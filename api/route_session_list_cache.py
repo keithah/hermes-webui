@@ -74,6 +74,7 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "source_tag",
     "raw_source",
     "session_source",
+    "session_origin",
     "source_label",
     "is_cli_session",
     "is_messaging_session",
