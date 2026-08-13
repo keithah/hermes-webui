@@ -4992,7 +4992,14 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         s.save()
     return s
 
-def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_webhook: bool = False, show_kanban: bool = False) -> bool:
+def _hide_from_default_sidebar(
+    session: dict,
+    *,
+    show_cron: bool = False,
+    show_matrix: bool = False,
+    show_webhook: bool = False,
+    show_kanban: bool = False,
+) -> bool:
     """Return True for internal/background sessions hidden from the default list."""
     sid = str(session.get('session_id') or '')
     source = (
@@ -5002,6 +5009,12 @@ def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_w
         or session.get('session_source')
     )
     if not show_cron and (source == 'cron' or sid.startswith('cron_')):
+        return True
+    matrix_sources = {
+        str(session.get(key) or '').strip().lower()
+        for key in ('source', 'source_tag', 'raw_source', 'session_source')
+    }
+    if not show_matrix and 'matrix' in matrix_sources:
         return True
     if not show_webhook and source == 'webhook':
         return True
@@ -5060,7 +5073,7 @@ def _is_intentionally_background_sidebar_session(session: dict) -> bool:
         or session.get('raw_source')
         or session.get('session_source')
     )
-    return source in {'cron', 'webhook', 'kanban'} or sid.startswith('cron_')
+    return source in {'cron', 'matrix', 'webhook', 'kanban'} or sid.startswith('cron_')
 
 
 def _include_project_hidden_background_sidebar_sessions(
@@ -5069,7 +5082,7 @@ def _include_project_hidden_background_sidebar_sessions(
 ) -> list[dict]:
     """Keep project-assigned background sessions addressable by project chips.
 
-    Cron and webhook sessions stay hidden from the default sidebar, but if they
+    Cron, Matrix, and webhook sessions stay hidden from the default sidebar, but if they
     have a project assignment they must still be present in the client cache so
     their dedicated project chips can reveal them (#3019).
     """
@@ -7410,7 +7423,7 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
     stops being true (metadata moves to another store), this gate would short-
     circuit before the real source — update both together.
     """
-    default = {"title": None, "archived": False}
+    default = {"title": None, "archived": False, "project_id": None}
     if not is_safe_session_id(sid):
         return dict(default)
     p = SESSION_DIR / f'{sid}.json'
@@ -7438,6 +7451,7 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
         if title:
             metadata["title"] = title
         metadata["archived"] = bool(getattr(webui_meta, 'archived', False))
+        metadata["project_id"] = getattr(webui_meta, 'project_id', None)
 
     with _SIDECAR_METADATA_CACHE_LOCK:
         # Re-check under lock in case a concurrent build populated it; either
@@ -7613,7 +7627,11 @@ def _load_cli_sessions_uncached(
             'updated_at': raw_ts,
             'pinned': False,
             'archived': _archived,
-            'project_id': _state_row_project_id(sid, _source),
+            'project_id': (
+                _sidecar_meta.get('project_id')
+                if _source == 'matrix'
+                else _state_row_project_id(sid, _source)
+            ),
             'profile': profile,
             'source_tag': _source,
             'raw_source': row.get('raw_source') or _source_meta.get('raw_source'),
