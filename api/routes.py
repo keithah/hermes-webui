@@ -1995,6 +1995,7 @@ def _session_list_cache_key(
     show_cli_sessions: bool,
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
+    show_matrix_sessions: bool = False,
     include_archived: bool = False,
     exclude_hidden: bool = False,
     visible_only: bool = False,
@@ -2012,6 +2013,7 @@ def _session_list_cache_key(
         show_cli_sessions=show_cli_sessions,
         show_previous_messaging_sessions=show_previous_messaging_sessions,
         show_cron_sessions=show_cron_sessions,
+        show_matrix_sessions=show_matrix_sessions,
         include_archived=include_archived,
         exclude_hidden=exclude_hidden,
         visible_only=visible_only,
@@ -2257,6 +2259,7 @@ def _build_session_list_cache_payload(
     show_cli_sessions: bool,
     show_previous_messaging_sessions: bool,
     show_cron_sessions: bool,
+    show_matrix_sessions: bool = False,
     show_claude_code_sessions: bool = True,
     include_archived: bool = False,
     exclude_hidden: bool = False,
@@ -2316,6 +2319,7 @@ def _build_session_list_cache_payload(
     show_cli_sessions = bool(show_cli_sessions)
     show_previous_messaging_sessions = bool(show_previous_messaging_sessions)
     show_cron_sessions = bool(show_cron_sessions)
+    show_matrix_sessions = bool(show_matrix_sessions)
     show_webhook_sessions = bool(show_webhook_sessions)
     show_kanban_sessions = bool(show_kanban_sessions)
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
@@ -2463,6 +2467,7 @@ def _build_session_list_cache_payload(
             cli,
             represented_webui_ids,
             show_cron_sessions=show_cron_sessions,
+            show_matrix_sessions=show_matrix_sessions,
             show_webhook_sessions=show_webhook_sessions,
             show_kanban_sessions=show_kanban_sessions,
             source_filter=source_filter,
@@ -2627,6 +2632,7 @@ def _build_session_list_cache_payload(
             "show_cli_sessions": show_cli_sessions,
             "show_previous_messaging_sessions": show_previous_messaging_sessions,
             "show_cron_sessions": show_cron_sessions,
+            "show_matrix_sessions": show_matrix_sessions,
             "show_claude_code_sessions": show_claude_code_sessions if show_cli_sessions else False,
             "show_webhook_sessions": show_webhook_sessions,
             "show_kanban_sessions": show_kanban_sessions,
@@ -10230,6 +10236,7 @@ def _dedupe_cli_sidebar_sessions_for_api(
     represented_webui_ids: set[str],
     *,
     show_cron_sessions: bool = False,
+    show_matrix_sessions: bool = False,
     show_webhook_sessions: bool = False,
     show_kanban_sessions: bool = False,
     source_filter: str | None = None,
@@ -10255,6 +10262,8 @@ def _dedupe_cli_sidebar_sessions_for_api(
     _sf = str(source_filter or '').strip().lower()
     if _sf == 'cron':
         show_cron_sessions = True
+    elif _sf == 'matrix':
+        show_matrix_sessions = True
     elif _sf == 'webhook':
         show_webhook_sessions = True
     elif _sf == 'kanban':
@@ -10271,6 +10280,7 @@ def _dedupe_cli_sidebar_sessions_for_api(
         if not _hide_background(
             s,
             show_cron=show_cron_sessions,
+            show_matrix=show_matrix_sessions,
             show_webhook=show_webhook_sessions,
             show_kanban=show_kanban_sessions,
         )
@@ -14190,6 +14200,7 @@ def handle_get(handler, parsed) -> bool:
                 settings.get("show_previous_messaging_sessions")
             )
             show_cron_sessions = bool(settings.get("show_cron_sessions"))
+            show_matrix_sessions = bool(settings.get("show_matrix_sessions"))
             show_webhook_sessions = bool(settings.get("show_webhook_sessions"))
             show_kanban_sessions = bool(settings.get("show_kanban_sessions"))
             agent_session_source_filter = settings.get("agent_session_source_filter")
@@ -14211,6 +14222,7 @@ def handle_get(handler, parsed) -> bool:
                 show_claude_code_sessions=show_claude_code_sessions,
                 show_previous_messaging_sessions=show_previous_messaging_sessions,
                 show_cron_sessions=show_cron_sessions,
+                show_matrix_sessions=show_matrix_sessions,
                 include_archived=include_archived,
                 exclude_hidden=exclude_hidden,
                 visible_only=True,
@@ -14234,6 +14246,7 @@ def handle_get(handler, parsed) -> bool:
                     show_claude_code_sessions=show_claude_code_sessions,
                     show_previous_messaging_sessions=show_previous_messaging_sessions,
                     show_cron_sessions=show_cron_sessions,
+                    show_matrix_sessions=show_matrix_sessions,
                     include_archived=include_archived,
                     exclude_hidden=exclude_hidden,
                     visible_only=True,
@@ -17064,6 +17077,7 @@ def handle_post(handler, parsed) -> bool:
                 "show_cli_sessions",
                 "show_claude_code_sessions",
                 "show_cron_sessions",
+                "show_matrix_sessions",
                 "show_webhook_sessions",
                 "show_kanban_sessions",
                 "show_previous_messaging_sessions",
