@@ -66,6 +66,21 @@ from api.shares import create_or_refresh_share, load_share, revoke_share
 logger = logging.getLogger(__name__)
 
 
+def _normalize_sidebar_sources(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...] | None:
+    if not values:
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        source = str(value or "").strip().lower()
+        if len(source) > 48 or not re.fullmatch(r"[a-z0-9_]+", source):
+            raise ValueError("Invalid sidebar_source")
+        if source not in seen:
+            seen.add(source)
+            normalized.append(source)
+    return tuple(normalized)
+
+
 def _publish_session_list_changed(
     reason: str,
     *,
@@ -1987,6 +2002,7 @@ def _session_list_cache_key(
     show_kanban_sessions: bool = False,
     source_filter: str | None = None,
     sidebar_source: str | None = None,
+    sidebar_sources: tuple[str, ...] | list[str] | None = None,
     archived_limit: int | None = None,
     archived_offset: int = 0,
     show_claude_code_sessions: bool = True,
@@ -2005,6 +2021,7 @@ def _session_list_cache_key(
         show_kanban_sessions=show_kanban_sessions,
         source_filter=source_filter,
         sidebar_source=sidebar_source,
+        sidebar_sources=sidebar_sources,
         archived_limit=archived_limit,
         archived_offset=archived_offset,
     ) + (bool(show_claude_code_sessions),)
@@ -2252,6 +2269,7 @@ def _build_session_list_cache_payload(
     show_kanban_sessions: bool = False,
     source_filter: str | None = None,
     sidebar_source: str | None = None,
+    sidebar_sources: tuple[str, ...] | list[str] | None = None,
     archived_limit: int | None = None,
     archived_offset: int = 0,
     diag=None,
@@ -2306,16 +2324,21 @@ def _build_session_list_cache_payload(
     # The sidebar's origin tabs are explicit requests for one high-level
     # source. Opt into the external-session loader for any non-WebUI origin;
     # the per-origin flags below still control the default mixed view.
-    sidebar_origin = str(sidebar_source or '').strip().lower()
-    if sidebar_origin and sidebar_origin != 'webui':
+    selected_sidebar_sources = sidebar_sources
+    if selected_sidebar_sources is None and sidebar_source:
+        selected_sidebar_sources = (sidebar_source,)
+    selected_sidebar_sources = tuple(selected_sidebar_sources or ())
+    selected_sidebar_source_set = set(selected_sidebar_sources)
+    external_sidebar_origins = selected_sidebar_source_set - {'webui'}
+    if external_sidebar_origins:
         show_cli_sessions = True
-        if sidebar_origin == 'cron':
+        if 'cron' in external_sidebar_origins:
             show_cron_sessions = True
-        elif sidebar_origin == 'matrix':
+        if 'matrix' in external_sidebar_origins:
             show_matrix_sessions = True
-        elif sidebar_origin == 'webhook':
+        if 'webhook' in external_sidebar_origins:
             show_webhook_sessions = True
-        elif sidebar_origin == 'kanban':
+        if 'kanban' in external_sidebar_origins:
             show_kanban_sessions = True
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
     if show_cli_sessions:
@@ -2544,8 +2567,8 @@ def _build_session_list_cache_payload(
     )
     archived_count = archived_webui_count + archived_cli_count
     def _filter_sidebar_source(rows: list[dict]) -> list[dict]:
-        if sidebar_source:
-            return [s for s in rows if _sidebar_session_origin(s) == sidebar_source]
+        if selected_sidebar_source_set:
+            return [s for s in rows if _sidebar_session_origin(s) in selected_sidebar_source_set]
         return list(rows)
 
     full_scoped_all_sources = archived_scoped if include_archived else visible_scoped
@@ -2563,10 +2586,9 @@ def _build_session_list_cache_payload(
         origin = _sidebar_session_origin(session)
         session_origin_counts[origin] += 1
         session_origin_labels.setdefault(origin, _sidebar_session_origin_label(origin))
-    if show_cli_sessions:
-        for origin, count in _sidebar_state_origin_counts().items():
-            session_origin_counts[origin] = max(session_origin_counts[origin], count)
-            session_origin_labels.setdefault(origin, _sidebar_session_origin_label(origin))
+    for origin, count in _sidebar_state_origin_counts().items():
+        session_origin_counts[origin] = max(session_origin_counts[origin], count)
+        session_origin_labels.setdefault(origin, _sidebar_session_origin_label(origin))
     visible_scoped_filtered = _filter_sidebar_source(visible_scoped)
     archived_scoped_filtered = _filter_sidebar_source(archived_scoped)
     scoped = _filter_sidebar_source(full_scoped_all_sources)
@@ -14329,12 +14351,12 @@ def handle_get(handler, parsed) -> bool:
             exclude_hidden = _query_flag(parsed, "exclude_hidden")
             archived_limit = _query_positive_int(parsed, "archived_limit", default=None, maximum=2000)
             archived_offset = _query_positive_int(parsed, "archived_offset", default=0, maximum=200000)
-            sidebar_source = parse_qs(parsed.query).get("sidebar_source", [""])[0].strip().lower() or None
-            if sidebar_source and (
-                len(sidebar_source) > 48
-                or not re.fullmatch(r"[a-z0-9_]+", sidebar_source)
-            ):
-                sidebar_source = None
+            try:
+                sidebar_sources = _normalize_sidebar_sources(
+                    parse_qs(parsed.query, keep_blank_values=True).get("sidebar_source", [])
+                )
+            except ValueError:
+                return bad(handler, "Invalid sidebar_source", status=400)
             # /api/sessions is the default sidebar contract, so keep the route-owned
             # visible-row filter in the shared cache builder for both cache hits and misses.
             key = _session_list_cache_key(
@@ -14351,7 +14373,7 @@ def handle_get(handler, parsed) -> bool:
                 show_webhook_sessions=show_webhook_sessions,
                 show_kanban_sessions=show_kanban_sessions,
                 source_filter=agent_session_source_filter,
-                sidebar_source=sidebar_source,
+                sidebar_sources=sidebar_sources,
                 archived_limit=archived_limit,
                 archived_offset=archived_offset,
             )
@@ -14375,7 +14397,7 @@ def handle_get(handler, parsed) -> bool:
                     show_webhook_sessions=show_webhook_sessions,
                     show_kanban_sessions=show_kanban_sessions,
                     source_filter=agent_session_source_filter,
-                    sidebar_source=sidebar_source,
+                    sidebar_sources=sidebar_sources,
                     archived_limit=archived_limit,
                     archived_offset=archived_offset,
                     diag=diag,

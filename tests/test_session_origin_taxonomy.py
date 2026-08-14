@@ -32,20 +32,24 @@ def _extract_function(source_text, function_name):
 def test_source_filter_model_keeps_every_origin_readable_without_a_tab_strip():
     """Dropping or truncating dynamic adapters must break the source-control contract."""
     source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    normalize_fn = _extract_function(source, "_normalizeSessionSourceFilters")
     model_fn = _extract_function(source, "_sessionSourceFilterModel")
     script = f"""
-global._sessionSourceFilter = 'matrix';
-global._serverSessionOriginCounts = {{webui: 17, cli: 2, matrix: 220, telegram: 14}};
+global._sessionSourceFilters = ['matrix', 'telegram', 'slack', 'discord'];
+global._serverSessionOriginCounts = {{webui: 17, cli: 2, matrix: 220, telegram: 14, slack: 8, discord: 5}};
 global._serverSessionOriginLabels = {{
   webui: 'WebUI sessions',
   cli: 'CLI sessions',
   matrix: 'Matrix sessions',
   telegram: 'Telegram sessions',
+  slack: 'Slack sessions',
+  discord: 'Discord sessions',
 }};
-global._sessionOriginKeys = () => ['webui', 'cli', 'matrix', 'telegram'];
+global._sessionOriginKeys = () => ['webui', 'cli', 'matrix', 'telegram', 'slack', 'discord'];
 global._sessionSourceTabCount = (origin) => global._serverSessionOriginCounts[origin];
 global._sessionSourceLabel = (origin, count) => `${{global._serverSessionOriginLabels[origin]}} (${{count}})`;
 global._sessionOriginLabel = (origin) => global._serverSessionOriginLabels[origin];
+{normalize_fn}
 {model_fn}
 console.log(JSON.stringify(_sessionSourceFilterModel(null, null)));
 """
@@ -53,15 +57,63 @@ console.log(JSON.stringify(_sessionSourceFilterModel(null, null)));
     model = json.loads(result.stdout)
 
     assert model == {
-        "activeOrigin": "matrix",
-        "activeLabel": "Matrix sessions",
-        "originCount": 4,
-        "items": [
-            {"origin": "webui", "label": "WebUI sessions", "count": 17, "active": False},
-            {"origin": "cli", "label": "CLI sessions", "count": 2, "active": False},
-            {"origin": "matrix", "label": "Matrix sessions", "count": 220, "active": True},
-            {"origin": "telegram", "label": "Telegram sessions", "count": 14, "active": False},
+        "selectedOrigins": ["matrix", "telegram", "slack", "discord"],
+        "visibleChips": [
+            {"origin": "matrix", "label": "Matrix sessions"},
+            {"origin": "telegram", "label": "Telegram sessions"},
         ],
+        "overflowCount": 2,
+        "originCount": 6,
+        "items": [
+            {"origin": "webui", "label": "WebUI sessions", "count": 17, "selected": False},
+            {"origin": "cli", "label": "CLI sessions", "count": 2, "selected": False},
+            {"origin": "matrix", "label": "Matrix sessions", "count": 220, "selected": True},
+            {"origin": "telegram", "label": "Telegram sessions", "count": 14, "selected": True},
+            {"origin": "slack", "label": "Slack sessions", "count": 8, "selected": True},
+            {"origin": "discord", "label": "Discord sessions", "count": 5, "selected": True},
+        ],
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_source_menu_item_uses_checkbox_and_reports_immediate_checked_state():
+    source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    render_fn = _extract_function(source, "_renderSessionSourceMenuItem")
+    script = f"""
+global.document = {{
+  createElement(tag) {{
+    return {{
+      tagName: tag.toUpperCase(), type: '', className: '', textContent: '', checked: false,
+      children: [], attrs: {{}},
+      appendChild(child) {{ this.children.push(child); }},
+      setAttribute(key, value) {{ this.attrs[key] = value; }},
+    }};
+  }},
+}};
+{render_fn}
+const changes = [];
+const row = _renderSessionSourceMenuItem(
+  {{origin:'slack', label:'Slack sessions', count:8, selected:false}},
+  (origin, selected) => changes.push([origin, selected])
+);
+const checkbox = row.children[0];
+checkbox.checked = true;
+checkbox.onchange({{stopPropagation(){{}}}});
+console.log(JSON.stringify({{
+  rowTag: row.tagName,
+  checkboxTag: checkbox.tagName,
+  checkboxType: checkbox.type,
+  initialSelected: row.attrs['aria-checked'],
+  changes,
+}}));
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == {
+        "rowTag": "LABEL",
+        "checkboxTag": "INPUT",
+        "checkboxType": "checkbox",
+        "initialSelected": "false",
+        "changes": [["slack", True]],
     }
 
 
@@ -90,6 +142,24 @@ def test_sidebar_origin_defaults_blank_rows_to_webui_and_unknown_rows_to_their_s
     assert _sidebar_session_origin({"session_id": "native"}) == "webui"
     assert _sidebar_session_origin({"source_tag": "new_adapter"}) == "new_adapter"
     assert _sidebar_session_origin({"session_source": "cli", "is_cli_session": True}) == "cli"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_client_origin_preserves_legacy_webui_markers():
+    source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    origin_fn = _extract_function(source, "_sessionOrigin")
+    script = f"""
+const _SESSION_ORIGIN_ORDER = ['webui','cli','subagent','other'];
+function _isCliSession() {{ return false; }}
+{origin_fn}
+console.log(JSON.stringify([
+  _sessionOrigin({{source:'webui', session_source:'webui'}}),
+  _sessionOrigin({{raw_source:'webui'}}),
+  _sessionOrigin({{source_tag:'webui'}}),
+]));
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == ["webui", "webui", "webui"]
 
 
 def test_sidebar_payload_exposes_origin_metadata_and_dynamic_filtering_contract(monkeypatch):
@@ -133,7 +203,7 @@ def test_sidebar_payload_exposes_origin_metadata_and_dynamic_filtering_contract(
     assert payload["session_origin_labels"]["matrix"] == "Matrix sessions"
 
 
-def test_sidebar_origin_counts_include_hidden_state_db_origins(monkeypatch, tmp_path):
+def test_webui_filtered_payload_counts_available_state_db_origins(monkeypatch, tmp_path):
     import sqlite3
     import api.routes as routes
 
@@ -148,20 +218,36 @@ def test_sidebar_origin_counts_include_hidden_state_db_origins(monkeypatch, tmp_
     con.close()
 
     monkeypatch.setattr(routes, "_active_state_db_path", lambda: db_path)
-    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [])
+    webui_row = {
+        "session_id": "webui-1",
+        "title": "WebUI session",
+        "profile": "default",
+        "source": "webui",
+        "message_count": 2,
+        "updated_at": 20,
+        "last_message_at": 20,
+        "archived": False,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [dict(webui_row)])
     monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
     monkeypatch.setattr(routes, "get_cli_sessions", lambda **_kwargs: [])
 
     payload = routes._build_session_list_cache_payload(
         active_profile="default",
         all_profiles=False,
-        show_cli_sessions=True,
+        show_cli_sessions=False,
         show_previous_messaging_sessions=False,
         show_cron_sessions=False,
         show_matrix_sessions=False,
+        sidebar_source="webui",
     )
 
-    assert payload["session_origin_counts"] == {"matrix": 1, "telegram": 1}
+    assert [row["session_id"] for row in payload["sessions"]] == ["webui-1"]
+    assert payload["session_origin_counts"] == {
+        "webui": 1,
+        "matrix": 1,
+        "telegram": 1,
+    }
 
 
 def test_sidebar_payload_exposes_origin_metadata_fields():
@@ -169,7 +255,7 @@ def test_sidebar_payload_exposes_origin_metadata_fields():
     source = routes.read_text(encoding="utf-8")
     assert '"session_origin_counts"' in source
     assert '"session_origin_labels"' in source
-    assert "_sidebar_session_origin(s) == sidebar_source" in source
+    assert "_sidebar_session_origin(s) in selected_sidebar_source_set" in source
     assert '"session_origin",' in source
 
 
@@ -178,5 +264,5 @@ def test_sidebar_frontend_renders_origin_tabs_and_accepts_non_cli_origins():
     assert "_serverSessionOriginCounts" in source
     assert "session_origin_counts" in source
     assert "_sessionOriginKeys" in source
-    assert "sourceFilter!=='webui'&&sourceFilter!=='cli'" in source
+    assert "selectedOrigins.has(_sessionOrigin(s))" in source
     assert "session_origin" in source
