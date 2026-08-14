@@ -918,11 +918,9 @@ function _purgeStaleInflightEntries() {
     && typeof _sessionListSourceById.get === 'function'
     ? _sessionListSourceById
     : null;
-  const currentSidebarSource = typeof _allSessionsScope !== 'undefined'
-    && _allSessionsScope
-    && typeof _allSessionsScope.sidebarSource === 'string'
-    ? _allSessionsScope.sidebarSource
-    : null;
+  const currentSidebarSources = typeof _allSessionsScope !== 'undefined'&&_allSessionsScope
+    ? new Set(String(_allSessionsScope.sidebarSourcesKey||_allSessionsScope.sidebarSource||'').split(',').filter(Boolean))
+    : new Set();
   for (const sid of Object.keys(INFLIGHT)) {
     // #4354: purge stale INFLIGHT even for a hung/idle session, BUT skip the one
     // session actively mid-send (#2689 start-race) — during /api/chat/start the
@@ -933,7 +931,7 @@ function _purgeStaleInflightEntries() {
     }
     if (!sessionsById.has(sid)) {
       const knownSource = sourceById ? sourceById.get(sid) : null;
-      if (currentSidebarSource && (!knownSource || knownSource !== currentSidebarSource)) {
+      if (currentSidebarSources.size && (!knownSource || !currentSidebarSources.has(knownSource))) {
         continue;
       }
       // Session is absent from _allSessions — it was deleted / archived /
@@ -1197,11 +1195,9 @@ function _markPollingCompletionUnreadTransitions(sessions) {
     && typeof _sessionListSourceById.delete === 'function'
     ? _sessionListSourceById
     : new Map();
-  const currentSidebarSource = typeof _allSessionsScope !== 'undefined'
-    && _allSessionsScope
-    && typeof _allSessionsScope.sidebarSource === 'string'
-    ? _allSessionsScope.sidebarSource
-    : null;
+  const currentSidebarSources = typeof _allSessionsScope !== 'undefined'&&_allSessionsScope
+    ? new Set(String(_allSessionsScope.sidebarSourcesKey||_allSessionsScope.sidebarSource||'').split(',').filter(Boolean))
+    : new Set();
   for (const s of sessions) {
     if (!s || !s.session_id) continue;
     const sid = s.session_id;
@@ -1275,7 +1271,7 @@ function _markPollingCompletionUnreadTransitions(sessions) {
   for (const sid of staleRuntimeStateSids) {
     if (seen.has(sid)) continue;
     const knownSource = sourceById.get(sid);
-    if (currentSidebarSource && (!knownSource || knownSource !== currentSidebarSource)) continue;
+    if (currentSidebarSources.size && (!knownSource || !currentSidebarSources.has(knownSource))) continue;
     _sessionStreamingById.delete(sid);
     _sessionListSnapshotById.delete(sid);
     sourceById.delete(sid);
@@ -1493,7 +1489,14 @@ async function newSession(flash, options={}){
     }
     S.session=data.session;S.messages=data.session.messages||[];
     S._pendingSessionToolsets=null;
-    if(_sessionSourceFilter==='cli') _sessionSourceFilter='webui';
+    const hasNonWebuiSource=typeof _sessionSourceFilters!=='undefined'&&Array.isArray(_sessionSourceFilters)
+      ? _sessionSourceFilters.some(source=>source!=='webui')
+      : _sessionSourceFilter!=='webui';
+    if(hasNonWebuiSource){
+      if(typeof _sessionSourceFilters!=='undefined') _sessionSourceFilters=['webui'];
+      _sessionSourceFilter='webui';
+      try{localStorage.setItem('hermes-session-source-filters-v2',JSON.stringify(['webui']));}catch(_e){}
+    }
     if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
     S.lastUsage={...(data.session.last_usage||{})};
     if(!(options&&options.worktree)) _rememberNewChatDraftSession(S.session);
@@ -2561,6 +2564,7 @@ function _sessionOrigin(session){
     .map(value=>String(value||'').trim().toLowerCase().replace(/[- ]/g,'_'));
   const known=_SESSION_ORIGIN_ORDER.filter(origin=>origin!=='webui');
   for(const marker of raw){
+    if(marker==='webui') return 'webui';
     if(marker==='api_server') return 'api';
     if(known.includes(marker)) return marker;
   }
@@ -2573,7 +2577,7 @@ function _sessionOriginKeys(){
   const keys=new Set(['webui']);
   if(window._showCliSessions) keys.add('cli');
   Object.keys(counts).forEach(key=>{if(Number(counts[key])>0)keys.add(key);});
-  if(_sessionSourceFilter) keys.add(_sessionSourceFilter);
+  for(const source of _sessionSourceFilters)keys.add(source);
   return [...keys].sort((a,b)=>{
     const ai=_SESSION_ORIGIN_ORDER.indexOf(a),bi=_SESSION_ORIGIN_ORDER.indexOf(b);
     return (ai<0?999:ai)-(bi<0?999:bi)||a.localeCompare(b);
@@ -2590,18 +2594,33 @@ function _sessionOriginLabel(filter) {
 }
 
 function _sessionSourceFilterModel(renderedWebuiSessionCount, renderedCliSessionCount){
-  const activeOrigin=_sessionSourceFilter||'webui';
+  const selectedOrigins=_normalizeSessionSourceFilters(_sessionSourceFilters);
+  const selectedSet=new Set(selectedOrigins);
   const items=_sessionOriginKeys().map(origin=>{
     const count=_sessionSourceTabCount(origin,renderedWebuiSessionCount,renderedCliSessionCount);
-    return {origin,label:_sessionOriginLabel(origin),count:Number(count)||0,active:origin===activeOrigin};
+    return {origin,label:_sessionOriginLabel(origin),count:Number(count)||0,selected:selectedSet.has(origin)};
   });
-  const active=items.find(item=>item.active);
   return {
-    activeOrigin,
-    activeLabel:active?active.label:_sessionOriginLabel(activeOrigin),
+    selectedOrigins,
+    visibleChips:selectedOrigins.slice(0,2).map(origin=>({origin,label:_sessionOriginLabel(origin)})),
+    overflowCount:Math.max(0,selectedOrigins.length-2),
     originCount:items.length,
     items,
   };
+}
+
+function _renderSessionSourceMenuItem(item,onToggle){
+  const row=document.createElement('label');
+  row.className='session-source-menu-item'+(item.selected?' active':'');
+  row.setAttribute('role','menuitemcheckbox');row.setAttribute('aria-checked',item.selected?'true':'false');
+  const checkbox=document.createElement('input');
+  checkbox.type='checkbox';checkbox.className='session-source-menu-checkbox';checkbox.checked=item.selected;
+  checkbox.setAttribute('aria-label',item.label);
+  checkbox.onchange=(event)=>{event.stopPropagation();onToggle(item.origin,checkbox.checked);};
+  const label=document.createElement('span');label.className='session-source-menu-label';label.textContent=item.label;
+  const count=document.createElement('span');count.className='session-source-menu-count';count.textContent=String(item.count);
+  row.appendChild(checkbox);row.appendChild(label);row.appendChild(count);
+  return row;
 }
 
 function _renderSessionSourceFilterControl(renderedWebuiSessionCount, renderedCliSessionCount){
@@ -2609,18 +2628,8 @@ function _renderSessionSourceFilterControl(renderedWebuiSessionCount, renderedCl
   if(model.originCount<2) return null;
   const control=document.createElement('div');
   control.className='session-source-filter';
-  const active=document.createElement('div');
-  active.className='session-source-active';
-  active.textContent=model.activeLabel;
-  active.title=model.activeLabel;
-  control.appendChild(active);
-  if(model.activeOrigin!=='webui'){
-    const clear=document.createElement('button');
-    clear.type='button';clear.className='session-source-clear';clear.textContent='\u00d7';
-    clear.title='Show WebUI sessions';clear.setAttribute('aria-label','Clear source filter');
-    clear.onclick=(event)=>{event.stopPropagation();_setSessionSourceFilter('webui');};
-    active.appendChild(clear);
-  }
+  const selectedBar=document.createElement('div');selectedBar.className='session-source-selected-bar';
+  control.appendChild(selectedBar);
   const trigger=document.createElement('button');
   trigger.type='button';trigger.className='session-source-menu-trigger';
   trigger.setAttribute('aria-haspopup','menu');trigger.setAttribute('aria-expanded','false');
@@ -2641,31 +2650,55 @@ function _renderSessionSourceFilterControl(renderedWebuiSessionCount, renderedCl
     menu.hidden=true;trigger.setAttribute('aria-expanded','false');
     if(restoreFocus)trigger.focus();
   };
-  for(const item of model.items){
-    const button=document.createElement('button');
-    button.type='button';button.className='session-source-menu-item'+(item.active?' active':'');
-    button.setAttribute('role','menuitemradio');button.setAttribute('aria-checked',item.active?'true':'false');
-    const label=document.createElement('span');label.className='session-source-menu-label';label.textContent=item.label;
-    const count=document.createElement('span');count.className='session-source-menu-count';count.textContent=String(item.count);
-    button.appendChild(label);button.appendChild(count);
-    button.onclick=(event)=>{event.stopPropagation();close(false);_setSessionSourceFilter(item.origin);};
-    menu.appendChild(button);
-  }
-  trigger.onclick=(event)=>{
+  const openMenu=(event)=>{
     event.stopPropagation();
-    const opening=menu.hidden;
-    menu.hidden=!opening;trigger.setAttribute('aria-expanded',opening?'true':'false');
-    if(opening){
+    if(menu.hidden){
+      menu.hidden=false;trigger.setAttribute('aria-expanded','true');
       if(_sessionSourceMenuCleanup)_sessionSourceMenuCleanup();
       _sessionSourceMenuCleanup=releaseOutsideHandler;
       outsideHandler=(outsideEvent)=>{if(!control.contains(outsideEvent.target))close(false);};
       outsideTimer=setTimeout(()=>{outsideTimer=0;if(!menu.hidden)document.addEventListener('pointerdown',outsideHandler);},0);
-      const selected=menu.querySelector('.session-source-menu-item.active');
+      const selected=menu.querySelector('.session-source-menu-checkbox:checked');
       if(selected)selected.focus();
-    }else releaseOutsideHandler();
+    }else close(false);
   };
+  const refreshSelectedState=()=>{
+    const nextModel=_sessionSourceFilterModel(renderedWebuiSessionCount,renderedCliSessionCount);
+    selectedBar.innerHTML='';
+    for(const chip of nextModel.visibleChips){
+      const node=document.createElement('div');node.className='session-source-filter-chip';node.title=chip.label;
+      const text=document.createElement('span');text.textContent=chip.label;node.appendChild(text);
+      const remove=document.createElement('button');remove.type='button';remove.className='session-source-chip-remove';
+      remove.textContent='\u00d7';remove.setAttribute('aria-label',`Remove ${chip.label}`);
+      remove.onclick=(event)=>{event.stopPropagation();_toggleSessionSourceFilter(chip.origin,false,{renderCache:false});refreshSelectedState();};
+      node.appendChild(remove);selectedBar.appendChild(node);
+    }
+    if(nextModel.overflowCount){
+      const overflow=document.createElement('button');overflow.type='button';overflow.className='session-source-overflow';
+      overflow.textContent=`+${nextModel.overflowCount}`;overflow.setAttribute('aria-label',`${nextModel.overflowCount} more selected sources`);
+      overflow.onclick=openMenu;selectedBar.appendChild(overflow);
+    }
+    const selectedSet=new Set(nextModel.selectedOrigins);
+    menu.querySelectorAll('.session-source-menu-item').forEach(row=>{
+      const checkbox=row.querySelector('.session-source-menu-checkbox');
+      const selected=checkbox&&selectedSet.has(checkbox.dataset.origin);
+      if(checkbox)checkbox.checked=selected;
+      row.classList.toggle('active',selected);row.setAttribute('aria-checked',selected?'true':'false');
+    });
+  };
+  for(const item of model.items){
+    const row=_renderSessionSourceMenuItem(item,(origin,selected)=>{
+      _toggleSessionSourceFilter(origin,selected,{renderCache:false});
+      refreshSelectedState();
+    });
+    const checkbox=row.querySelector('.session-source-menu-checkbox');
+    if(checkbox)checkbox.dataset.origin=item.origin;
+    menu.appendChild(row);
+  }
+  trigger.onclick=openMenu;
   control.onkeydown=(event)=>{if(event.key==='Escape'&&!menu.hidden){event.preventDefault();event.stopPropagation();close(true);}};
   control.appendChild(menu);
+  refreshSelectedState();
   return control;
 }
 
@@ -2676,8 +2709,23 @@ function _clearSessionSourceTabCounts() {
   _serverSessionOriginLabels = null;
 }
 
-function _requestedSessionSidebarSource() {
-  return window._showCliSessions ? _sessionSourceFilter : 'webui';
+function _normalizeSessionSourceFilters(values){
+  const normalized=[];
+  const seen=new Set();
+  for(const value of (Array.isArray(values)?values:[])){
+    const source=String(value||'').trim().toLowerCase().replace(/[- ]/g,'_');
+    if(!source||!/^[a-z0-9_]+$/.test(source)||seen.has(source))continue;
+    seen.add(source);normalized.push(source);
+  }
+  return normalized.length?normalized:['webui'];
+}
+
+function _requestedSessionSidebarSources() {
+  return window._showCliSessions ? _normalizeSessionSourceFilters(_sessionSourceFilters) : ['webui'];
+}
+
+function _sessionSourceSelectionKey(values){
+  return _normalizeSessionSourceFilters(values).slice().sort().join(',');
 }
 
 function _sessionListExcludeHiddenEnabled() {
@@ -2695,7 +2743,7 @@ function _sessionArchivePagingFilterActive() {
 
 function _sessionListQueryString() {
   const qs = new URLSearchParams();
-  qs.set('sidebar_source', _requestedSessionSidebarSource());
+  for(const source of _requestedSessionSidebarSources())qs.append('sidebar_source',source);
   if(_sessionListExcludeHiddenEnabled()) qs.set('exclude_hidden','1');
   if(_showAllProfiles) qs.set('all_profiles','1');
   if(_showArchived){
@@ -2728,25 +2776,51 @@ function _setActiveProjectFilter(projectId) {
   void renderSessionList({deferWhileInteracting:false});
 }
 
-function _setSessionSourceFilter(filter) {
-  const candidate=String(filter||'').trim().toLowerCase().replace(/[- ]/g,'_');
-  const next = /^[a-z0-9_]+$/.test(candidate)&&candidate ? candidate : 'webui';
-  if (_sessionSourceFilter === next) return;
-  _sessionSourceFilter = next;
+function _setSessionSourceFilters(filters,options) {
+  options=options&&typeof options==='object'?options:{};
+  const next=_normalizeSessionSourceFilters(filters);
+  if(next.length===_sessionSourceFilters.length&&next.every((source,index)=>source===_sessionSourceFilters[index]))return;
+  _sessionSourceFilters=next;
+  _sessionSourceFilter=next[0];
   _activeProject = null;
   _selectedSessions.clear();
   _sessionSelectMode = false;
-  try { localStorage.setItem('hermes-session-source-filter', next); } catch (_e) {}
-  renderSessionListFromCache();
+  try { localStorage.setItem('hermes-session-source-filters-v2', JSON.stringify(next)); } catch (_e) {}
+  if(options.renderCache!==false)renderSessionListFromCache();
   void renderSessionList({deferWhileInteracting:false});
 }
 
-function _restoreSessionSourceFilter() {
+function _toggleSessionSourceFilter(origin, selected, options){
+  options=options&&typeof options==='object'?options:{};
+  const source=_normalizeSessionSourceFilters([origin])[0];
+  const next=selected
+    ? _sessionSourceFilters.concat(source)
+    : _sessionSourceFilters.filter(item=>item!==source);
+  _setSessionSourceFilters(next,options);
+}
+
+function _setSessionSourceFilter(filter) {
+  _setSessionSourceFilters([filter]);
+}
+
+function _restoreSessionSourceFilters() {
   try {
-    const raw = localStorage.getItem('hermes-session-source-filter');
-    if (/^[a-z0-9_]+$/.test(raw||'')) _sessionSourceFilter = raw;
+    const stored=localStorage.getItem('hermes-session-source-filters-v2');
+    let restored=null;
+    if(stored){
+      try{const parsed=JSON.parse(stored);if(Array.isArray(parsed))restored=_normalizeSessionSourceFilters(parsed);}catch(_e){}
+    }
+    if(!restored){
+      const legacy=localStorage.getItem('hermes-session-source-filter');
+      restored=_normalizeSessionSourceFilters(legacy?[legacy]:[]);
+      localStorage.setItem('hermes-session-source-filters-v2',JSON.stringify(restored));
+    }
+    _sessionSourceFilters=restored;
+    _sessionSourceFilter=restored[0];
   } catch (_e) {}
 }
+
+function _restoreSessionSourceFilter(){_restoreSessionSourceFilters();}
 
 function _normalizeMessageForCliImportComparison(message) {
   if (!message || typeof message !== 'object') return message;
@@ -4062,7 +4136,8 @@ let _serverCliSessionCount = null;    // explicit server count for CLI sessions
 let _serverSessionOriginCounts = null;
 let _serverSessionOriginLabels = null;
 let _sessionSourceMenuCleanup = null;
-let _sessionSourceFilter = 'webui';  // one high-level origin: webui, tui, matrix, telegram, ...
+let _sessionSourceFilters = ['webui'];  // ordered, non-empty high-level origins
+let _sessionSourceFilter = 'webui';  // first-origin compatibility alias
 
 function _restoreShowAllProfiles(){
   try{
@@ -5371,7 +5446,7 @@ function showSessionListSkeleton(targetProfile){
       && typeof _knownSessionProfileCount === 'function')
     ? _knownSessionProfileCount(targetProfile) : null;
   const filterActive = (typeof _activeProject !== 'undefined' && _activeProject)
-    || (typeof _sessionSourceFilter !== 'undefined' && _sessionSourceFilter === 'cli');
+    || (typeof _sessionSourceFilters !== 'undefined' && _sessionSourceFilters.some(source=>source!=='webui'));
   const wrap = document.createElement('div');
   wrap.setAttribute('aria-hidden', 'true');
   if(knownCount === 0 && !filterActive){
@@ -5585,7 +5660,7 @@ function _sessionListRenderSignature(){
       _allProjects,
       _activeSessionIdForSidebar(),
       search,
-      _sessionSourceFilter,
+      _sessionSourceFilters,
       !!_sessionSelectMode,
       (window._sidebarDensity==='detailed'?'d':'c'),
       !!_showAllProfiles,
@@ -5636,12 +5711,19 @@ function _applySessionListPayload(sessData, projData, opts){
   // all-profiles flag). If a later /api/sessions fails right after a profile
   // switch, the catch path checks this so it won't re-render the PRIOR
   // profile's rows as if they were current (#4167 review item 3).
+  const requestedSidebarSources=typeof _requestedSessionSidebarSources==='function'
+    ? _requestedSessionSidebarSources()
+    : [typeof _requestedSessionSidebarSource==='function'?_requestedSessionSidebarSource():'webui'];
+  const requestedSidebarSourcesKey=typeof _sessionSourceSelectionKey==='function'
+    ? _sessionSourceSelectionKey(requestedSidebarSources)
+    : requestedSidebarSources.slice().sort().join(',');
   _allSessionsScope = {
     profile: (typeof sessData.active_profile === 'string' && sessData.active_profile)
       ? sessData.active_profile
       : (S.activeProfile || 'default'),
     allProfiles: !!_showAllProfiles,
-    sidebarSource: _requestedSessionSidebarSource(),
+    sidebarSource: requestedSidebarSources[0],
+    sidebarSourcesKey: requestedSidebarSourcesKey,
     excludeHidden: _sessionListExcludeHiddenEnabled(),
   };
   // Record this profile's session count so the NEXT switch into it can pick an
@@ -5652,7 +5734,7 @@ function _applySessionListPayload(sessData, projData, opts){
   // a different filter). This mirrors the read-side `filterActive` gate in
   // showSessionListSkeleton so the write and read agree on what the count means.
   const _recordFilterActive = (typeof _activeProject !== 'undefined' && _activeProject)
-    || (typeof _sessionSourceFilter !== 'undefined' && _sessionSourceFilter === 'cli');
+    || (typeof _sessionSourceFilters !== 'undefined' && _sessionSourceFilters.some(source=>source!=='webui'));
   if (!_showAllProfiles && !_recordFilterActive) {
     _recordSessionProfileCount(_allSessionsScope.profile, _allSessions.length);
   }
@@ -5864,16 +5946,23 @@ async function _runRenderSessionListRefresh(opts, _gen){
     // PRIOR profile's sessions; re-rendering them would falsely show another
     // profile's conversations, so render the error state with no rows instead
     // (#4167 review item 3).
+    const _currentRequestedSources=typeof _requestedSessionSidebarSources==='function'
+      ? _requestedSessionSidebarSources()
+      : [typeof _requestedSessionSidebarSource==='function'?_requestedSessionSidebarSource():'webui'];
+    const _currentRequestedSourcesKey=typeof _sessionSourceSelectionKey==='function'
+      ? _sessionSourceSelectionKey(_currentRequestedSources)
+      : _currentRequestedSources.slice().sort().join(',');
     const _curScope = {
       profile: S.activeProfile || 'default',
       allProfiles: !!_showAllProfiles,
-      sidebarSource: _requestedSessionSidebarSource(),
+      sidebarSource: _currentRequestedSources[0],
+      sidebarSourcesKey: _currentRequestedSourcesKey,
       excludeHidden: _sessionListExcludeHiddenEnabled(),
     };
     const _scopeMatches = _allSessionsScope
       && _allSessionsScope.profile === _curScope.profile
       && _allSessionsScope.allProfiles === _curScope.allProfiles
-      && _allSessionsScope.sidebarSource === _curScope.sidebarSource
+      && _allSessionsScope.sidebarSourcesKey === _curScope.sidebarSourcesKey
       && _allSessionsScope.excludeHidden === _curScope.excludeHidden;
     // #4671: the /api/sessions fetch failed — clear the skeleton flag so this error
     // render (matched cache, or empty rows for a mismatched scope) replaces the
@@ -7695,36 +7784,33 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
     if(!_showArchived&&s.archived) continue;
     sessionsRaw.push(s);
   }
-  if(_sessionSourceFilter==='cli' && !window._showCliSessions && cliSessionCount===0){
+  let activeSourceFilters=typeof _sessionSourceFilters!=='undefined'&&Array.isArray(_sessionSourceFilters)
+    ? _sessionSourceFilters.slice()
+    : [typeof _sessionSourceFilter==='string'?_sessionSourceFilter:'webui'];
+  if(activeSourceFilters.some(source=>source!=='webui') && !window._showCliSessions && cliSessionCount===0){
+    activeSourceFilters=['webui'];
+    if(typeof _sessionSourceFilters!=='undefined') _sessionSourceFilters=activeSourceFilters.slice();
     _sessionSourceFilter='webui';
   }
-  const showCliOnly=_sessionSourceFilter==='cli';
-  const selectedOrigin=_sessionSourceFilter;
-  const selectedProfileFiltered=selectedOrigin==='webui'
-    ? webuiProfileFiltered
-    : selectedOrigin==='cli'
-      ? cliProfileFiltered
-      : webuiProfileFiltered.concat(cliProfileFiltered).filter(s=>_sessionOrigin(s)===selectedOrigin);
-  const selectedSessionsRaw=selectedOrigin==='webui'
-    ? webuiSessionsRaw
-    : selectedOrigin==='cli'
-      ? cliSessionsRaw
-      : webuiSessionsRaw.concat(cliSessionsRaw).filter(s=>_sessionOrigin(s)===selectedOrigin);
-  const selectedReferenceRaw=selectedOrigin==='webui'
-    ? webuiReferenceRaw
-    : selectedOrigin==='cli'
-      ? cliReferenceRaw
-      : webuiReferenceRaw.concat(cliReferenceRaw).filter(s=>_sessionOrigin(s)===selectedOrigin);
-  const serverArchivedCount=showCliOnly?_archivedCliCount:_archivedWebuiCount;
+  const selectedOrigins=new Set(activeSourceFilters);
+  const sourceRowsById=new Map(allMatched.filter(Boolean).map(s=>[s.session_id,s]));
+  const effectiveOrigin=s=>{
+    const parent=s&&s.parent_session_id?sourceRowsById.get(s.parent_session_id):null;
+    return parent&&_isChildSession(s)?_sessionOrigin(parent):_sessionOrigin(s);
+  };
+  const selectedProfileFiltered=webuiProfileFiltered.concat(cliProfileFiltered).filter(s=>selectedOrigins.has(effectiveOrigin(s)));
+  const selectedSessionsRaw=webuiSessionsRaw.concat(cliSessionsRaw).filter(s=>selectedOrigins.has(effectiveOrigin(s)));
+  const selectedReferenceRaw=webuiReferenceRaw.concat(cliReferenceRaw).filter(s=>selectedOrigins.has(effectiveOrigin(s)));
+  const showCliOnly=selectedOrigins.size===1&&selectedOrigins.has('cli');
+  const serverArchivedCount=(selectedOrigins.has('webui')?_archivedWebuiCount:0)+([...selectedOrigins].some(origin=>origin!=='webui')?_archivedCliCount:0);
   const selectedArchivedCount=selectedSessionsRaw.filter(s=>s.archived).length;
-  const originServerArchivedCount=selectedOrigin==='cli'?_archivedCliCount:_archivedWebuiCount;
   return {
     cliSessionCount,
     profileFiltered: selectedProfileFiltered,
     sessionsRaw: selectedSessionsRaw,
     referenceRaw: selectedReferenceRaw,
     archivedCount: Math.max(showCliOnly ? cliArchivedCount : webuiArchivedCount, Number(serverArchivedCount||0)),
-    originArchivedCount: Math.max(selectedArchivedCount, Number(originServerArchivedCount||serverArchivedCount||0)),
+    originArchivedCount: Math.max(selectedArchivedCount, Number(serverArchivedCount||0)),
     webuiReferenceRaw,
     cliReferenceRaw,
     webuiSessionsRaw,
@@ -7740,14 +7826,17 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
 // suppression context — silently hiding a visible child/fork whose archived
 // ancestor lives outside the current view. Scope the references to the same
 // project + source bucket as the render they feed before using them.
-function _scopedSidebarReferenceRows(isCli){
+function _scopedSidebarReferenceRows(isCli=null){
   if(typeof _sidebarReferenceSessions==='undefined'||!Array.isArray(_sidebarReferenceSessions)||!_sidebarReferenceSessions.length) return [];
-  const sourceFilter=typeof _sessionSourceFilter==='string'?_sessionSourceFilter:'webui';
+  const activeSourceFilters=typeof _sessionSourceFilters!=='undefined'&&Array.isArray(_sessionSourceFilters)
+    ? _sessionSourceFilters
+    : [typeof _sessionSourceFilter==='string'?_sessionSourceFilter:'webui'];
+  const selectedOrigins=new Set(activeSourceFilters.map(source=>String(source||'').trim().toLowerCase().replace(/[- ]/g,'_')).filter(Boolean));
   return _sidebarReferenceSessions.filter(s=>{
     if(!s) return false;
-    if(sourceFilter!=='webui'&&sourceFilter!=='cli'&&_sessionOrigin(s)!==sourceFilter) return false;
+    if(!selectedOrigins.has(_sessionOrigin(s))) return false;
     // Source scope: only references in the same webui/cli bucket as this render.
-    if(_isCliSession(s)!==!!isCli) return false;
+    if(typeof isCli==='boolean'&&_isCliSession(s)!==isCli) return false;
     // Project scope: mirror _partitionSidebarSessionRows exactly.
     if(_activeProject===NO_PROJECT_FILTER){ if(s.project_id) return false; }
     else if(_activeProject){ if(s.project_id!==_activeProject) return false; }
@@ -7862,8 +7951,7 @@ function renderSessionListFromCache(){
     cliSessionsRaw,
   }=sidebarPartition;
   const referenceRaw=sidebarPartition.referenceRaw;
-  const isCliView=_sessionSourceFilter==='cli';
-  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, [...referenceRaw, ..._scopedSidebarReferenceRows(isCliView)]);
+  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, [...referenceRaw, ..._scopedSidebarReferenceRows()]);
   // Server-provided source bucket counts are authoritative for the current
   // payload. When present, skip the expensive cross-bucket render/count pass;
   // null is a deliberate "not computed" sentinel consumed only by
@@ -8036,11 +8124,12 @@ function renderSessionListFromCache(){
     list.appendChild(toggle);
   }
   // Empty state for active project filter
-  if(sessions.length===0&&_sessionSourceFilter!=='webui'){
+  if(sessions.length===0&&!(_sessionSourceFilters.length===1&&_sessionSourceFilters[0]==='webui')){
     const empty=document.createElement('div');
     empty.className='session-empty-note';
-    empty.textContent=window._showCliSessions||_sessionSourceFilter!=='cli'
-      ? `No ${_sessionOriginLabel(_sessionSourceFilter).toLowerCase()} found.`
+    const selectedLabels=_sessionSourceFilters.map(source=>_sessionOriginLabel(source));
+    empty.textContent=window._showCliSessions||!_sessionSourceFilters.includes('cli')
+      ? `No sessions found for ${selectedLabels.join(', ')}.`
       : 'Enable Show agent sessions in Settings to list CLI sessions here.';
     list.appendChild(empty);
   } else if(_activeProject&&sessions.length===0){
@@ -8190,8 +8279,9 @@ function renderSessionListFromCache(){
   }
   const archivePagingFilterActive=_sessionArchivePagingFilterActive();
   if(_showArchived&&!archivePagingFilterActive){
-    const activeArchivedTotal=_sessionSourceFilter==='cli'?_archivedCliCount:_archivedWebuiCount;
-    const loadedArchivedCount=sidebarRows.filter(s=>s&&s.archived&&(_sessionSourceFilter==='cli'?_isCliSession(s):!_isCliSession(s))).length;
+    const selectedOrigins=new Set(_sessionSourceFilters);
+    const activeArchivedTotal=(selectedOrigins.has('webui')?_archivedWebuiCount:0)+([...selectedOrigins].some(origin=>origin!=='webui')?_archivedCliCount:0);
+    const loadedArchivedCount=sidebarRows.filter(s=>s&&s.archived&&selectedOrigins.has(_sessionOrigin(s))).length;
     const archiveLoadCapReached=Number(_archivedRowsLoadedLimit||0)>=SESSION_ARCHIVED_MAX_LOADED_LIMIT;
     const remainingArchived=archiveLoadCapReached?0:Math.max(0, Number(activeArchivedTotal||0)-loadedArchivedCount);
     if(remainingArchived>0){
