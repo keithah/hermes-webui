@@ -8364,6 +8364,25 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             "aliases": model_aliases,
         }
 
+    # Cache-only callers are latency-sensitive session/display paths. Never
+    # wait behind a live provider rebuild: the persisted session model is
+    # authoritative, and the network-free minimal catalog is a safe fallback.
+    # A non-blocking lock probe still allows warm memory/disk snapshots to be
+    # reused when no rebuild owns the cache lock.
+    if prefer_cache:
+        if not _available_models_cache_lock.acquire(blocking=False):
+            return copy.deepcopy(_minimal_static_models_catalog())
+        try:
+            cached = _get_fresh_memory_models_cache(time.monotonic())
+            if cached is not None:
+                return cached
+            disk_groups = _load_models_cache_from_disk()
+            if disk_groups is not None:
+                return copy.deepcopy(disk_groups)
+            return copy.deepcopy(_minimal_static_models_catalog())
+        finally:
+            _available_models_cache_lock.release()
+
     # ── FAST PATH ─────────────────────────────────────────────────────────────
     # Mark that a build may be in progress BEFORE acquiring the lock.
     # If another thread has already started the cold path, we will wait for
@@ -8489,28 +8508,6 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
             _sync_models_cache_provenance()
             return copy.deepcopy(disk_groups)
-
-        # ── prefer_cache: NEVER run the live provider rebuild ────────────────
-        # Server-initiated wakeup turns (Option Z) reach here with a cold
-        # cache (the drain thread fires while idle; the catalog warmed by a
-        # human's /api/models has expired or was never built). The live
-        # rebuild does a Copilot token-exchange HTTPS call per the proven
-        # thread-stack; on this WSL/corp network it stalls the wakeup
-        # chat/start indefinitely. A wakeup turn does NOT need the full live
-        # catalog — _resolve_compatible_session_model_state only needs
-        # default_model/active_provider and trusts the persisted session
-        # model. Serve a network-free minimal catalog instead and let a later
-        # human request do the real live rebuild.
-        if prefer_cache:
-            # NOTE (Greptile P1): do NOT touch _cache_build_in_progress here.
-            # This branch never set the flag (only the cold path below does),
-            # and `should_wait` is sampled outside the lock (line ~4964). A
-            # concurrent cold-path caller can flip the flag to True after our
-            # sample but before we acquire the lock; clearing it here would
-            # prematurely release that rebuild's serialization, waking waiters
-            # to an empty cache and triggering a second live rebuild. Just
-            # serve the network-free minimal catalog and leave the flag alone.
-            return copy.deepcopy(_minimal_static_models_catalog())
 
         # Cold path: full rebuild — only one thread reaches here at a time
         with _cache_build_cv:

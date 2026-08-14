@@ -655,6 +655,32 @@ def test_nonblocking_session_visit_uses_cache_only_fallback_when_no_stale_catalo
     release_refresh.set()
 
 
+def test_prefer_cache_does_not_wait_behind_live_catalog_lock(monkeypatch):
+    import api.config as cfg
+    import threading
+    import time as time_module
+
+    held = threading.Event()
+    release = threading.Event()
+
+    def _hold_catalog_lock():
+        with cfg._available_models_cache_lock:
+            held.set()
+            release.wait(timeout=2.0)
+
+    holder = threading.Thread(target=_hold_catalog_lock)
+    holder.start()
+    assert held.wait(timeout=1.0)
+    started = time_module.monotonic()
+    result = cfg.get_available_models(prefer_cache=True)
+    elapsed = time_module.monotonic() - started
+    release.set()
+    holder.join(timeout=1.0)
+
+    assert isinstance(result, dict)
+    assert elapsed < 0.1
+
+
 class _FakeHandler:
     def __init__(self):
         self.status = None
