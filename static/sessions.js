@@ -954,12 +954,16 @@ function _rememberSessionListSource(s, sid = null, allowScopeFallback = true) {
   const resolvedSid = sid || (s && s.session_id);
   if (!resolvedSid) return;
   let source = null;
-  if (s && typeof _isCliSession === 'function') {
+  if (s && typeof _sessionOrigin === 'function') {
+    source = _sessionOrigin(s);
+  } else if (s && typeof _isCliSession === 'function') {
     source = _isCliSession(s) ? 'cli' : 'webui';
   }
   if (!source && Array.isArray(_allSessions)) {
     const cached = _allSessions.find(item => item && item.session_id === resolvedSid);
-    if (cached && typeof _isCliSession === 'function') {
+    if (cached && typeof _sessionOrigin === 'function') {
+      source = _sessionOrigin(cached);
+    } else if (cached && typeof _isCliSession === 'function') {
       source = _isCliSession(cached) ? 'cli' : 'webui';
     }
   }
@@ -2559,7 +2563,10 @@ const _SESSION_ORIGIN_LABELS={
 function _sessionOrigin(session){
   if(!session) return 'other';
   const explicit=String(session.session_origin||'').trim().toLowerCase();
-  if(explicit) return explicit.replace(/[- ]/g,'_');
+  if(explicit){
+    const normalizedExplicit=explicit.replace(/[- ]/g,'_');
+    if(normalizedExplicit.length<=48&&/^[a-z0-9_]+$/.test(normalizedExplicit))return normalizedExplicit;
+  }
   const raw=[session.source_tag,session.raw_source,session.source,session.platform,session.source_label]
     .map(value=>String(value||'').trim().toLowerCase().replace(/[- ]/g,'_'));
   const known=_SESSION_ORIGIN_ORDER.filter(origin=>origin!=='webui');
@@ -2707,6 +2714,7 @@ function _clearSessionSourceTabCounts() {
   _serverCliSessionCount = null;
   _serverSessionOriginCounts = null;
   _serverSessionOriginLabels = null;
+  _serverArchivedSessionOriginCounts = null;
 }
 
 function _normalizeSessionSourceFilters(values){
@@ -2714,14 +2722,14 @@ function _normalizeSessionSourceFilters(values){
   const seen=new Set();
   for(const value of (Array.isArray(values)?values:[])){
     const source=String(value||'').trim().toLowerCase().replace(/[- ]/g,'_');
-    if(!source||!/^[a-z0-9_]+$/.test(source)||seen.has(source))continue;
+    if(!source||source.length>48||!/^[a-z0-9_]+$/.test(source)||seen.has(source))continue;
     seen.add(source);normalized.push(source);
   }
   return normalized.length?normalized:['webui'];
 }
 
 function _requestedSessionSidebarSources() {
-  return window._showCliSessions ? _normalizeSessionSourceFilters(_sessionSourceFilters) : ['webui'];
+  return _normalizeSessionSourceFilters(_sessionSourceFilters);
 }
 
 function _sessionSourceSelectionKey(values){
@@ -2766,6 +2774,15 @@ function _sessionSourceTabCount(filter, renderedWebuiSessionCount, renderedCliSe
   const serverCount = filter === 'cli' ? _serverCliSessionCount : _serverWebuiSessionCount;
   if (Number.isFinite(serverCount)) return serverCount;
   return filter === 'cli' ? renderedCliSessionCount : renderedWebuiSessionCount;
+}
+
+function _selectedSessionOriginArchivedCount(origins){
+  const selected=[...new Set(Array.isArray(origins)?origins:[])];
+  if(_serverArchivedSessionOriginCounts&&typeof _serverArchivedSessionOriginCounts==='object'){
+    return selected.reduce((total,origin)=>total+(Number(_serverArchivedSessionOriginCounts[origin])||0),0);
+  }
+  return (selected.includes('webui')?_archivedWebuiCount:0)
+    +(selected.some(origin=>origin!=='webui')?_archivedCliCount:0);
 }
 
 function _setActiveProjectFilter(projectId) {
@@ -4135,6 +4152,7 @@ let _serverWebuiSessionCount = null;  // explicit server count for WebUI session
 let _serverCliSessionCount = null;    // explicit server count for CLI sessions
 let _serverSessionOriginCounts = null;
 let _serverSessionOriginLabels = null;
+let _serverArchivedSessionOriginCounts = null;
 let _sessionSourceMenuCleanup = null;
 let _sessionSourceFilters = ['webui'];  // ordered, non-empty high-level origins
 let _sessionSourceFilter = 'webui';  // first-origin compatibility alias
@@ -4512,6 +4530,28 @@ function _updateBatchActionBar(){
   if(!_sessionSelectMode) return;
   _renderSessionBatchDock();
 }
+async function _settleSessionBatchRequests(ids,request){
+  const settled=await Promise.allSettled(ids.map(async sid=>({sid,value:await request(sid)})));
+  const succeeded=[];
+  const failed=[];
+  settled.forEach((result,index)=>{
+    const sid=ids[index];
+    if(result.status==='fulfilled') succeeded.push(result.value);
+    else failed.push({sid,error:String(result.reason&&result.reason.message||result.reason||'Request failed')});
+  });
+  return {succeeded,failed};
+}
+function _retainFailedBatchSelection(failed){
+  _selectedSessions.clear();
+  for(const item of failed||[])if(item&&item.sid)_selectedSessions.add(item.sid);
+  _renderSessionBatchDock();
+}
+function _refreshSessionListAfterBatch(){
+  return Promise.resolve().then(()=>renderSessionList()).then(()=>null).catch(error=>{
+    showToast('Changes were saved, but the conversation list could not refresh.',0,'error');
+    return error;
+  });
+}
 function _renderBatchActionBar(){
   const bar=$('batchActionBar');if(!bar)return;
   const count=_selectedSessions.size;
@@ -4542,14 +4582,19 @@ function _renderBatchActionBar(){
       danger:true
     });
     if(!ok)return;
-    try{
-      const results=await Promise.all(ids.map(async sid=>{
-        const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:sid,archived:true})});
-        return {response,session:sessionsById.get(sid)||null};
-      }));
+    const outcome=await _settleSessionBatchRequests(ids,async sid=>({
+      response:await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:sid,archived:true})}),
+      session:sessionsById.get(sid)||null,
+    }));
+    const results=outcome.succeeded.map(item=>item.value);
+    await _refreshSessionListAfterBatch();
+    if(outcome.failed.length){
+      _retainFailedBatchSelection(outcome.failed);
+      showToast(`Archived ${outcome.succeeded.length}; ${outcome.failed.length} failed.`,0,'error');
+    }else{
       const retainedCount=_worktreeResponseCount(results);
-      showToast(retainedCount?t('session_archived_worktree'):t('session_archived'));exitSessionSelectMode();await renderSessionList();
-    }catch(e){showToast('Archive failed: '+(e.message||e));}
+      showToast(retainedCount?t('session_archived_worktree'):t('session_archived'));exitSessionSelectMode();
+    }
   };bar.appendChild(archiveBtn);
   // Move
   const moveBtn=document.createElement('button');moveBtn.className='batch-action-btn';
@@ -4571,24 +4616,32 @@ function _renderBatchActionBar(){
       danger:true
     });
     if(!ok)return;
+    const outcome=await _settleSessionBatchRequests(ids,async sid=>({
+      response:await api('/api/session/delete',{method:'POST',body:JSON.stringify({session_id:sid})}),
+      session:sessionsById.get(sid)||null,
+    }));
+    const results=outcome.succeeded.map(item=>item.value);
+    const succeededIds=outcome.succeeded.map(item=>item.sid);
     try{
-      const results=await Promise.all(ids.map(async sid=>{
-        const response=await api('/api/session/delete',{method:'POST',body:JSON.stringify({session_id:sid})});
-        return {response,session:sessionsById.get(sid)||null};
-      }));
       const retainedCount=_worktreeResponseCount(results);
       const cleanupFailedCount=results.filter(result=>result.response&&result.response.state_db_cleanup_failed).length;
-      ids.forEach(_clearHandoffStorageForSession);
-      if(S.session&&ids.includes(S.session.session_id)){
+      succeededIds.forEach(_clearHandoffStorageForSession);
+      if(S.session&&succeededIds.includes(S.session.session_id)){
         S.session=null;S.messages=[];S.entries=[];localStorage.removeItem('hermes-webui-session');
         if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(null);
         const remaining=await api('/api/sessions'+_sessionListQueryString());
         if(remaining.sessions&&remaining.sessions.length){await loadSession(remaining.sessions[0].session_id);}
         else{$('msgInner').innerHTML='';$('emptyState').style.display='';}
       }
-      if(cleanupFailedCount) showToast(t('delete_failed')+' ('+cleanupFailedCount+'/'+ids.length+')',0,'error');
-      else showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))+' ('+ids.length+')');
-      exitSessionSelectMode();await renderSessionList();
+      await _refreshSessionListAfterBatch();
+      if(outcome.failed.length){
+        _retainFailedBatchSelection(outcome.failed);
+        showToast(`Deleted ${succeededIds.length}; ${outcome.failed.length} failed.`,0,'error');
+      }else{
+        if(cleanupFailedCount) showToast(t('delete_failed')+' ('+cleanupFailedCount+'/'+ids.length+')',0,'error');
+        else showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))+' ('+ids.length+')');
+        exitSessionSelectMode();
+      }
     }catch(e){showToast('Delete failed: '+(e.message||e));}
   };bar.appendChild(deleteBtn);
 }
@@ -4610,10 +4663,18 @@ function _showBatchProjectPicker(){
   bar.querySelectorAll('.batch-project-picker').forEach(p=>p.remove());
   const picker=document.createElement('div');picker.className='project-picker batch-project-picker';
   const none=document.createElement('div');none.className='project-picker-item';none.textContent='No project';
+  const moveSelected=async(projectId,successMessage)=>{
+    const outcome=await _settleSessionBatchRequests(ids,sid=>api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:sid,project_id:projectId})}));
+    await _refreshSessionListAfterBatch();
+    if(outcome.failed.length){
+      _retainFailedBatchSelection(outcome.failed);
+      showToast(`Moved ${outcome.succeeded.length}; ${outcome.failed.length} failed.`,0,'error');
+    }else{
+      showToast(successMessage);exitSessionSelectMode();
+    }
+  };
   none.onclick=async()=>{picker.remove();
-    try{await Promise.all(ids.map(sid=>api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:sid,project_id:null})})));
-      showToast('Removed from project');exitSessionSelectMode();await renderSessionList();
-    }catch(e){showToast('Move failed: '+(e.message||e));}
+    await moveSelected(null,'Removed from project');
   };picker.appendChild(none);
   for(const p of(_allProjects||[])){
     const item=document.createElement('div');item.className='project-picker-item';
@@ -4621,9 +4682,7 @@ function _showBatchProjectPicker(){
       dot.style.cssText='width:6px;height:6px;border-radius:50%;background:'+p.color+';flex-shrink:0;';item.appendChild(dot);}
     const name=document.createElement('span');name.textContent=p.name;item.appendChild(name);
     item.onclick=async()=>{picker.remove();
-      try{await Promise.all(ids.map(sid=>api('/api/session/move',{method:'POST',body:JSON.stringify({session_id:sid,project_id:p.project_id})})));
-        showToast('Moved to '+p.name);exitSessionSelectMode();await renderSessionList();
-      }catch(e){showToast('Move failed: '+(e.message||e));}
+      await moveSelected(p.project_id,'Moved to '+p.name);
     };picker.appendChild(item);
   }
   bar.appendChild(picker);
@@ -5666,6 +5725,8 @@ function _sessionListRenderSignature(){
       !!_showAllProfiles,
       _otherProfileCount,_archivedWebuiCount,_archivedCliCount,
       _serverWebuiSessionCount,_serverCliSessionCount,
+      _serverSessionOriginCounts,_serverSessionOriginLabels,
+      _serverArchivedSessionOriginCounts,
     ]);
   }catch(_){ return null; }
 }
@@ -5687,6 +5748,9 @@ function _applySessionListPayload(sessData, projData, opts){
     ? sessData.session_origin_counts : null;
   _serverSessionOriginLabels = sessData.session_origin_labels && typeof sessData.session_origin_labels === 'object'
     ? sessData.session_origin_labels : null;
+  _serverArchivedSessionOriginCounts = sessData.archived_session_origin_counts
+    && typeof sessData.archived_session_origin_counts === 'object'
+    ? sessData.archived_session_origin_counts : null;
   if (!Number.isFinite(_serverWebuiSessionCount)) _serverWebuiSessionCount = null;
   if (!Number.isFinite(_serverCliSessionCount)) _serverCliSessionCount = null;
   // Capture server clock for clock-skew compensation (issue #1144).
@@ -7787,11 +7851,6 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   let activeSourceFilters=typeof _sessionSourceFilters!=='undefined'&&Array.isArray(_sessionSourceFilters)
     ? _sessionSourceFilters.slice()
     : [typeof _sessionSourceFilter==='string'?_sessionSourceFilter:'webui'];
-  if(activeSourceFilters.some(source=>source!=='webui') && !window._showCliSessions && cliSessionCount===0){
-    activeSourceFilters=['webui'];
-    if(typeof _sessionSourceFilters!=='undefined') _sessionSourceFilters=activeSourceFilters.slice();
-    _sessionSourceFilter='webui';
-  }
   const selectedOrigins=new Set(activeSourceFilters);
   const sourceRowsById=new Map(allMatched.filter(Boolean).map(s=>[s.session_id,s]));
   const effectiveOrigin=s=>{
@@ -7802,7 +7861,9 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   const selectedSessionsRaw=webuiSessionsRaw.concat(cliSessionsRaw).filter(s=>selectedOrigins.has(effectiveOrigin(s)));
   const selectedReferenceRaw=webuiReferenceRaw.concat(cliReferenceRaw).filter(s=>selectedOrigins.has(effectiveOrigin(s)));
   const showCliOnly=selectedOrigins.size===1&&selectedOrigins.has('cli');
-  const serverArchivedCount=(selectedOrigins.has('webui')?_archivedWebuiCount:0)+([...selectedOrigins].some(origin=>origin!=='webui')?_archivedCliCount:0);
+  const serverArchivedCount=typeof _selectedSessionOriginArchivedCount==='function'
+    ? _selectedSessionOriginArchivedCount([...selectedOrigins])
+    : (selectedOrigins.has('webui')?_archivedWebuiCount:0)+([...selectedOrigins].some(origin=>origin!=='webui')?_archivedCliCount:0);
   const selectedArchivedCount=selectedSessionsRaw.filter(s=>s.archived).length;
   return {
     cliSessionCount,
@@ -8280,7 +8341,7 @@ function renderSessionListFromCache(){
   const archivePagingFilterActive=_sessionArchivePagingFilterActive();
   if(_showArchived&&!archivePagingFilterActive){
     const selectedOrigins=new Set(_sessionSourceFilters);
-    const activeArchivedTotal=(selectedOrigins.has('webui')?_archivedWebuiCount:0)+([...selectedOrigins].some(origin=>origin!=='webui')?_archivedCliCount:0);
+    const activeArchivedTotal=_selectedSessionOriginArchivedCount([...selectedOrigins]);
     const loadedArchivedCount=sidebarRows.filter(s=>s&&s.archived&&selectedOrigins.has(_sessionOrigin(s))).length;
     const archiveLoadCapReached=Number(_archivedRowsLoadedLimit||0)>=SESSION_ARCHIVED_MAX_LOADED_LIMIT;
     const remainingArchived=archiveLoadCapReached?0:Math.max(0, Number(activeArchivedTotal||0)-loadedArchivedCount);

@@ -326,3 +326,67 @@ def test_batch_delete_uses_confirm_dialog():
         "Batch delete should use session_batch_delete_confirm i18n key"
     assert "showConfirmDialog" in src, \
         "Should use showConfirmDialog for batch operations"
+
+
+def test_batch_request_settles_every_item_and_reports_partial_success():
+    import json
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not on PATH")
+    with open('static/sessions.js', encoding="utf-8") as f:
+        src = f.read()
+
+    marker = "async function _settleSessionBatchRequests("
+    start = src.index(marker)
+    brace = src.index("{", start)
+    depth = 0
+    end = None
+    for index in range(brace, len(src)):
+        if src[index] == "{":
+            depth += 1
+        elif src[index] == "}":
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                break
+    helper = src[start:end]
+    script = f"""
+{helper}
+const attempted = [];
+_settleSessionBatchRequests(['a', 'b', 'c'], async sid => {{
+  attempted.push(sid);
+  if (sid === 'b') throw new Error('denied');
+  return {{sid}};
+}}).then(result => console.log(JSON.stringify({{attempted, result}})));
+"""
+    completed = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
+    body = json.loads(completed.stdout)
+
+    assert body["attempted"] == ["a", "b", "c"]
+    assert [item["sid"] for item in body["result"]["succeeded"]] == ["a", "c"]
+    assert [item["sid"] for item in body["result"]["failed"]] == ["b"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_batch_refresh_failure_is_reported_without_rejecting_completed_mutations():
+    with open('static/sessions.js', encoding="utf-8") as f:
+        src = f.read()
+    helper = _extract_function(src, "_refreshSessionListAfterBatch")
+    script = f"""
+const toasts = [];
+global.renderSessionList = async () => {{ throw new Error('offline'); }};
+global.showToast = (...args) => toasts.push(args);
+{helper}
+_refreshSessionListAfterBatch().then(error => console.log(JSON.stringify({{
+  error: error && error.message,
+  toasts,
+}})));
+"""
+    completed = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    body = json.loads(completed.stdout)
+
+    assert body["error"] == "offline"
+    assert body["toasts"][0][0] == "Changes were saved, but the conversation list could not refresh."

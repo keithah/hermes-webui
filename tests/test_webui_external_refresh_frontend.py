@@ -341,6 +341,10 @@ def test_session_list_render_signature_serializes_full_rows_not_a_narrow_allowli
     assert "_allSessions," in block, "signature must serialize the full applied rows"
     assert "_sidebarReferenceSessions," in block, \
         "signature must include the hidden reference/nesting rows the sidebar renders"
+    assert "_serverSessionOriginCounts," in block, \
+        "signature must repaint when source availability/counts change"
+    assert "_serverSessionOriginLabels," in block, \
+        "signature must repaint when server-provided source labels change"
     # Fail-open on serialization failure (never skip on null).
     assert "catch(_){ return null; }" in block
 
