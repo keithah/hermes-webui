@@ -498,6 +498,54 @@ console.log(JSON.stringify({{filters:_sessionSourceFilters,writes:localStorage.w
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_explicit_external_sources_are_requested_when_global_cli_display_is_off():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    normalize_fn = _extract_function(src, "_normalizeSessionSourceFilters")
+    requested_fn = _extract_function(src, "_requestedSessionSidebarSources")
+    query_fn = _extract_function(src, "_sessionListQueryString")
+    script = f"""
+global.window = {{ _showCliSessions: false }};
+global._sessionSourceFilters = ['matrix', 'webui'];
+global._activeProject = null;
+global.NO_PROJECT_FILTER = '__none__';
+global._showAllProfiles = false;
+global._showArchived = false;
+global.$ = () => null;
+{normalize_fn}
+{requested_fn}
+function _sessionListExcludeHiddenEnabled() {{ return true; }}
+{query_fn}
+console.log(JSON.stringify({{
+  requested: _requestedSessionSidebarSources(),
+  query: _sessionListQueryString(),
+}}));
+"""
+    body = _run_node(script)
+
+    assert body == {
+        "requested": ["matrix", "webui"],
+        "query": "?sidebar_source=matrix&sidebar_source=webui&exclude_hidden=1",
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_client_source_normalization_matches_server_length_limit():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    normalize_fn = _extract_function(src, "_normalizeSessionSourceFilters")
+    script = f"""
+{normalize_fn}
+console.log(JSON.stringify({{
+  longestValid: _normalizeSessionSourceFilters(['{'m' * 48}']),
+  tooLong: _normalizeSessionSourceFilters(['{'m' * 49}']),
+}}));
+"""
+    body = _run_node(script)
+
+    assert body["longestValid"] == ["m" * 48]
+    assert body["tooLong"] == ["webui"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_session_list_query_string_respects_sidebar_source_and_flags():
     src = SESSIONS_JS.read_text(encoding="utf-8")
     normalize_fn = _extract_function(src, "_normalizeSessionSourceFilters")
@@ -544,11 +592,11 @@ console.log(JSON.stringify({{ first, second, searchFiltered, projectFiltered, ca
     body = _run_node(script)
 
     assert body["first"] == "?sidebar_source=cli&exclude_hidden=1&all_profiles=1"
-    assert body["second"] == "?sidebar_source=webui&exclude_hidden=1&all_profiles=1&include_archived=1&archived_limit=100"
-    assert body["searchFiltered"] == "?sidebar_source=webui&exclude_hidden=1&all_profiles=1&include_archived=1"
-    assert body["projectFiltered"] == "?sidebar_source=webui&all_profiles=1&include_archived=1"
-    assert body["capped"] == "?sidebar_source=webui&exclude_hidden=1&all_profiles=1&include_archived=1&archived_limit=2000"
-    assert body["third"] == "?sidebar_source=webui&exclude_hidden=1"
+    assert body["second"] == "?sidebar_source=cli&exclude_hidden=1&all_profiles=1&include_archived=1&archived_limit=100"
+    assert body["searchFiltered"] == "?sidebar_source=cli&exclude_hidden=1&all_profiles=1&include_archived=1"
+    assert body["projectFiltered"] == "?sidebar_source=cli&all_profiles=1&include_archived=1"
+    assert body["capped"] == "?sidebar_source=cli&exclude_hidden=1&all_profiles=1&include_archived=1&archived_limit=2000"
+    assert body["third"] == "?sidebar_source=cli&exclude_hidden=1"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -762,6 +810,25 @@ console.log(JSON.stringify(Object.keys(INFLIGHT).sort()));
     body = _run_node(script)
 
     assert body == ["slack-hidden"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_runtime_state_records_the_high_level_session_origin():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    remember_source_fn = _extract_function(src, "_rememberSessionListSource")
+    script = f"""
+global._allSessions = [];
+global._allSessionsScope = {{sidebarSource:'matrix', sidebarSourcesKey:'matrix,webui'}};
+global._sessionListSourceById = new Map();
+global._sessionOrigin = session => session.session_origin;
+global._isCliSession = () => false;
+{remember_source_fn}
+_rememberSessionListSource({{session_id:'matrix-1', session_origin:'matrix'}});
+console.log(JSON.stringify(Array.from(_sessionListSourceById.entries())));
+"""
+    body = _run_node(script)
+
+    assert body == [["matrix-1", "matrix"]]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")

@@ -2343,19 +2343,46 @@ def _build_session_list_cache_payload(
     webui_sessions = [_normalize_sidebar_source_flags(s) for s in webui_sessions]
     if show_cli_sessions:
         diag_stage("get_cli_sessions")
-        if _callable_accepts_kwarg(get_cli_sessions, "include_claude_code"):
-            cli = get_cli_sessions(
-                source_filter=source_filter,
-                all_profiles=all_profiles,
-                include_claude_code=show_claude_code_sessions,
+        requested_external_origins = tuple(
+            source for source in selected_sidebar_sources if source != "webui"
+        )
+        source_aliases = {
+            "api": ("api", "api_server"),
+            "other": ("other", "messaging", "external_agent"),
+            "wecom_callback": ("wecom_callback", "wecom-callback"),
+        }
+        discovered_source_aliases = _sidebar_state_raw_sources_for_origins(
+            requested_external_origins
+        )
+        requested_external_filters = tuple(dict.fromkeys(
+            loader_source
+            for origin in requested_external_origins
+            for loader_source in (
+                *source_aliases.get(origin, (origin,)),
+                *discovered_source_aliases.get(origin, ()),
             )
-        else:
-            # Focused tests sometimes monkeypatch routes.get_cli_sessions with
-            # the historical two-keyword signature.
-            cli = get_cli_sessions(
-                source_filter=source_filter,
-                all_profiles=all_profiles,
-            )
+        ))
+        loader_filters = requested_external_filters or (source_filter,)
+        cli_by_loaded_id: dict[str, dict] = {}
+        for loader_filter in loader_filters:
+            if _callable_accepts_kwarg(get_cli_sessions, "include_claude_code"):
+                loaded_cli = get_cli_sessions(
+                    source_filter=loader_filter,
+                    all_profiles=all_profiles,
+                    include_claude_code=show_claude_code_sessions,
+                )
+            else:
+                # Focused tests sometimes monkeypatch routes.get_cli_sessions with
+                # the historical two-keyword signature.
+                loaded_cli = get_cli_sessions(
+                    source_filter=loader_filter,
+                    all_profiles=all_profiles,
+                )
+            for loaded_session in loaded_cli:
+                sid = str(loaded_session.get("session_id") or "")
+                if sid and sid not in cli_by_loaded_id:
+                    cli_by_loaded_id[sid] = loaded_session
+        cli = list(cli_by_loaded_id.values())
         diag_stage("merge_cli_sessions")
         cli_by_id = {s["session_id"]: s for s in cli}
         # #3238/#4591: reconcile orphaned imported sidecars. When a CLI or
@@ -2545,8 +2572,20 @@ def _build_session_list_cache_payload(
     )
     if show_cli_sessions:
         diag_stage("cli_cap")
-        archived_scoped = _cap_recent_cli_sessions(archived_scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
-        visible_scoped = _cap_recent_cli_sessions(visible_scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
+        if external_sidebar_origins:
+            archived_scoped = _cap_recent_sessions_per_origin(
+                archived_scoped,
+                origins=external_sidebar_origins,
+                origin_cap=CLI_VISIBLE_SESSION_CAP,
+            )
+            visible_scoped = _cap_recent_sessions_per_origin(
+                visible_scoped,
+                origins=external_sidebar_origins,
+                origin_cap=CLI_VISIBLE_SESSION_CAP,
+            )
+        else:
+            archived_scoped = _cap_recent_cli_sessions(archived_scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
+            visible_scoped = _cap_recent_cli_sessions(visible_scoped, cli_cap=CLI_VISIBLE_SESSION_CAP)
     if visible_only:
         archived_scoped = [
             s for s in archived_scoped if _session_has_server_visible_messages(s)
@@ -2566,6 +2605,10 @@ def _build_session_list_cache_payload(
         if s.get("archived") and _is_cli_session_for_settings(s)
     )
     archived_count = archived_webui_count + archived_cli_count
+    archived_session_origin_counts: dict[str, int] = defaultdict(int)
+    for session in archived_scoped:
+        if session.get("archived"):
+            archived_session_origin_counts[_sidebar_session_origin(session)] += 1
     def _filter_sidebar_source(rows: list[dict]) -> list[dict]:
         if selected_sidebar_source_set:
             return [s for s in rows if _sidebar_session_origin(s) in selected_sidebar_source_set]
@@ -2646,6 +2689,7 @@ def _build_session_list_cache_payload(
         "archived_count": archived_count,
         "archived_webui_count": archived_webui_count,
         "archived_cli_count": archived_cli_count,
+        "archived_session_origin_counts": dict(archived_session_origin_counts),
         "webui_session_count": webui_session_count,
         "cli_session_count": cli_session_count,
         "session_origin_counts": dict(session_origin_counts),
@@ -2714,6 +2758,11 @@ def _session_list_payload_to_response(payload: dict) -> dict:
         response["session_origin_counts"] = {
             str(key): int(value or 0)
             for key, value in dict(payload.get("session_origin_counts") or {}).items()
+        }
+    if "archived_session_origin_counts" in payload:
+        response["archived_session_origin_counts"] = {
+            str(key): int(value or 0)
+            for key, value in dict(payload.get("archived_session_origin_counts") or {}).items()
         }
     if "session_origin_labels" in payload:
         response["session_origin_labels"] = {
@@ -10136,6 +10185,14 @@ _SIDEBAR_ORIGIN_LABELS = {
 }
 
 
+def _validated_sidebar_origin_key(value) -> str:
+    """Return a client-selectable origin key or the safe ``other`` bucket."""
+    normalized = _normalized_source_marker(value)
+    if len(normalized) > 48 or not re.fullmatch(r"[a-z0-9_]+", normalized):
+        return "other"
+    return normalized or "other"
+
+
 def _sidebar_session_origin(session: dict) -> str:
     """Return the durable high-level origin bucket for one sidebar row.
 
@@ -10147,9 +10204,13 @@ def _sidebar_session_origin(session: dict) -> str:
     if not isinstance(session, dict):
         return "other"
 
+    invalid_explicit = False
     explicit = str(session.get("session_origin") or "").strip().lower()
     if explicit:
-        return explicit.replace("-", "_").replace(" ", "_")
+        validated_explicit = _validated_sidebar_origin_key(explicit)
+        if validated_explicit != "other" or _normalized_source_marker(explicit) == "other":
+            return validated_explicit
+        invalid_explicit = True
 
     markers = []
     for key in ("source_tag", "raw_source", "source", "platform"):
@@ -10187,12 +10248,14 @@ def _sidebar_session_origin(session: dict) -> str:
     if session.get("is_cli_session"):
         return "cli"
     if not markers and not session_source:
+        if invalid_explicit:
+            return "other"
         return "webui"
-    return markers[0] if markers else "other"
+    return _validated_sidebar_origin_key(markers[0]) if markers else "other"
 
 
 def _sidebar_session_origin_label(origin: str) -> str:
-    normalized = _normalized_source_marker(origin) or "other"
+    normalized = _validated_sidebar_origin_key(origin)
     return _SIDEBAR_ORIGIN_LABELS.get(
         normalized,
         f"{normalized.replace('_', ' ').title()} sessions",
@@ -10220,6 +10283,35 @@ def _sidebar_state_origin_counts() -> dict[str, int]:
         return dict(counts)
     except Exception:
         logger.debug("Failed to read sidebar origin counts", exc_info=True)
+        return {}
+
+
+def _sidebar_state_raw_sources_for_origins(origins) -> dict[str, tuple[str, ...]]:
+    """Return exact state.db source values backing selected normalized origins."""
+    selected = {str(origin or "") for origin in origins or () if str(origin or "")}
+    if not selected:
+        return {}
+    try:
+        db_path = _active_state_db_path()
+        if not db_path or not Path(db_path).exists():
+            return {}
+        with closing(open_state_db_readonly(Path(db_path))) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "source" not in columns:
+                return {}
+            rows = conn.execute(
+                "SELECT DISTINCT source FROM sessions "
+                "WHERE source IS NOT NULL AND trim(source) != '' ORDER BY source"
+            ).fetchall()
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for (raw_source,) in rows:
+            origin = _sidebar_session_origin({"source_tag": raw_source})
+            source = str(raw_source or "").strip().lower()
+            if origin in selected and source and source not in grouped[origin]:
+                grouped[origin].append(source)
+        return {origin: tuple(values) for origin, values in grouped.items()}
+    except Exception:
+        logger.debug("Failed to read sidebar raw origin sources", exc_info=True)
         return {}
 
 
@@ -10376,6 +10468,27 @@ def _dedupe_cli_sidebar_sessions_for_api(
 
 
 CLI_VISIBLE_SESSION_CAP = 20
+
+
+def _cap_recent_sessions_per_origin(
+    sessions: list[dict],
+    *,
+    origins: set[str] | frozenset[str],
+    origin_cap: int,
+) -> list[dict]:
+    """Cap each explicitly requested origin independently, preserving order."""
+    if origin_cap <= 0 or not origins:
+        return sessions
+    seen: dict[str, int] = defaultdict(int)
+    kept = []
+    for session in sessions:
+        origin = _sidebar_session_origin(session)
+        if origin in origins:
+            seen[origin] += 1
+            if seen[origin] > origin_cap:
+                continue
+        kept.append(session)
+    return kept
 
 
 def _cap_recent_cli_sessions(sessions: list[dict], cli_cap: int = CLI_VISIBLE_SESSION_CAP) -> list[dict]:

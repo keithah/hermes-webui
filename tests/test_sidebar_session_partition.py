@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import shutil
+import subprocess
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+NODE = shutil.which("node")
 
 
 def _function_block(name: str) -> str:
@@ -48,13 +54,13 @@ def test_partition_helper_applies_message_source_project_and_archive_gates():
 
     assert "function _sidebarRowHasVisibleMessages(s, activeSidForSidebar)" in SESSIONS_JS
     assert "_sidebarRowHasVisibleMessages(s, activeSidForSidebar)" in block
-    assert "activeSourceFilters.some(source=>source!=='webui')" in block
+    assert "activeSourceFilters.some(source=>source!=='webui')" not in block
     assert "const selectedOrigins=new Set(activeSourceFilters);" in block
     assert "selectedOrigins.has(effectiveOrigin(s))" in block
     assert "parent&&_isChildSession(s)?_sessionOrigin(parent):_sessionOrigin(s)" in block
     assert "if(!_showArchived&&s.archived) continue;" in block
     assert "if(s.archived){" in block
-    assert "const serverArchivedCount=(selectedOrigins.has('webui')?_archivedWebuiCount:0)" in block
+    assert "? _selectedSessionOriginArchivedCount([...selectedOrigins])" in block
     assert "archivedCount: Math.max(showCliOnly ? cliArchivedCount : webuiArchivedCount, Number(serverArchivedCount||0))," in block
     assert "return {" in block
     assert "profileFiltered: selectedProfileFiltered," in block
@@ -77,6 +83,70 @@ def test_partition_helper_keeps_raw_source_counts_while_render_owns_visible_coun
     assert "function _countRenderedSidebarRowsFromRawSessions" not in SESSIONS_JS
     assert "function _renderSidebarRowsFromRawSessions(sessionsRaw, referenceSessionsRaw){" in SESSIONS_JS
     assert "_attachChildSessionsToSidebarRows(_collapseSessionLineageForSidebar(sessionsRaw), sessionsRaw, referenceRows)" in SESSIONS_JS
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_partition_preserves_explicit_matrix_selection_when_cli_display_is_off():
+    script = f"""
+global.window = {{ _showCliSessions: false }};
+global._sessionSourceFilters = ['matrix'];
+global._sessionSourceFilter = 'matrix';
+global._activeProject = null;
+global.NO_PROJECT_FILTER = '__none__';
+global._showArchived = false;
+global._archivedWebuiCount = 0;
+global._archivedCliCount = 0;
+global._serverArchivedSessionOriginCounts = {{}};
+global.S = {{ session: null }};
+global._sessionAttentionState = () => null;
+global._isSessionEffectivelyStreaming = () => false;
+global._isChildSession = () => false;
+global._isCliSession = () => false;
+global._sessionOrigin = session => session.session_origin;
+{_function_block('_selectedSessionOriginArchivedCount')}
+{_function_block('_sidebarRowHasVisibleMessages')}
+{_function_block('_partitionSidebarSessionRows')}
+const row = {{ session_id: 'matrix-1', session_origin: 'matrix', message_count: 1 }};
+const result = _partitionSidebarSessionRows([row], null);
+console.log(JSON.stringify({{
+  selected: _sessionSourceFilters,
+  legacy: _sessionSourceFilter,
+  ids: result.sessionsRaw.map(session => session.session_id),
+}}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", script], capture_output=True, text=True, check=True
+    )
+    body = json.loads(completed.stdout)
+
+    assert body == {
+        "selected": ["matrix"],
+        "legacy": "matrix",
+        "ids": ["matrix-1"],
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_partition_uses_authoritative_archived_counts_for_selected_origins():
+    source = SESSIONS_JS
+    helper = _function_block("_selectedSessionOriginArchivedCount")
+    script = f"""
+global._serverArchivedSessionOriginCounts = {{matrix: 2, telegram: 3, webui: 4}};
+global._archivedWebuiCount = 99;
+global._archivedCliCount = 88;
+{helper}
+console.log(JSON.stringify({{
+  matrix: _selectedSessionOriginArchivedCount(['matrix']),
+  externalUnion: _selectedSessionOriginArchivedCount(['matrix', 'telegram']),
+  mixed: _selectedSessionOriginArchivedCount(['webui', 'matrix']),
+}}));
+"""
+    completed = subprocess.run(
+        [NODE, "-e", script], capture_output=True, text=True, check=True
+    )
+    body = json.loads(completed.stdout)
+
+    assert body == {"matrix": 2, "externalUnion": 5, "mixed": 6}
 
 
 def test_archive_load_more_uses_source_wide_loaded_count_and_hides_under_filters():

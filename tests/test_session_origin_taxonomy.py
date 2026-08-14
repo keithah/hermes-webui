@@ -203,6 +203,254 @@ def test_sidebar_payload_exposes_origin_metadata_and_dynamic_filtering_contract(
     assert payload["session_origin_labels"]["matrix"] == "Matrix sessions"
 
 
+def test_selected_external_origins_are_loaded_through_independent_source_windows(monkeypatch):
+    import api.routes as routes
+    import api.profiles as profiles
+
+    calls = []
+
+    def load_external(*, source_filter=None, all_profiles=False, **_kwargs):
+        calls.append((source_filter, all_profiles))
+        return [{
+            "session_id": f"{source_filter}-1",
+            "title": source_filter,
+            "profile": "default",
+            "source_tag": source_filter,
+            "raw_source": source_filter,
+            "session_source": "messaging",
+            "message_count": 1,
+            "updated_at": 10,
+            "last_message_at": 10,
+            "archived": False,
+        }]
+
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [])
+    monkeypatch.setattr(routes, "get_cli_sessions", load_external)
+    monkeypatch.setattr(routes, "_enrich_sidebar_lineage_metadata", lambda _rows: None)
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
+    monkeypatch.setattr(routes, "_sidebar_state_origin_counts", lambda: {})
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=False,
+        show_previous_messaging_sessions=True,
+        show_cron_sessions=False,
+        sidebar_sources=("matrix", "telegram"),
+        visible_only=True,
+    )
+
+    assert calls == [("matrix", False), ("telegram", False)]
+    assert {row["session_id"] for row in payload["sessions"]} == {
+        "matrix-1",
+        "telegram-1",
+    }
+
+
+def test_aggregated_api_origin_loads_each_backing_source_alias(monkeypatch):
+    import api.routes as routes
+    import api.profiles as profiles
+
+    calls = []
+
+    def load_external(*, source_filter=None, **_kwargs):
+        calls.append(source_filter)
+        return [{
+            "session_id": f"{source_filter}-1",
+            "title": source_filter,
+            "profile": "default",
+            "source_tag": source_filter,
+            "message_count": 1,
+            "updated_at": 10,
+            "last_message_at": 10,
+            "archived": False,
+        }]
+
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [])
+    monkeypatch.setattr(routes, "get_cli_sessions", load_external)
+    monkeypatch.setattr(routes, "_enrich_sidebar_lineage_metadata", lambda _rows: None)
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
+    monkeypatch.setattr(routes, "_sidebar_state_origin_counts", lambda: {})
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=False,
+        show_previous_messaging_sessions=True,
+        show_cron_sessions=False,
+        sidebar_source="api",
+        visible_only=True,
+    )
+
+    assert calls == ["api", "api_server"]
+    assert {row["session_origin"] for row in payload["sessions"]} == {"api"}
+
+
+def test_other_origin_loads_sanitized_raw_sources_discovered_in_state(monkeypatch):
+    import api.routes as routes
+    import api.profiles as profiles
+
+    calls = []
+
+    def load_external(*, source_filter=None, **_kwargs):
+        calls.append(source_filter)
+        return []
+
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [])
+    monkeypatch.setattr(routes, "get_cli_sessions", load_external)
+    monkeypatch.setattr(routes, "_enrich_sidebar_lineage_metadata", lambda _rows: None)
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
+    monkeypatch.setattr(routes, "_sidebar_state_origin_counts", lambda: {"other": 1})
+    monkeypatch.setattr(
+        routes,
+        "_sidebar_state_raw_sources_for_origins",
+        lambda _origins: {"other": ("matrix/v2",)},
+    )
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+
+    routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=False,
+        show_previous_messaging_sessions=True,
+        show_cron_sessions=False,
+        sidebar_source="other",
+        visible_only=True,
+    )
+
+    assert calls == ["other", "messaging", "external_agent", "matrix/v2"]
+
+
+def test_multi_origin_union_is_capped_per_origin_not_globally(monkeypatch):
+    import api.routes as routes
+    import api.profiles as profiles
+
+    def load_external(*, source_filter=None, **_kwargs):
+        return [{
+            "session_id": f"{source_filter}-{index}",
+            "title": f"{source_filter}-{index}",
+            "profile": "default",
+            "source_tag": source_filter,
+            "raw_source": source_filter,
+            "session_source": "cli",
+            "is_cli_session": True,
+            "message_count": 1,
+            "updated_at": 100 - index,
+            "last_message_at": 100 - index,
+            "archived": False,
+        } for index in range(21)]
+
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [])
+    monkeypatch.setattr(routes, "get_cli_sessions", load_external)
+    monkeypatch.setattr(routes, "_enrich_sidebar_lineage_metadata", lambda _rows: None)
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
+    monkeypatch.setattr(routes, "_sidebar_state_origin_counts", lambda: {})
+    monkeypatch.setattr(routes, "_sidebar_state_raw_sources_for_origins", lambda _origins: {})
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=False,
+        show_previous_messaging_sessions=True,
+        show_cron_sessions=False,
+        sidebar_sources=("cli", "tui"),
+        visible_only=True,
+    )
+
+    counts = {}
+    for row in payload["sessions"]:
+        counts[row["session_origin"]] = counts.get(row["session_origin"], 0) + 1
+    assert counts == {"cli": 20, "tui": 20}
+
+
+def test_archived_counts_are_reported_per_high_level_origin(monkeypatch):
+    import api.routes as routes
+    import api.profiles as profiles
+
+    rows = [
+        {
+            "session_id": "matrix-archived",
+            "title": "Matrix archived",
+            "profile": "default",
+            "source_tag": "matrix",
+            "raw_source": "matrix",
+            "session_source": "messaging",
+            "message_count": 1,
+            "updated_at": 20,
+            "last_message_at": 20,
+            "archived": True,
+        },
+        {
+            "session_id": "telegram-archived",
+            "title": "Telegram archived",
+            "profile": "default",
+            "source_tag": "telegram",
+            "raw_source": "telegram",
+            "session_source": "messaging",
+            "message_count": 1,
+            "updated_at": 10,
+            "last_message_at": 10,
+            "archived": True,
+        },
+    ]
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [])
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda **_kwargs: list(rows))
+    monkeypatch.setattr(routes, "_enrich_sidebar_lineage_metadata", lambda _rows: None)
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
+    monkeypatch.setattr(routes, "_sidebar_state_origin_counts", lambda: {})
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=True,
+        show_cron_sessions=False,
+        show_matrix_sessions=True,
+        include_archived=False,
+        sidebar_source="matrix",
+        visible_only=True,
+    )
+
+    assert payload["sessions"] == []
+    assert payload["archived_session_origin_counts"] == {
+        "matrix": 1,
+        "telegram": 1,
+    }
+
+
+def test_invalid_server_origin_metadata_falls_back_to_other():
+    from api.routes import _sidebar_session_origin
+
+    assert _sidebar_session_origin({"source_tag": "matrix/v2"}) == "other"
+    assert _sidebar_session_origin({"session_origin": "x" * 49}) == "other"
+    assert _sidebar_session_origin({"source_tag": "new_adapter"}) == "new_adapter"
+    assert _sidebar_session_origin({
+        "session_origin": "matrix/v2",
+        "source_tag": "matrix",
+    }) == "matrix"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_client_ignores_invalid_explicit_origin_when_valid_raw_source_exists():
+    source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    origin_fn = _extract_function(source, "_sessionOrigin")
+    script = f"""
+const _SESSION_ORIGIN_ORDER = ['webui','cli','matrix','other'];
+function _isCliSession() {{ return false; }}
+{origin_fn}
+console.log(JSON.stringify(_sessionOrigin({{
+  session_origin:'matrix/v2',
+  source_tag:'matrix',
+}})));
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == "matrix"
+
+
 def test_webui_filtered_payload_counts_available_state_db_origins(monkeypatch, tmp_path):
     import sqlite3
     import api.routes as routes
