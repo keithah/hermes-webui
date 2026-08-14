@@ -13,10 +13,11 @@ def test_sidebar_has_dynamic_webui_and_cli_session_source_menu():
     assert "session-source-filter" in src
     assert "session-source-menu" in src
     # Upstream #7580 requires locale keys (not hardcoded English) for the
-    # known cli/webui counts; #6985 generalizes the control to N origins.
+    # known cli/webui counts; #6985 generalizes the control to N origins and
+    # replaces the singular _sessionSourceFilter check with the multi-filter set.
     assert "t('sessions_source_webui', n)" in src
     assert "t('sessions_source_cli', n)" in src
-    assert "_sessionSourceFilter==='cli'" in src
+    assert "_sessionSourceFilters" in src
 
 
 def test_session_source_labels_are_locale_keys_with_number_placeholder():
@@ -39,7 +40,7 @@ def test_cli_filter_keeps_cli_rows_out_of_default_webui_list():
     src = SESSIONS_JS.read_text(encoding="utf-8")
     assert "function _partitionSidebarSessionRows(allMatched, activeSidForSidebar)" in src
     assert "cliSessionCount" in src
-    assert "const showCliOnly=_sessionSourceFilter==='cli';" in src
+    assert "const showCliOnly=selectedOrigins.size===1&&selectedOrigins.has('cli');" in src
     assert "const webuiProfileFiltered=[];" in src
     assert "const cliProfileFiltered=[];" in src
     assert "const webuiSessionsRaw=[];" in src
