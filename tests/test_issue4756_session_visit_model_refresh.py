@@ -589,6 +589,72 @@ def test_session_visit_live_rebuild_failure_falls_back_to_cached_catalog(tmp_pat
     assert cfg.get_available_models_for_session_visit() == stale_catalog
 
 
+def test_nonblocking_session_visit_returns_stale_catalog_while_refreshing(tmp_path, monkeypatch):
+    import api.config as cfg
+    import threading
+
+    _reset_models_memory_cache(monkeypatch)
+    stale_catalog = _catalog("stale-model")
+    rebuilt_catalog = _catalog("rebuilt-model")
+    cache_path = tmp_path / "models_cache.profile.json"
+    cache_path.write_text("{}", encoding="utf-8")
+    os.utime(cache_path, (time.time() - 600.0, time.time() - 600.0))
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+
+    monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: stale_catalog)
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: stale_catalog)
+
+    def _live_rebuild(**kwargs):
+        assert kwargs == {"force_refresh": True}
+        refresh_started.set()
+        assert release_refresh.wait(timeout=2.0)
+        return rebuilt_catalog
+
+    monkeypatch.setattr(cfg, "get_available_models", _live_rebuild)
+
+    assert cfg.get_available_models_for_session_visit(nonblocking=True) == stale_catalog
+    assert refresh_started.wait(timeout=1.0)
+    release_refresh.set()
+
+
+def test_nonblocking_session_visit_uses_cache_only_fallback_when_no_stale_catalog(tmp_path, monkeypatch):
+    import api.config as cfg
+    import threading
+
+    _reset_models_memory_cache(monkeypatch)
+    fallback_catalog = _catalog("fallback-model")
+    cache_path = tmp_path / "models_cache.profile.json"
+    cache_path.write_text("{}", encoding="utf-8")
+    os.utime(cache_path, (time.time() - 600.0, time.time() - 600.0))
+    refresh_started = threading.Event()
+    release_refresh = threading.Event()
+    calls = []
+
+    monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: None)
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: None)
+
+    def _models(**kwargs):
+        calls.append(kwargs)
+        if kwargs == {"prefer_cache": True}:
+            return fallback_catalog
+        assert kwargs == {"force_refresh": True}
+        refresh_started.set()
+        assert release_refresh.wait(timeout=2.0)
+        return _catalog("rebuilt-model")
+
+    monkeypatch.setattr(cfg, "get_available_models", _models)
+
+    assert cfg.get_available_models_for_session_visit(nonblocking=True) == fallback_catalog
+    assert refresh_started.wait(timeout=1.0)
+    assert calls[0] == {"prefer_cache": True}
+    release_refresh.set()
+
+
 class _FakeHandler:
     def __init__(self):
         self.status = None
@@ -621,7 +687,8 @@ def test_models_route_session_visit_freshness_uses_bounded_helper(monkeypatch):
     expected = _catalog("route-model")
     calls = []
 
-    def _session_visit_catalog():
+    def _session_visit_catalog(**kwargs):
+        assert kwargs == {"nonblocking": True}
         calls.append("session_visit")
         return expected
 

@@ -4856,6 +4856,8 @@ _available_models_live_rebuild_ts: float = 0.0
 _available_models_cache_source_fingerprint: dict | None = None
 _AVAILABLE_MODELS_CACHE_TTL: float = 86400.0  # 24 hours
 _SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = 300.0
+_session_visit_refresh_lock = threading.Lock()
+_session_visit_refresh_in_progress = False
 _available_models_cache_lock = threading.RLock()
 
 # Provider auth-status enumeration cache. ``list_available_providers()``
@@ -8540,7 +8542,32 @@ def warm_models_catalog_provenance_if_cold() -> None:
         _available_models_cache_lock.release()
 
 
-def get_available_models_for_session_visit() -> dict:
+def _start_session_visit_models_refresh() -> None:
+    """Refresh the session-visit catalog once without blocking its caller."""
+    global _session_visit_refresh_in_progress
+    with _session_visit_refresh_lock:
+        if _session_visit_refresh_in_progress:
+            return
+        _session_visit_refresh_in_progress = True
+
+    def _refresh() -> None:
+        global _session_visit_refresh_in_progress
+        try:
+            get_available_models(force_refresh=True)
+        except Exception:
+            logger.debug("session-visit models background refresh failed", exc_info=True)
+        finally:
+            with _session_visit_refresh_lock:
+                _session_visit_refresh_in_progress = False
+
+    threading.Thread(
+        target=_refresh,
+        name="models-session-visit-refresh",
+        daemon=True,
+    ).start()
+
+
+def get_available_models_for_session_visit(*, nonblocking: bool = False) -> dict:
     """Return /api/models with a short session-visit freshness horizon.
 
     perf(session-load-latency) Phase 0: this function is the source of the
@@ -8603,6 +8630,15 @@ def get_available_models_for_session_visit() -> dict:
     _mark("cache_age_stale_or_missing")
     stale_cached = disk_cached or _load_stale_models_cache_from_disk()
     _mark(f"stale_cached_loaded:{bool(stale_cached)}")
+    if nonblocking:
+        fallback = stale_cached
+        if fallback is None:
+            fallback = get_available_models(prefer_cache=True)
+            _mark("prefer_cache_fallback")
+        _start_session_visit_models_refresh()
+        _mark("background_refresh_started")
+        _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
+        return copy.deepcopy(fallback)
     try:
         _mark("force_refresh_start")
         result = get_available_models(force_refresh=True)

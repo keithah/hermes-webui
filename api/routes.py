@@ -12947,7 +12947,7 @@ def handle_get(handler, parsed) -> bool:
         try:
             diag.stage(f"enter:freshness={freshness or 'default'}") if diag else None
             if freshness == "session_visit":
-                result = get_available_models_for_session_visit()
+                result = get_available_models_for_session_visit(nonblocking=True)
                 diag.stage("response_serialize") if diag else None
                 return j(handler, result)
             if freshness:

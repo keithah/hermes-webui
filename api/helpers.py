@@ -962,22 +962,28 @@ def _redact_value(v, *, _enabled: bool | None = None):
     return v
 
 
-def _redact_message_content_part(part, *, _enabled: bool):
+def _redact_message_content_part(part, *, _enabled: bool, allow_native_image: bool = False):
     """Redact one canonical ``messages[*].content[*]`` part.
 
     The raster exemption exists only at this authoritative schema position.
     Image-shaped dictionaries in metadata, tools, todos, journals, or arbitrary
     nested values remain on the normal fail-closed redaction path.
     """
-    if not _enabled or not (
-        isinstance(part, dict)
+    if not isinstance(part, dict):
+        return _redact_value(part, _enabled=_enabled)
+    native_image = (
+        allow_native_image
         and part.get("type") == "image_url"
         and isinstance(part.get("image_url"), dict)
-    ):
-        return _redact_value(part, _enabled=_enabled)
+    )
     result = {}
     for key, value in part.items():
-        if key != "image_url":
+        if key in _PUBLIC_MESSAGE_INTERNAL_FIELDS:
+            continue
+        if key != "image_url" or not native_image:
+            result[key] = _redact_value(value, _enabled=_enabled)
+            continue
+        if not _enabled or not isinstance(value, dict):
             result[key] = _redact_value(value, _enabled=_enabled)
             continue
         result[key] = {
@@ -985,6 +991,7 @@ def _redact_message_content_part(part, *, _enabled: bool):
             if image_key == "url" and _is_native_raster_data_uri(image_value)
             else _redact_value(image_value, _enabled=_enabled)
             for image_key, image_value in value.items()
+            if image_key not in _PUBLIC_MESSAGE_INTERNAL_FIELDS
         }
     return result
 
@@ -1116,7 +1123,6 @@ def scrub_internal_replay_fields(
 
 def _public_message_projection(message, *, _enabled: bool):
     """Return one public transcript message without internal replay fields."""
-    message = scrub_internal_replay_fields([message], message_records=True)[0]
     if not isinstance(message, dict):
         return _redact_value(message, _enabled=_enabled)
     item = {}
@@ -1124,10 +1130,19 @@ def _public_message_projection(message, *, _enabled: bool):
     for key, value in message.items():
         if key in _PUBLIC_MESSAGE_INTERNAL_FIELDS:
             continue
-        if allow_native_image and key == "content" and isinstance(value, list):
+        if key == "content" and isinstance(value, list):
             item[key] = [
-                _redact_message_content_part(part, _enabled=_enabled)
+                _redact_message_content_part(
+                    part,
+                    _enabled=_enabled,
+                    allow_native_image=allow_native_image,
+                )
                 for part in value
+            ]
+        elif key == "tool_calls" and isinstance(value, list):
+            item[key] = [
+                _public_tool_call_projection(call, _enabled=_enabled)
+                for call in value
             ]
         else:
             item[key] = _redact_value(value, _enabled=_enabled)
@@ -1140,9 +1155,29 @@ def _redact_messages(messages, *, _enabled: bool):
     return [_public_message_projection(message, _enabled=_enabled) for message in messages]
 
 
+def _public_tool_call_projection(tool_call, *, _enabled: bool):
+    """Copy and redact one tool-call record without a preliminary deep copy."""
+    if not isinstance(tool_call, dict):
+        return _redact_value(tool_call, _enabled=_enabled)
+    result = {}
+    for key, value in tool_call.items():
+        if key in _PUBLIC_MESSAGE_INTERNAL_FIELDS:
+            continue
+        if key == "function" and isinstance(value, dict):
+            result[key] = {
+                function_key: _redact_value(function_value, _enabled=_enabled)
+                for function_key, function_value in value.items()
+                if function_key not in _PUBLIC_MESSAGE_INTERNAL_FIELDS
+            }
+        else:
+            result[key] = _redact_value(value, _enabled=_enabled)
+    return result
+
+
 def _redact_tool_calls(tool_calls, *, _enabled: bool):
-    scrubbed = scrub_internal_replay_fields(tool_calls, message_records=False)
-    return _redact_value(scrubbed, _enabled=_enabled)
+    if not isinstance(tool_calls, list):
+        return _redact_value(tool_calls, _enabled=_enabled)
+    return [_public_tool_call_projection(call, _enabled=_enabled) for call in tool_calls]
 
 
 def _redact_nested_message_containers(value, *, _enabled: bool):
