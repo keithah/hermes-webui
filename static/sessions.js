@@ -3234,7 +3234,14 @@ let _messagesTruncated = false;
 // user/assistant rows for fast switching. Tool rows inside the window are
 // server-bounded and do not consume the visible-message budget.
 // Older messages are loaded on-demand via _loadOlderMessages().
-const _INITIAL_MSG_LIMIT = 30;
+// WKWebView has a noticeably smaller page/rendering budget than desktop
+// browsers.  Keep the native shell's first paint small; older messages remain
+// available through the existing upward paging path.  The marker is injected
+// by hermes-swift-mac at document start and is deliberately absent from normal
+// Safari/Chrome sessions.
+const _INITIAL_MSG_LIMIT = (typeof window !== 'undefined' && window.__HERMES_NATIVE_MAC__)
+  ? 12
+  : 30;
 // ============================================================================
 // COUPLED CONSTANT — keep in sync with api/routes.py:_MAX_MSG_LIMIT.
 // ============================================================================
