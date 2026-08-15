@@ -43,16 +43,109 @@ extractConst('_DATA_IMAGE_SVG_RE');
 extractConst('_DATA_IMAGE_MAX_LEN');
 extractConst('_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT');
 extractConst('_TRANSCRIPT_DISPLAY_NOTICE');
+extractConst('_TRANSCRIPT_DISPLAY_OPAQUE_RE');
 eval(extractFunc('_isSafeDataImageUri'));
 eval(extractFunc('_projectTranscriptTextForDisplay'));
+eval(extractFunc('_stripXmlToolCallsDisplay'));
+eval(extractFunc('_sanitizeThinkingDisplayText'));
+eval(extractFunc('_renderThinkingInto'));
 
 let input = '';
 process.stdin.on('data', chunk => { input += chunk; });
 process.stdin.on('end', () => {
   const payload = JSON.parse(input);
   const source = payload.value;
+  if (payload.mode === 'thinking') {
+    const pre = {textContent: ''};
+    const row = {querySelector: () => pre};
+    _renderThinkingInto(row, source);
+    process.stdout.write(JSON.stringify({source, display: pre.textContent}));
+    return;
+  }
   const display = _projectTranscriptTextForDisplay(source, payload.options || {});
   process.stdout.write(JSON.stringify({source, display}));
+});
+"""
+
+_TOOL_DRIVER_SRC = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+
+function extractFunc(name) {
+  const start = src.search(new RegExp('function\\s+' + name + '\\s*\\('));
+  if (start < 0) throw new Error(name + ' not found');
+  let cursor = src.indexOf('{', start);
+  let depth = 1;
+  cursor++;
+  while (depth && cursor < src.length) {
+    if (src[cursor] === '{') depth++;
+    else if (src[cursor] === '}') depth--;
+    cursor++;
+  }
+  return src.slice(start, cursor);
+}
+
+const esc = value => String(value == null ? '' : value)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const li = () => '';
+const noop = () => '';
+globalThis.esc = esc;
+globalThis.li = li;
+globalThis.t = key => key;
+globalThis.toolIcon = noop;
+globalThis._toolActionKind = () => 'shell';
+globalThis._toolActionLabelText = () => 'terminal';
+globalThis._toolDisplayName = () => 'terminal';
+globalThis._toolDisclosureIdentity = () => 'tool-1';
+globalThis._toolCardAllowsDetail = () => true;
+globalThis._toolCardPreviewText = (tc, displaySnippet) => displaySnippet;
+globalThis._DATA_IMAGE_RE = /^data:image\/(?:png|jpe?g|gif|webp|avif)(?:;base64)?,[a-z0-9+/=%._~:@!$&'()*+,;-]*$/i;
+globalThis._DATA_IMAGE_SVG_RE = /^data:image\/svg\+xml;base64,[a-z0-9+/=]+$/i;
+globalThis._DATA_IMAGE_MAX_LEN = 2 * 1024 * 1024;
+globalThis._TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT = 60000;
+globalThis._TRANSCRIPT_DISPLAY_NOTICE = '[opaque payload abbreviated for display]';
+globalThis._TRANSCRIPT_DISPLAY_OPAQUE_RE = /data:(?:application|image)\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*;base64,[a-z0-9+/=\r\n]+|[a-z0-9+/=]{60001,}/ig;
+globalThis._isSafeDataImageUri = value => String(value || '').length <= _DATA_IMAGE_MAX_LEN
+  && (_DATA_IMAGE_RE.test(String(value || '')) || _DATA_IMAGE_SVG_RE.test(String(value || '')));
+globalThis._projectTranscriptTextForDisplay = (value, options) => {
+  const text = String(value || '');
+  const surface = String(options && options.surface || 'message');
+  _TRANSCRIPT_DISPLAY_OPAQUE_RE.lastIndex = 0;
+  return text.replace(_TRANSCRIPT_DISPLAY_OPAQUE_RE, match => {
+    if (_isSafeDataImageUri(match)) return match;
+    if (match.length <= _TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT) return match;
+    return `${match.slice(0, 2048)}\\n\\n${_TRANSCRIPT_DISPLAY_NOTICE} (${match.length} characters; ${surface})`;
+  });
+};
+globalThis._formatToolArgPreview = () => '';
+globalThis._toolTargetLabel = () => '';
+globalThis._toolFullCommandLabel = () => '';
+globalThis._toolDetailLeadLabel = () => 'Shell';
+globalThis._redactToolTargetLabel = value => value;
+globalThis._isMemorySave = () => false;
+globalThis._isSkillUpdate = () => false;
+globalThis._snippetLooksLikeDiff = () => false;
+globalThis._colorDiffLines = esc;
+globalThis._worklogDetailsExpandedDefault = () => false;
+globalThis.document = {
+  createElement: () => ({
+    dataset: {},
+    setAttribute() {},
+    removeAttribute() {},
+  }),
+};
+eval(extractFunc('buildToolCard'));
+
+let input = '';
+process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('end', () => {
+  const payload = JSON.parse(input);
+  const row = buildToolCard(payload.tc);
+  process.stdout.write(JSON.stringify({
+    htmlLength: row.innerHTML.length,
+    hasFullPayloadAttribute: row.innerHTML.includes('data-full='),
+  }));
 });
 """
 
@@ -64,11 +157,46 @@ def driver_path(tmp_path_factory: pytest.TempPathFactory) -> str:
     return str(path)
 
 
+@pytest.fixture(scope="module")
+def tool_driver_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    path = tmp_path_factory.mktemp("tool_projection") / "driver.js"
+    path.write_text(_TOOL_DRIVER_SRC, encoding="utf-8")
+    return str(path)
+
+
 def _project(driver_path: str, value: str, *, surface: str = "message") -> dict[str, str]:
     assert NODE is not None
     result = subprocess.run(
         [NODE, driver_path, str(UI_JS_PATH)],
         input=json.dumps({"value": value, "options": {"surface": surface}}),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    return json.loads(result.stdout)
+
+
+def _project_thinking(driver_path: str, value: str) -> dict[str, str]:
+    assert NODE is not None
+    result = subprocess.run(
+        [NODE, driver_path, str(UI_JS_PATH)],
+        input=json.dumps({"value": value, "mode": "thinking"}),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    return json.loads(result.stdout)
+
+
+def _tool_render(tool_driver_path: str, tc: dict) -> dict[str, object]:
+    assert NODE is not None
+    result = subprocess.run(
+        [NODE, tool_driver_path, str(UI_JS_PATH)],
+        input=json.dumps({"tc": tc}),
         capture_output=True,
         text=True,
         timeout=30,
@@ -122,3 +250,23 @@ def test_repeated_projection_is_deterministic(driver_path: str) -> None:
 
     assert first == second
     assert first["source"] == payload
+
+
+def test_live_thinking_render_is_bounded(driver_path: str) -> None:
+    payload = "reasoning data:application/octet-stream;base64," + ("C" * 200_000)
+
+    result = _project_thinking(driver_path, payload)
+
+    assert result["source"] == payload
+    assert len(result["display"]) < 70_000
+    assert "opaque payload abbreviated for display" in result["display"]
+
+
+def test_tool_card_does_not_embed_full_snippet_in_dom(tool_driver_path: str) -> None:
+    result = _tool_render(
+        tool_driver_path,
+        {"name": "terminal", "done": True, "snippet": "D" * 200_000},
+    )
+
+    assert result["hasFullPayloadAttribute"] is False
+    assert result["htmlLength"] < 10_000
