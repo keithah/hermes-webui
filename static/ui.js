@@ -2699,6 +2699,7 @@ const _DATA_IMAGE_SVG_RE=/^data:image\/svg\+xml;base64,[a-z0-9+/=]+$/i;
 const _DATA_IMAGE_MAX_LEN=2*1024*1024;
 const _TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT=60000;
 const _TRANSCRIPT_DISPLAY_NOTICE='[opaque payload abbreviated for display]';
+const _TRANSCRIPT_DISPLAY_OPAQUE_RE=/data:(?:application|image)\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*;base64,[a-z0-9+/=\r\n]+|[a-z0-9+/=]{60001,}/ig;
 
 // The streaming renderer calls this ui-owned predicate too. Keep the dangerous
 // SVG form base64-only: URL-encoded XML is a document-shaped payload, not a
@@ -2715,8 +2716,8 @@ function _isSafeDataImageUri(ref){
 function _projectTranscriptTextForDisplay(value, options){
   const text=String(value||'');
   const surface=String(options&&options.surface||'message');
-  const opaque=/data:(?:application|image)\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*;base64,[a-z0-9+/=\r\n]+|[a-z0-9+/=]{60001,}/ig;
-  return text.replace(opaque, match=>{
+  _TRANSCRIPT_DISPLAY_OPAQUE_RE.lastIndex=0;
+  return text.replace(_TRANSCRIPT_DISPLAY_OPAQUE_RE, match=>{
     if(_isSafeDataImageUri(match)) return match;
     if(match.length<=_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT) return match;
     return `${match.slice(0,2048)}\n\n${_TRANSCRIPT_DISPLAY_NOTICE} (${match.length} characters; ${surface})`;
@@ -12721,7 +12722,7 @@ function _worklogReasonHtmlFromAnchor(anchor, textOverride){
   return body?body.innerHTML:esc(String(text||'').trim());
 }
 function _worklogReasonHtmlFromText(text){
-  const clean=_sanitizeThinkingDisplayText(text);
+  const clean=_projectTranscriptTextForDisplay(_sanitizeThinkingDisplayText(text),{surface:'reasoning'});
   if(!String(clean||'').trim()) return '';
   if(String(clean||'').trim()==='(empty)') return '';
   return renderMd?renderMd(clean):esc(clean);
@@ -18785,7 +18786,8 @@ function buildToolCard(tc){
   const argPreview=_formatToolArgPreview(tc&&tc.args);
   if(toolKind==='shell'||previewText===argPreview||previewText==='Completed'||previewText==='Running'||previewText==='Failed') previewText='';
   if(isSubagent) previewText=previewText.replace(/^(?:\u{1F500}|↳)\s*/u,'');
-  const detailLeadText=hasDetail&&typeof _toolDetailLeadText==='function'?_toolDetailLeadText(toolKind,tc):'';
+  const detailLeadTextRaw=hasDetail&&typeof _toolDetailLeadText==='function'?_toolDetailLeadText(toolKind,tc):'';
+  const detailLeadText=_projectTranscriptTextForDisplay(detailLeadTextRaw,{surface:'tool-detail'});
   const detailLeadLabel=typeof _toolDetailLeadLabel==='function'?_toolDetailLeadLabel(toolKind):(toolKind==='shell'?'Shell':'Input');
   const detailLead=detailLeadText?`<div class="tool-card-detail-lead"><div class="tool-card-detail-lead-label">${esc(detailLeadLabel)}</div><pre>${esc(detailLeadText)}</pre></div>`:'';
   const argsEntries=tc.args&&Object.keys(tc.args).length?Object.entries(tc.args):[];
@@ -18805,12 +18807,13 @@ function buildToolCard(tc){
           visibleArgs.map(([k,v])=>{
             let sv=String(v);
             if(typeof _redactToolTargetLabel==='function'){ try{ sv=_redactToolTargetLabel(sv); }catch(e){} }
+            sv=_projectTranscriptTextForDisplay(sv,{surface:'tool-detail'});
             return `<div class="tool-arg-pair"><span class="tool-arg-key">${esc(k)}</span><span class="tool-arg-val">${esc(sv)}</span></div>`;
           }).join('')
         }</div>`:''}
         ${displaySnippet?`<div class="tool-card-result">
           <pre>${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?`<code class="diff-block" data-highlighted="1">${_colorDiffLines(displaySnippet)}</code>`:esc(displaySnippet)}</pre>
-          ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
+          ${hasMore?`<button class="tool-card-more" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
         </div>`:''}
       </div>`:''}
     </div>`;
@@ -18854,7 +18857,11 @@ function _toggleToolDiff(btn){
   if(!pre) return;
   const isDiff=btn.dataset.isDiff==='1';
   const expanded=btn.textContent===btn.dataset.moreLabel;
-  const raw=expanded?btn.dataset.full:btn.dataset.short;
+  const row=btn.closest('.tool-card-row');
+  const canonicalSnippet=row&&row._tcData&&row._tcData.snippet;
+  const raw=expanded
+    ? (canonicalSnippet==null?btn.dataset.short:String(canonicalSnippet))
+    : btn.dataset.short;
   if(isDiff){
     let code=pre.querySelector('code');
     if(!code){code=document.createElement('code');code.className='diff-block';pre.textContent='';pre.appendChild(code);}
@@ -20115,7 +20122,7 @@ function renderKatexBlocks(container,options){
 }
 
 function _thinkingMarkup(text=''){
-  const clean=_sanitizeThinkingDisplayText(text);
+  const clean=_projectTranscriptTextForDisplay(_sanitizeThinkingDisplayText(text),{surface:'reasoning'});
   const openClass=_worklogDetailsExpandedDefault()?' open':'';
   return (clean&&String(clean).trim())
     ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(String(clean).trim())}</pre></div></div>`
@@ -20123,7 +20130,7 @@ function _thinkingMarkup(text=''){
 }
 function _renderThinkingInto(row,text=''){
   if(!row) return;
-  const clean=_sanitizeThinkingDisplayText(text);
+  const clean=_projectTranscriptTextForDisplay(_sanitizeThinkingDisplayText(text),{surface:'reasoning'});
   if(!clean){
     row.innerHTML=_thinkingMarkup(text);
     return;
