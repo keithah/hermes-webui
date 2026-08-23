@@ -5204,6 +5204,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _renderStreamingFadeMarkdown(_rawDisplayText){
     if(!assistantBody) return true;
     const displayText=_projectLiveDisplayText(_rawDisplayText);
+    try{
+      assistantBody._canonicalRawText=_rawDisplayText;
+      if(assistantRow) assistantRow._canonicalRawText=_rawDisplayText;
+      if(typeof window!=='undefined') window._lastLiveAssistantText=_rawDisplayText;
+    }catch(_){}
     const next=_streamFadeNextText(displayText);
     if(!next.changed) return next.caughtUp;
     assistantBody.classList.add('stream-fade-active');
@@ -5291,6 +5296,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       ? _parseStreamState().displayText
       : _stripXmlToolCalls(assistantText.slice(segmentStart));
     const displayText=_projectLiveDisplayText(_rawDisplayText);
+    try{
+      if(assistantBody) assistantBody._canonicalRawText=_rawDisplayText;
+      if(assistantRow) assistantRow._canonicalRawText=_rawDisplayText;
+      if(typeof window!=='undefined') window._lastLiveAssistantText=_rawDisplayText;
+      if(assistantBody) try{ assistantBody.dataset.rawText=displayText; }catch(_){}
+      if(assistantRow) try{ assistantRow.dataset.rawText=displayText; }catch(_){}
+    }catch(_){}
     if(_smdParser){
       _smdWrite(displayText);
     } else if(window.smd){

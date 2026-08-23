@@ -2716,32 +2716,70 @@ function _isSafeDataImageUri(ref){
 function _projectTranscriptTextForDisplay(value, options){
   const text=String(value||'');
   const surface=String(options&&options.surface||'message');
-  // Protect complete safe data-image URIs before matching generic opaque runs.
-  // A supported non-base64 data:image/* URI (accepted by _isSafeDataImageUri)
-  // would otherwise be split by the 60,001-char generic base64 matcher and
-  // corrupted. Stash safe candidates with inert placeholders, project the rest,
-  // then restore — the safe URI is never truncated.
-  const _safePlaceholders=[];
-  const _candidateRe=/data:image\/[^\s\"'<>]+/gi;
-  let protectedText=text.replace(_candidateRe, candidate=>{
-    if(_isSafeDataImageUri(candidate)) {
-      const idx=_safePlaceholders.length;
-      _safePlaceholders.push(candidate);
-      return `\x00SAFEIMG${idx}\x00`;
+  const safeSpans=[];
+  const _candidateScanRe = /data:image\/[^\s\]]{1,2097152}/gi;
+  let m;
+  const seen=new Set();
+  _candidateScanRe.lastIndex=0;
+  while((m=_candidateScanRe.exec(text))!==null){
+    const cand=m[0];
+    const start=m.index;
+    const end=start+cand.length;
+    const key=start+'-'+end;
+    if(seen.has(key)) continue;
+    seen.add(key);
+    let cur=cand;
+    let curStart=start;
+    let curEnd=end;
+    while(cur && !_isSafeDataImageUri(cur)){
+      cur=cur.slice(0,-1);
+      curEnd--;
+      if(cur.length<22) break;
     }
-    return candidate;
-  });
+    if(cur && _isSafeDataImageUri(cur)){
+      while(curEnd < text.length && cur.length < _DATA_IMAGE_MAX_LEN){
+        const nextChar=text[curEnd];
+        if(/\s/.test(nextChar) || nextChar==='"' || nextChar==='<') break;
+        const extended=cur+nextChar;
+        if(_isSafeDataImageUri(extended)){
+          cur=extended;
+          curEnd++;
+        } else break;
+      }
+      safeSpans.push({start:curStart, end:curEnd, value:cur});
+      _candidateScanRe.lastIndex=curEnd;
+    }
+  }
+  safeSpans.sort((a,b)=>a.start-b.start);
+  const merged=[];
+  for(const s of safeSpans){
+    if(!merged.length || s.start>=merged[merged.length-1].end) merged.push(s);
+    else if(s.end>merged[merged.length-1].end) merged[merged.length-1]=s;
+  }
+  let out='';
+  let pos=0;
   _TRANSCRIPT_DISPLAY_OPAQUE_RE.lastIndex=0;
-  protectedText=protectedText.replace(_TRANSCRIPT_DISPLAY_OPAQUE_RE, match=>{
-    if(match.length<=_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT) return match;
-    return `${match.slice(0,2048)}\n\n${_TRANSCRIPT_DISPLAY_NOTICE} (${match.length} characters; ${surface})`;
-  });
-  if(_safePlaceholders.length){
-    _safePlaceholders.forEach((orig, idx)=>{
-      protectedText=protectedText.split(`\x00SAFEIMG${idx}\x00`).join(orig);
+  for(const span of merged){
+    if(pos<span.start){
+      const gap=text.slice(pos, span.start);
+      _TRANSCRIPT_DISPLAY_OPAQUE_RE.lastIndex=0;
+      out+=gap.replace(_TRANSCRIPT_DISPLAY_OPAQUE_RE, match=>{
+        if(match.length<=_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT) return match;
+        return `${match.slice(0,2048)}\n\n${_TRANSCRIPT_DISPLAY_NOTICE}`;
+      });
+    }
+    out+=span.value;
+    pos=span.end;
+  }
+  if(pos<text.length){
+    const tail=text.slice(pos);
+    _TRANSCRIPT_DISPLAY_OPAQUE_RE.lastIndex=0;
+    out+=tail.replace(_TRANSCRIPT_DISPLAY_OPAQUE_RE, match=>{
+      if(match.length<=_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT) return match;
+      return `${match.slice(0,2048)}\n\n${_TRANSCRIPT_DISPLAY_NOTICE}`;
     });
   }
-  return protectedText;
+  return out;
 }
 
 function _dataImageHtml(ref, altText){
@@ -8967,17 +9005,34 @@ function _canonicalTextForRow(row){
     if(row._canonicalRawText) return String(row._canonicalRawText);
   }catch(_){}
   try{
+    // Live: check ancestor live turn's canonical (messages.js stores it)
+    const liveTurn=row.closest&&row.closest('#liveAssistantTurn');
+    if(liveTurn){
+      try{
+        if(liveTurn._canonicalRawText) return String(liveTurn._canonicalRawText);
+        const body=liveTurn.querySelector&&liveTurn.querySelector('.msg-body');
+        if(body&&body._canonicalRawText) return String(body._canonicalRawText);
+      }catch(_){}
+      if(typeof window!=='undefined' && window._lastLiveAssistantText) return String(window._lastLiveAssistantText);
+    }
+    // Also check closest ancestor with canonical
+    let cur=row.parentElement;
+    while(cur){
+      try{ if(cur._canonicalRawText) return String(cur._canonicalRawText); }catch(_){}
+      cur=cur.parentElement;
+      if(cur&&cur.id==='liveAssistantTurn') break;
+    }
+  }catch(_){}
+  try{
     const msgIdxAttr=row.getAttribute('data-msg-idx');
     const msgIdx=msgIdxAttr!=null?parseInt(msgIdxAttr,10):NaN;
     if(Number.isFinite(msgIdx) && typeof S!=='undefined' && S && Array.isArray(S.messages)){
       const m=S.messages[msgIdx];
       if(m){
-        // User / assistant / process_wakeup rows: content is canonical
         if(m.role==='user' || m.role==='assistant' || m._source==='process_wakeup'){
           const c=typeof msgContent==='function'?msgContent(m): (m.content||'');
           if(typeof c==='string' && c) return c;
           if(Array.isArray(m.content)){
-            // Content array with text parts
             const t=m.content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
             if(t) return t;
           }
@@ -13016,12 +13071,6 @@ function _toolDisclosureIdentity(tc, ordinal){
   if(!tc) return '';
   const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
   if(tid) return `id:${tid}`;
-  // Ordinal distinguishes multiple same-name ID-less calls in one turn.
-  // Must not use tool arguments or result snippets — those change while
-  // streaming and would lose the open/closed disclosure state
-  // (test_ui_tool_call_cleanup: disclosure keys must remain independent of
-  // streaming content). Prefer an explicit ordinal (caller supplies
-  // occurrence index) else look for a stored _ordinal/ordinal on the tool call.
   let ord=ordinal;
   if(ord===undefined||ord===null||ord===''){
     if(tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='') ord=tc._ordinal;
@@ -13029,13 +13078,16 @@ function _toolDisclosureIdentity(tc, ordinal){
     else if(tc._disclosureOrdinal!==undefined&&tc._disclosureOrdinal!==null&&tc._disclosureOrdinal!=='') ord=tc._disclosureOrdinal;
     else ord='';
   }
-  const parts=[
-    tc.assistant_msg_idx!==undefined?`a:${tc.assistant_msg_idx}`:'',
-    tc.name||'tool',
-  ];
-  if(ord!==''&&ord!==null&&ord!==undefined) parts.push(`o:${ord}`);
-  const stable=parts.join('\x1f');
-  return stable.trim()?`derived:${_worklogDetailHashKey(stable)}`:'';
+  const hasAssistantIdx=tc.assistant_msg_idx!==undefined&&tc.assistant_msg_idx!==null&&tc.assistant_msg_idx!=='';
+  const hasBurst=tc.activityBurstId!==undefined&&tc.activityBurstId!==null&&String(tc.activityBurstId)!==''&&String(tc.activityBurstId)!=='0';
+  const hasSeq=tc.activitySegmentSeq!==undefined&&tc.activitySegmentSeq!==null&&String(tc.activitySegmentSeq)!==''&&String(tc.activitySegmentSeq)!=='0';
+  let owner='';
+  if(hasAssistantIdx) owner=`a:${tc.assistant_msg_idx}`;
+  else if(hasBurst||hasSeq) owner=`b:${hasBurst?tc.activityBurstId:''}:s:${hasSeq?tc.activitySegmentSeq:''}`;
+  else owner='a:';
+  const name=tc.name||'tool';
+  const ordPart=(ord!==''&&ord!==null&&ord!==undefined)?`o:${ord}`:'o:0';
+  return `derived:${owner}:${name}:${ordPart}`;
 }
 function _filterNewWorklogTools(cards, seenTools){
   const out=[];
@@ -17392,10 +17444,17 @@ function renderMessages(options){
       if(thinkingText&&window._showThinking!==false){
         if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
       }
+      const _orderedOrdCounts=new Map();
       orderedTransparentParts.forEach((part, partIdx)=>{
         if(!part) return;
         if(part.kind==='tool'){
         const toolCall=_transparentOrderedToolCall(part, rawIdx, transparentOrderedToolCallsByTid, transparentToolResultsByTid, transparentPersistedSnippetByTid);
+          if(!toolCall.tid && !toolCall.id){
+            const gk=`${rawIdx}\x1f${toolCall.name||'tool'}`;
+            const ord=_orderedOrdCounts.get(gk)||0;
+            toolCall._ordinal=ord;
+            _orderedOrdCounts.set(gk, ord+1);
+          }
           const toolRow=_decorateTransparentEventRow(buildToolCard(toolCall),{
             type:'tool',
             name:toolCall&&toolCall.name,
@@ -19134,7 +19193,6 @@ function _toolCallByDisclosureKey(key){
       if(typeof _toolDisclosureIdentity==='function'&&_toolDisclosureIdentity(tc, ordinal)===key) return tc;
       if((ordinal===0||ordinal==='0') && typeof _toolDisclosureIdentity==='function'&&_toolDisclosureIdentity(tc)===key) return tc;
     }catch(_){}
-    }
   }
   return null;
 }
@@ -20398,6 +20456,12 @@ function _thinkingMarkup(text=''){
 function _renderThinkingInto(row,text=''){
   if(!row) return;
   const clean=_projectTranscriptTextForDisplay(_sanitizeThinkingDisplayText(text),{surface:'reasoning'});
+  try{
+    const card=row.querySelector('.thinking-card');
+    if(card) card._canonicalReasoning=String(text||'');
+    row._canonicalReasoning=String(text||'');
+    if(typeof window!=='undefined') window._lastLiveReasoningText=String(text||'');
+  }catch(_){}
   if(!clean){
     row.innerHTML=_thinkingMarkup(text);
     return;
