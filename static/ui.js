@@ -2716,12 +2716,32 @@ function _isSafeDataImageUri(ref){
 function _projectTranscriptTextForDisplay(value, options){
   const text=String(value||'');
   const surface=String(options&&options.surface||'message');
+  // Protect complete safe data-image URIs before matching generic opaque runs.
+  // A supported non-base64 data:image/* URI (accepted by _isSafeDataImageUri)
+  // would otherwise be split by the 60,001-char generic base64 matcher and
+  // corrupted. Stash safe candidates with inert placeholders, project the rest,
+  // then restore — the safe URI is never truncated.
+  const _safePlaceholders=[];
+  const _candidateRe=/data:image\/[^\s\"'<>]+/gi;
+  let protectedText=text.replace(_candidateRe, candidate=>{
+    if(_isSafeDataImageUri(candidate)) {
+      const idx=_safePlaceholders.length;
+      _safePlaceholders.push(candidate);
+      return `\x00SAFEIMG${idx}\x00`;
+    }
+    return candidate;
+  });
   _TRANSCRIPT_DISPLAY_OPAQUE_RE.lastIndex=0;
-  return text.replace(_TRANSCRIPT_DISPLAY_OPAQUE_RE, match=>{
-    if(_isSafeDataImageUri(match)) return match;
+  protectedText=protectedText.replace(_TRANSCRIPT_DISPLAY_OPAQUE_RE, match=>{
     if(match.length<=_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT) return match;
     return `${match.slice(0,2048)}\n\n${_TRANSCRIPT_DISPLAY_NOTICE} (${match.length} characters; ${surface})`;
   });
+  if(_safePlaceholders.length){
+    _safePlaceholders.forEach((orig, idx)=>{
+      protectedText=protectedText.split(`\x00SAFEIMG${idx}\x00`).join(orig);
+    });
+  }
+  return protectedText;
 }
 
 function _dataImageHtml(ref, altText){
@@ -8941,9 +8961,69 @@ function copyStatusSessionId(btn){
     setTimeout(()=>{btn.innerHTML=orig;btn.classList.remove('copied');},1500);
   }).catch(()=>showToast(t('copy_failed')));
 }
+function _canonicalTextForRow(row){
+  if(!row) return '';
+  try{
+    if(row._canonicalRawText) return String(row._canonicalRawText);
+  }catch(_){}
+  try{
+    const msgIdxAttr=row.getAttribute('data-msg-idx');
+    const msgIdx=msgIdxAttr!=null?parseInt(msgIdxAttr,10):NaN;
+    if(Number.isFinite(msgIdx) && typeof S!=='undefined' && S && Array.isArray(S.messages)){
+      const m=S.messages[msgIdx];
+      if(m){
+        // User / assistant / process_wakeup rows: content is canonical
+        if(m.role==='user' || m.role==='assistant' || m._source==='process_wakeup'){
+          const c=typeof msgContent==='function'?msgContent(m): (m.content||'');
+          if(typeof c==='string' && c) return c;
+          if(Array.isArray(m.content)){
+            // Content array with text parts
+            const t=m.content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
+            if(t) return t;
+          }
+          if(m.content) return String(m.content);
+        }
+        // Fallback for ordered transparent parts stored per-anchor? Try anchor identity
+        if(m && m._anchor_activity_scene){
+          // Anchor scene prose is stored in activity_rows; lookup by row id
+          const aid=row.getAttribute('data-anchor-row-id')||row.getAttribute('data-anchor-local-id');
+          if(aid && typeof window!=='undefined' && window._liveAnchorRegistries){
+            for(const reg of window._liveAnchorRegistries.values()){
+              if(!reg||!reg.anchor||!Array.isArray(reg.anchor.activity_events)) continue;
+              for(const ev of reg.anchor.activity_events){
+                if(ev && (ev.local_id===aid || ev.row_id===aid) && ev.payload && ev.payload.text){
+                  return String(ev.payload.text);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }catch(_){}
+  // Last resort: the bounded DOM attribute (already projected) – copy at least something
+  try{
+    if(row.dataset && row.dataset.rawText) return String(row.dataset.rawText);
+  }catch(_){}
+  return String(row.textContent||'').trim();
+}
+function _setBoundedRawText(row, canonical, surface){
+  if(!row) return;
+  try{ row._canonicalRawText=String(canonical||''); }catch(_){}
+  try{
+    const bounded=typeof _projectTranscriptTextForDisplay==='function'?_projectTranscriptTextForDisplay(String(canonical||''),{surface:surface||'message'}):String(canonical||'');
+    // Data attributes are serialized into innerHTML for the session HTML cache.
+    // Never store the full canonical opaque payload – store only the bounded
+    // display text so the DOM/cache stays bounded.
+    row.dataset.rawText=bounded;
+  }catch(_){
+    try{ row.dataset.rawText=String(canonical||'').slice(0,60000); }catch(__){}
+  }
+}
 function copyMsg(btn){
   const row=btn.closest('[data-raw-text]');
-  const text=row?row.dataset.rawText:'';
+  if(!row) return;
+  const text=_canonicalTextForRow(row);
   if(!text)return;
   _copyText(text).then(()=>{
     const orig=btn.innerHTML;btn.innerHTML=li('check',13);btn.style.color='var(--blue)';
@@ -8953,8 +9033,53 @@ function copyMsg(btn){
 function _copyThinkingText(btn){
   const card=btn&&btn.closest?btn.closest('.thinking-card'):null;
   if(!card)return;
-  const pre=card.querySelector('.thinking-card-body pre');
-  const text=pre?pre.textContent:'';
+  let text='';
+  // Resolve the canonical reasoning via identity so the Copy action returns the
+  // full value even though the displayed DOM is bounded. Try (1) settled
+  // message identity via data-msg-idx → S.messages, (2) Anchor scene
+  // data-anchor-row-id → live anchor registry, (3) non-serialized expando
+  // _canonicalReasoning / INFLIGHT, then fall back to displayed DOM.
+  try{
+    const seg=card.closest('[data-msg-idx]');
+    const msgIdxAttr=seg?seg.getAttribute('data-msg-idx'):null;
+    const msgIdx=msgIdxAttr!=null?parseInt(msgIdxAttr,10):NaN;
+    if(Number.isFinite(msgIdx) && typeof S!=='undefined' && S && Array.isArray(S.messages)){
+      const m=S.messages[msgIdx];
+      if(m){
+        const canon=typeof _assistantReasoningPayloadText==='function'?_assistantReasoningPayloadText(m):'';
+        if(canon) text=String(canon);
+      }
+    }
+  }catch(_){}
+  if(!text){
+    try{
+      const anchorId=card.getAttribute('data-anchor-row-id')||card.getAttribute('data-anchor-local-id')||card.getAttribute('data-thinking-key')||'';
+      if(anchorId && typeof window!=='undefined' && window._liveAnchorRegistries){
+        for(const reg of window._liveAnchorRegistries.values()){
+          if(!reg||!reg.anchor||!Array.isArray(reg.anchor.activity_events)) continue;
+          for(const ev of reg.anchor.activity_events){
+            if(ev && (ev.local_id===anchorId || ev.row_id===anchorId) && ev.source_event_type==='reasoning' && ev.payload && ev.payload.text){
+              const cand=String(ev.payload.text).trim();
+              if(cand){ text=cand; break; }
+            }
+          }
+          if(text) break;
+        }
+      }
+    }catch(_){}
+  }
+  if(!text && card._canonicalReasoning) text=String(card._canonicalReasoning);
+  if(!text && typeof window!=='undefined' && window._lastLiveReasoningText) text=String(window._lastLiveReasoningText);
+  if(!text){
+    try{
+      const sid=typeof S!=='undefined'&&S&&S.session?S.session.session_id:'';
+      if(sid && typeof INFLIGHT!=='undefined' && INFLIGHT[sid] && INFLIGHT[sid].lastReasoningText) text=String(INFLIGHT[sid].lastReasoningText);
+    }catch(_){}
+  }
+  if(!text){
+    const pre=card.querySelector('.thinking-card-body pre');
+    text=pre?pre.textContent:'';
+  }
   if(!text)return;
   _copyText(text).then(()=>{
     const orig=btn.innerHTML;
@@ -9127,7 +9252,7 @@ function speakMessage(btn){
   stopTTS();
 
   const row=btn?btn.closest('[data-raw-text]'):null;
-  const text=row?row.dataset.rawText:'';
+  const text=row?_canonicalTextForRow(row):'';
   if(!text) return;
 
   const clean=_stripForTTS(text);
@@ -9312,7 +9437,7 @@ function autoReadLastAssistant(){
   const rows=document.querySelectorAll('.msg-row[data-role="assistant"], .assistant-segment[data-raw-text]');
   if(!rows.length) return;
   const last=rows[rows.length-1];
-  const text=last.dataset.rawText||'';
+  const text=_canonicalTextForRow(last);
   if(!text.trim()) return;
   const clean=_stripForTTS(text);
   if(!clean) return;
@@ -11581,7 +11706,11 @@ function _thinkingCardHtml(text, open){
   const copyBtn=`<button class="thinking-copy-btn" onclick="event.stopPropagation();_copyThinkingText(this)" title="${t('copy')}" aria-label="${t('copy')}">${li('copy',12)}</button>`;
   const shouldOpen=!!open||_worklogDetailsExpandedDefault();
   const classes=`thinking-card${shouldOpen?' open':''}`;
-  return `<div class="${classes}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
+  // The displayed <pre> is bounded; keep the full canonical in a JS expando
+  // at render time (not a serialized attribute) for the Copy handler to use.
+  // After an HTML-cache round-trip the expando is lost, but the settled-path
+  // fallback in _copyThinkingText (S.messages / anchor registry) still resolves.
+  return `<div class="${classes}" data-thinking-card="1"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
 }
 function isSimplifiedToolCalling(){
   return window._simplifiedToolCalling!==false;
@@ -11592,6 +11721,11 @@ function _thinkingActivityNode(text, open, disclosureKey){
   row.setAttribute('data-worklog-thinking-card','1');
   if(disclosureKey) row.setAttribute('data-thinking-key', String(disclosureKey));
   row.innerHTML=_thinkingCardHtml(text, open);
+  try{
+    const card=row.querySelector('.thinking-card');
+    if(card) card._canonicalReasoning=String(text||'');
+    row._canonicalReasoning=String(text||'');
+  }catch(_){}
   _renderThinkingInto(row,text);
   return row;
 }
@@ -12882,9 +13016,25 @@ function _toolDisclosureIdentity(tc){
   if(!tc) return '';
   const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
   if(tid) return `id:${tid}`;
+  // For non-ID calls, include a bounded per-call fingerprint so two same-name
+  // calls in one assistant message don't collide (the review's FIRST-FULL vs
+  // SECOND-FULL case). Hash args + snippet head, then hash the composite — keeps
+  // the key short while guaranteeing distinct keys for different payloads.
+  let argsFp='';
+  try{
+    const rawArgs=tc.args&&typeof tc.args==='object'?JSON.stringify(tc.args):String(tc.args||'');
+    if(rawArgs) argsFp=_worklogDetailHashKey(rawArgs.slice(0,2048)).slice(0,8);
+  }catch(_){}
+  let snippetFp='';
+  try{
+    const rawSnippet=String(tc.snippet||tc.preview||tc.result||tc.output||'');
+    if(rawSnippet) snippetFp=_worklogDetailHashKey(rawSnippet.slice(0,2048)).slice(0,8);
+  }catch(_){}
   const stable=[
     tc.assistant_msg_idx!==undefined?`a:${tc.assistant_msg_idx}`:'',
     tc.name||'tool',
+    argsFp,
+    snippetFp,
   ].join('\x1f');
   return stable.trim()?`derived:${_worklogDetailHashKey(stable)}`:'';
 }
@@ -13128,8 +13278,9 @@ function _anchorSceneNodeForRow(row, opts){
       node=document.createElement('div');
       node.className='assistant-segment';
       node.setAttribute('data-anchor-scene-prose','1');
-      node.dataset.rawText=text;
-      node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
+      _setBoundedRawText(node, text, 'assistant');
+      const _projAnchor=typeof _projectTranscriptTextForDisplay==='function'?_projectTranscriptTextForDisplay(text,{surface:'assistant'}):text;
+      node.innerHTML=`<div class="msg-body">${renderMd?renderMd(_projAnchor):esc(_projAnchor)}</div>`;
     }
   }else if(row.role==='thinking'){
     if(window._showThinking===false) return null;
@@ -17134,10 +17285,10 @@ function renderMessages(options){
         // serialization-independent while still rebuilding when the markup
         // genuinely changes (locale/timestamp format); open state is
         // user-driven, so it is captured and restored across rebuilds.
-        if(row.dataset.rawText!==processText||row._wakeupRenderedHtml!==nextRowHtml){
+        if(row._canonicalRawText!==processText||row._wakeupRenderedHtml!==nextRowHtml){
           const _priorCard=row.querySelector&&row.querySelector('details.process-wakeup-card');
           const _wasOpen=!!(_priorCard&&_priorCard.open);
-          row.dataset.rawText=processText;
+          _setBoundedRawText(row, processText, 'process-output');
           row._wakeupRenderedHtml=nextRowHtml;
           row.innerHTML=nextRowHtml;
           if(_wasOpen){
@@ -17153,7 +17304,7 @@ function renderMessages(options){
         row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
         row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
         row.dataset.role='process_wakeup';
-        row.dataset.rawText=processText;
+        _setBoundedRawText(row, processText, 'process-output');
         row._wakeupRenderedHtml=nextRowHtml;
         row.innerHTML=nextRowHtml;
       }
@@ -17176,8 +17327,8 @@ function renderMessages(options){
         row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
         row.dataset.role='user';
         delete row.dataset.editing;
-        if(row.dataset.rawText!==newRawText||row.innerHTML!==nextRowHtml){
-          row.dataset.rawText=newRawText;
+        if(row._canonicalRawText!==newRawText||row.innerHTML!==nextRowHtml){
+          _setBoundedRawText(row, newRawText, 'user');
           row.innerHTML=nextRowHtml;
         }
       }else{
@@ -17188,7 +17339,7 @@ function renderMessages(options){
         row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
         row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
         row.dataset.role='user';
-        row.dataset.rawText=newRawText;
+        _setBoundedRawText(row, newRawText, 'user');
         row.innerHTML=nextRowHtml;
       }
       // Reserve this user row's real off-screen height up front so a wipe-and-rebuild
@@ -17265,7 +17416,7 @@ function renderMessages(options){
         orderedSeg.dataset.msgIdx=rawIdx;
         orderedSeg.dataset.sessionMsgIdx=sessionMsgIdx;
         orderedSeg.dataset.messageAnchorKey=messageAnchorKey;
-        orderedSeg.dataset.rawText=String(partDisplayText||'').trim();
+        _setBoundedRawText(orderedSeg, String(partDisplayText||'').trim(), 'assistant');
         if(m._activityBurstId!==undefined&&m._activityBurstId!==null) orderedSeg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
         if(Number.isFinite(Number(m._liveSegmentSeq))) orderedSeg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
         if(_ERR_MSG_RE.test(String(partDisplayText||'').trim())) orderedSeg.dataset.error='1';
@@ -17291,7 +17442,7 @@ function renderMessages(options){
     seg.dataset.msgIdx=rawIdx;
     seg.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
     seg.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
-    seg.dataset.rawText=String(content).trim();
+    _setBoundedRawText(seg, String(content).trim(), 'assistant');
     if(m._activityBurstId!==undefined&&m._activityBurstId!==null) seg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
     if(Number.isFinite(Number(m._liveSegmentSeq))) seg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
     const messageBelongsInWorklog=!S.busy&&isCompactWorklogMode()&&_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, displayContent, {isTurnFinalAssistant});
@@ -19320,7 +19471,7 @@ function editMessage(btn) {
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
   const msgIdx = parseInt(row.dataset.msgIdx, 10);
-  const originalText = row.dataset.rawText || '';
+  const originalText = _canonicalTextForRow(row) || row.dataset.rawText || '';
   const body = row.querySelector('.msg-body');
   if(!body || row.dataset.editing) return;
   row.dataset.editing = '1';
