@@ -13020,15 +13020,20 @@ function _toolDisclosureIdentity(tc){
   // calls in one assistant message don't collide (the review's FIRST-FULL vs
   // SECOND-FULL case). Hash args + snippet head, then hash the composite — keeps
   // the key short while guaranteeing distinct keys for different payloads.
+  // Hash the FULL args/snippet — a 2,048-char head still collides when two
+  // same-name calls share a common prefix and diverge later (r3839148863).
+  // _worklogDetailHashKey is O(n) and tool payloads are bounded by the
+  // display projection anyway, so hashing the full value is cheap and
+  // guarantees distinct keys for distinct payloads.
   let argsFp='';
   try{
     const rawArgs=tc.args&&typeof tc.args==='object'?JSON.stringify(tc.args):String(tc.args||'');
-    if(rawArgs) argsFp=_worklogDetailHashKey(rawArgs.slice(0,2048)).slice(0,8);
+    if(rawArgs) argsFp=_worklogDetailHashKey(rawArgs).slice(0,8);
   }catch(_){}
   let snippetFp='';
   try{
     const rawSnippet=String(tc.snippet||tc.preview||tc.result||tc.output||'');
-    if(rawSnippet) snippetFp=_worklogDetailHashKey(rawSnippet.slice(0,2048)).slice(0,8);
+    if(rawSnippet) snippetFp=_worklogDetailHashKey(rawSnippet).slice(0,8);
   }catch(_){}
   const stable=[
     tc.assistant_msg_idx!==undefined?`a:${tc.assistant_msg_idx}`:'',
@@ -19029,12 +19034,21 @@ function _toggleToolDiff(btn){
   const raw=expanded
     ? (canonicalSnippet==null?btn.dataset.short:String(canonicalSnippet))
     : btn.dataset.short;
+  // Even the expanded canonical payload must stay display-bounded — a
+  // deferred Transparent Stream detail can hold an oversized opaque run
+  // (r3792269302). Projecting here keeps WKWebView from stalling on Show more.
+  let displayRaw=raw;
+  try{
+    if(expanded && typeof _projectTranscriptTextForDisplay==='function'){
+      displayRaw=_projectTranscriptTextForDisplay(raw,{surface:'tool-detail'});
+    }
+  }catch(_){}
   if(isDiff){
     let code=pre.querySelector('code');
     if(!code){code=document.createElement('code');code.className='diff-block';pre.textContent='';pre.appendChild(code);}
-    code.innerHTML=_colorDiffLines(raw);
+    code.innerHTML=_colorDiffLines(expanded?displayRaw:raw);
   }else{
-    pre.textContent=raw;
+    pre.textContent=expanded?displayRaw:raw;
   }
   btn.textContent=expanded?btn.dataset.lessLabel:btn.dataset.moreLabel;
 }
