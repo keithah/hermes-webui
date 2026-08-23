@@ -13012,35 +13012,29 @@ function _toolIdentity(tc){
     String(tc.snippet||tc.preview||'').slice(0,160),
   ].join('|');
 }
-function _toolDisclosureIdentity(tc){
+function _toolDisclosureIdentity(tc, ordinal){
   if(!tc) return '';
   const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
   if(tid) return `id:${tid}`;
-  // For non-ID calls, include a bounded per-call fingerprint so two same-name
-  // calls in one assistant message don't collide (the review's FIRST-FULL vs
-  // SECOND-FULL case). Hash args + snippet head, then hash the composite — keeps
-  // the key short while guaranteeing distinct keys for different payloads.
-  // Hash the FULL args/snippet — a 2,048-char head still collides when two
-  // same-name calls share a common prefix and diverge later (r3839148863).
-  // _worklogDetailHashKey is O(n) and tool payloads are bounded by the
-  // display projection anyway, so hashing the full value is cheap and
-  // guarantees distinct keys for distinct payloads.
-  let argsFp='';
-  try{
-    const rawArgs=tc.args&&typeof tc.args==='object'?JSON.stringify(tc.args):String(tc.args||'');
-    if(rawArgs) argsFp=_worklogDetailHashKey(rawArgs).slice(0,8);
-  }catch(_){}
-  let snippetFp='';
-  try{
-    const rawSnippet=String(tc.snippet||tc.preview||tc.result||tc.output||'');
-    if(rawSnippet) snippetFp=_worklogDetailHashKey(rawSnippet).slice(0,8);
-  }catch(_){}
-  const stable=[
+  // Ordinal distinguishes multiple same-name ID-less calls in one turn.
+  // Must not use tool arguments or result snippets — those change while
+  // streaming and would lose the open/closed disclosure state
+  // (test_ui_tool_call_cleanup: disclosure keys must remain independent of
+  // streaming content). Prefer an explicit ordinal (caller supplies
+  // occurrence index) else look for a stored _ordinal/ordinal on the tool call.
+  let ord=ordinal;
+  if(ord===undefined||ord===null||ord===''){
+    if(tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='') ord=tc._ordinal;
+    else if(tc.ordinal!==undefined&&tc.ordinal!==null&&tc.ordinal!=='') ord=tc.ordinal;
+    else if(tc._disclosureOrdinal!==undefined&&tc._disclosureOrdinal!==null&&tc._disclosureOrdinal!=='') ord=tc._disclosureOrdinal;
+    else ord='';
+  }
+  const parts=[
     tc.assistant_msg_idx!==undefined?`a:${tc.assistant_msg_idx}`:'',
     tc.name||'tool',
-    argsFp,
-    snippetFp,
-  ].join('\x1f');
+  ];
+  if(ord!==''&&ord!==null&&ord!==undefined) parts.push(`o:${ord}`);
+  const stable=parts.join('\x1f');
   return stable.trim()?`derived:${_worklogDetailHashKey(stable)}`:'';
 }
 function _filterNewWorklogTools(cards, seenTools){
@@ -17775,7 +17769,24 @@ function renderMessages(options){
         });
       }
     });
-    if(derived.length) S.toolCalls=derived;
+    if(derived.length) {
+      // Stamp ordinal for ID-less derived tool calls so disclosure keys
+      // stay distinct without using args/snippet (which must remain stable
+      // while streaming). Ordinal is occurrence index within same
+      // (assistant_msg_idx, name) among ID-less calls.
+      const _ordCounts=new Map();
+      for(const tc of derived){
+        const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id)||'';
+        if(tid) continue;
+        const a=tc&&tc.assistant_msg_idx;
+        const name=tc&&tc.name||'tool';
+        const gk=`${a}\x1f${name}`;
+        const ord=_ordCounts.get(gk)||0;
+        tc._ordinal=ord;
+        _ordCounts.set(gk, ord+1);
+      }
+      S.toolCalls=derived;
+    }
     if(S._settledLiveToolMetadata) S._settledLiveToolMetadata=null;
   }
   if(!S.busy || (S.toolCalls&&S.toolCalls.length)){
@@ -18912,7 +18923,35 @@ function buildToolCard(tc){
   row.dataset.toolDone=String(tc&&tc.done!==false);
   row.dataset.toolError=String(!!(tc&&tc.is_error));
   row.dataset.toolActionLabel=typeof _toolActionLabelText==='function'?_toolActionLabelText(tc):_toolDisplayName(tc);
-  const disclosureKey=typeof _toolDisclosureIdentity==='function'?_toolDisclosureIdentity(tc):'';
+  // Ordinal for ID-less same-name collisions: count occurrence among
+  // same (assistant_msg_idx, name) tool calls in S.toolCalls so two
+  // terminal calls in one turn get o:0 vs o:1 (r3839148863) without
+  // using tc.args/snippet (which must stay stable while streaming).
+  let _disclosureOrdinal='';
+  try{
+    const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id)||'';
+    if(!tid && typeof S!=='undefined' && Array.isArray(S.toolCalls)){
+      if(tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='') _disclosureOrdinal=tc._ordinal;
+      else if(tc.ordinal!==undefined&&tc.ordinal!==null&&tc.ordinal!=='') _disclosureOrdinal=tc.ordinal;
+      else {
+        let count=0; let found=false;
+        for(const c of S.toolCalls){
+          if(!c) continue;
+          if(c===tc){ _disclosureOrdinal=count; found=true; break; }
+          const ca=c.assistant_msg_idx, cb=tc.assistant_msg_idx;
+          if(ca===cb && (c.name||'tool')===(tc.name||'tool')){
+            const cid=c.tid||c.id||c.tool_call_id||c.tool_use_id||c.call_id||'';
+            if(!cid) count++;
+          }
+        }
+        if(!found){
+          // Fallback: tc not yet in S.toolCalls (e.g., derived fallback not yet committed) — use stored _ordinal or 0
+          if(tc._ordinal!==undefined) _disclosureOrdinal=tc._ordinal;
+        }
+      }
+    } else if(!tid && tc._ordinal!==undefined) _disclosureOrdinal=tc._ordinal;
+  }catch(_){}
+  const disclosureKey=typeof _toolDisclosureIdentity==='function'?_toolDisclosureIdentity(tc, _disclosureOrdinal):'';
   if(disclosureKey) row.setAttribute('data-tool-disclosure-key', disclosureKey);
   const icon=toolIcon(tc.name);
   const hasRawDetail=!!(tc.snippet)||(tc.args&&Object.keys(tc.args).length>0);
@@ -19053,11 +19092,6 @@ function _toggleToolDiff(btn){
   btn.textContent=expanded?btn.dataset.lessLabel:btn.dataset.moreLabel;
 }
 function _toolCallByDisclosureKey(key){
-  // Fall back to the in-memory canonical tool calls for rows whose expando
-  // AND anchor attrs were dropped by an HTML-cache round-trip (worklog /
-  // ordered-transparent tool cards). S.toolCalls survives session switches
-  // (it is rehydrated from the backend), so a disclosure-key match recovers
-  // the full snippet instead of the truncated data-short preview.
   if(!key) return null;
   const candidates=[];
   if(typeof S!=='undefined'&&S&&Array.isArray(S.toolCalls)) candidates.push(...S.toolCalls);
@@ -19068,8 +19102,39 @@ function _toolCallByDisclosureKey(key){
   }
   for(const tc of candidates){
     try{
-      if(tc&&typeof _toolDisclosureIdentity==='function'&&_toolDisclosureIdentity(tc)===key) return tc;
+      const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id)||'';
+      if(tid && typeof _toolDisclosureIdentity==='function'&&_toolDisclosureIdentity(tc)===key) return tc;
     }catch(_){}
+  }
+  const groupCounts=new Map();
+  for(const tc of candidates){
+    try{
+      const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id)||'';
+      if(tid) continue;
+      let ordinal;
+      const hasExplicit = tc&&((tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='')||(tc.ordinal!==undefined&&tc.ordinal!==null&&tc.ordinal!==''));
+      if(hasExplicit){
+        ordinal = tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='' ? tc._ordinal : tc.ordinal;
+      } else {
+        const a=tc&&tc.assistant_msg_idx;
+        const name=tc&&tc.name||'tool';
+        const gk=`${a}\x1f${name}`;
+        ordinal=groupCounts.get(gk);
+        if(ordinal===undefined) ordinal=0;
+        groupCounts.set(gk, ordinal+1);
+      }
+      if(hasExplicit){
+        const a=tc&&tc.assistant_msg_idx;
+        const name=tc&&tc.name||'tool';
+        const gk=`${a}\x1f${name}`;
+        const cur=groupCounts.get(gk);
+        const needed = Number(ordinal)+1;
+        if(cur===undefined||cur<needed) groupCounts.set(gk, needed);
+      }
+      if(typeof _toolDisclosureIdentity==='function'&&_toolDisclosureIdentity(tc, ordinal)===key) return tc;
+      if((ordinal===0||ordinal==='0') && typeof _toolDisclosureIdentity==='function'&&_toolDisclosureIdentity(tc)===key) return tc;
+    }catch(_){}
+    }
   }
   return null;
 }
