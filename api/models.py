@@ -7218,6 +7218,7 @@ def _reload_cli_sessions_after_inflight(
         if is_owner:
             break
         wait_finished = False
+        wait_invalidation_stamp = _cli_sessions_cache_invalidation_stamp()
         try:
             wait_finished = bool(
                 event.wait(
@@ -7228,6 +7229,19 @@ def _reload_cli_sessions_after_inflight(
             )
         except Exception:
             pass
+        # A clear while this caller is joining invalidates the owner's result.
+        # Do not let every existing joiner time out into its own independent
+        # rebuild: wait for the old owner to release its claim, then contend for
+        # exactly one replacement owner in the next loop iteration.
+        if (
+            not wait_finished
+            and _cli_sessions_cache_invalidation_stamp() != wait_invalidation_stamp
+        ):
+            try:
+                event.wait()
+            except Exception:
+                pass
+            continue
         cached_sessions = _copy_fresh_cli_sessions_cache_entry(cache_key)
         if cached_sessions is not None:
             return cached_sessions
