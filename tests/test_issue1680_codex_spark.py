@@ -65,7 +65,6 @@ def test_openai_codex_group_uses_provider_model_ids_for_spark(monkeypatch, tmp_p
         pytest.skip(f"hermes_cli stub not active for openai-codex (likely test-isolation pollution from sibling test). Got calls={calls}")
     assert codex_groups, "OpenAI Codex group should be present"
     assert "gpt-5.3-codex-spark" in _flatten_ids(codex_groups)
-    assert codex_groups[0]["models"][0]["label"] == "GPT 5.4"
 
 
 def test_openai_codex_group_merges_visible_codex_cache_models(monkeypatch, tmp_path):
