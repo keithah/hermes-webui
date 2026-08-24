@@ -1504,12 +1504,17 @@ function _renderCacheKey(text, isUser){
   return p + ':' + text.length + ':' + text.slice(0,20) + ':' + text.slice(-20);
 }
 function _getCachedRender(text, isUser){
-  const key = _renderCacheKey(text, isUser);
+  // Project only at the final display/cache seam. Callers retain canonical
+  // transcript text for context cards, persistence, and restoration paths.
+  const displayText=typeof _projectTranscriptTextForDisplay==='function'
+    ? _projectTranscriptTextForDisplay(text,{surface:isUser?'user':'assistant'})
+    : String(text||'');
+  const key = _renderCacheKey(displayText, isUser);
   const hit = _renderCache.get(key);
   if(hit !== undefined) return hit;
   const rendered = isUser
-    ? (window._renderUserMarkdown ? renderMd(text) : _renderUserFencedBlocks(text))
-    : renderMd(_stripXmlToolCallsDisplay(String(text)));
+    ? (window._renderUserMarkdown ? renderMd(displayText) : _renderUserFencedBlocks(displayText))
+    : renderMd(_stripXmlToolCallsDisplay(displayText));
   if(_renderCache.size > _renderCacheMax) _renderCache.clear();
   _renderCache.set(key, rendered);
   return rendered;
@@ -16550,7 +16555,11 @@ function _processWakeupCardHtml(info, rawText, extras){
   // empty/non-empty decision so leading indentation and trailing blank lines
   // survive (#6350 review finding 1).
   const outRaw=info.output!=null?String(info.output):String(rawText||'');
-  const outDisplay=_projectTranscriptTextForDisplay(outRaw,{surface:'process-output'});
+  // This helper is evaluated alone in client-contract tests, so preserve its
+  // historical standalone behavior if the projector is not included.
+  const outDisplay=typeof _projectTranscriptTextForDisplay==='function'
+    ? _projectTranscriptTextForDisplay(outRaw,{surface:'process-output'})
+    : outRaw;
   const outHtml=outDisplay.trim()?`<pre class="process-wakeup-text">${esc(outDisplay)}</pre>`:'';
   const cmdRow=info.command?`<div class="process-wakeup-cmd-row"><code>${esc(info.command)}</code></div>`:'';
   // The collapsed watch chip truncates the pattern; surface the full,
@@ -17030,11 +17039,7 @@ function renderMessages(options){
         return _renderAttachmentHtml(fname,fileUrl);
       }).join('')}</div>`;
     }
-    const projectedDisplayContent=_projectTranscriptTextForDisplay(
-      displayContent,
-      {surface:isUser?'user':'assistant'}
-    );
-    let bodyHtml = _getCachedRender(projectedDisplayContent, isUser);
+    let bodyHtml = _getCachedRender(displayContent, isUser);
     // Message-level media snapshots: settled assistant messages carry a
     // path→digest map (written at settle time) freezing the file bytes the
     // turn emitted. Stamp it AFTER the text-keyed render cache so identical
@@ -17263,8 +17268,7 @@ function renderMessages(options){
         if(_ERR_MSG_RE.test(String(partDisplayText||'').trim())) orderedSeg.dataset.error='1';
         if(!firstSeg&&thinkingText&&window._showThinking!==false&&!((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs))) orderedSeg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
         const isLastTextPart=partIdx===lastTextPartIdx;
-        const projectedPartDisplayText=_projectTranscriptTextForDisplay(partDisplayText,{surface:'assistant'});
-        const partBodyHtml=_getCachedRender(projectedPartDisplayText,false);
+        const partBodyHtml=_getCachedRender(partDisplayText,false);
         // Message-level media snapshots: transparent ordered segments carry the
         // same per-message path→digest map as the main transcript; stamp it so
         // historical previews freeze (&snap=) instead of following overwrites.
