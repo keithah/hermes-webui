@@ -2463,6 +2463,20 @@ document.addEventListener('keydown',async e=>{
     if(composer){e.preventDefault();composer.focus();}
     return;
   }
+  // Cmd/Ctrl+N and Cmd/Ctrl+T create a new chat. Intercept the browser's
+  // default new-window/new-tab behavior only outside editable controls, and use
+  // the same empty-session and in-flight guard as Cmd/Ctrl+K below.
+  if((e.metaKey||e.ctrlKey)&&(e.key==='n'||e.key==='N'||e.key==='t'||e.key==='T')){
+    const t=e.target;
+    const isText=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable);
+    if(isText) return;
+    e.preventDefault();
+    if(_currentSessionIsReusableEmptyChat()){
+      $('msg').focus();return;
+    }
+    await newSession();await renderSessionList();closeMobileSidebar();$('msg').focus();
+    return;
+  }
   // Enter on approval card = Allow once (when a button inside the card is focused or
   // card is visible and focus is not on an input/textarea/select)
   if(e.key==='Enter'&&!e.metaKey&&!e.ctrlKey&&!e.shiftKey){
