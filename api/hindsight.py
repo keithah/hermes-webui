@@ -48,6 +48,16 @@ _STATUS_LOCK = threading.Lock()
 _STATUS_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _open_no_redirect(request: urllib.request.Request, timeout: float):
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
 def _active_home() -> Path:
     try:
         from api.profiles import get_active_hermes_home
@@ -219,7 +229,7 @@ def _proxy_sync(method: str, path: str, api_key: str, api_url: str, body: dict[s
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _open_no_redirect(request, timeout=timeout) as response:
             raw = response.read(4 * 1024 * 1024 + 1)
             if len(raw) > 4 * 1024 * 1024:
                 return 502, {"detail": "Hindsight response too large"}

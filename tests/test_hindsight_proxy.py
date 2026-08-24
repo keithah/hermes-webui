@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -74,10 +76,40 @@ def test_non_json_upstream_is_normalized(monkeypatch):
         def read(self, _limit):
             return b"not json"
 
-    monkeypatch.setattr(hindsight.urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    class Opener:
+        def open(self, *args, **kwargs):
+            return Response()
+
+    monkeypatch.setattr(hindsight.urllib.request, "build_opener", lambda *args: Opener())
     status, body = hindsight._proxy_sync("GET", "/health", "key", "https://memory.example", timeout=1)
     assert status == 502
     assert body == {"detail": "Hindsight returned a non-JSON response"}
+
+
+def test_proxy_does_not_follow_redirects():
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.1:9/private")
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), RedirectHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, body = hindsight._proxy_sync(
+            "GET", "/public", "key", f"http://127.0.0.1:{server.server_port}", timeout=1
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert status == 302
+    assert body["detail"] == "Found"
 
 
 def test_recall_input_limits_before_proxy(monkeypatch):
