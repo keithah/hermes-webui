@@ -5302,6 +5302,27 @@ let _hindsightReflectSeq = 0;
 let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'project_context' | 'external_notes' | 'hindsight'
 let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
 
+function _hindsightProfileName() { return (S && S.activeProfile) || 'default'; }
+function _resetHindsightState() {
+  ++_hindsightRecallSeq;
+  ++_hindsightReflectSeq;
+  _hindsightStatus = null;
+  _hindsightResults = [];
+  _hindsightReflectText = '';
+  _hindsightReflectQuery = '';
+  _hindsightMemories = [];
+  _hindsightMemoriesTotal = 0;
+  _hindsightLoading = false;
+  _hindsightReflectLoading = false;
+  _hindsightMemoriesLoading = false;
+  _hindsightError = '';
+  _hindsightReflectError = '';
+  _hindsightLastQuery = '';
+  _hindsightLastElapsed = 0;
+  _hindsightStatusProfile = '';
+  _hindsightMemoriesProfile = '';
+}
+
 const MEMORY_SECTIONS = [
   { key: 'memory', labelKey: 'my_notes', emptyKey: 'no_notes_yet', iconKey: 'brain' },
   { key: 'hindsight', labelKey: 'hindsight', emptyKey: 'hindsight_disabled', iconKey: 'eye', readOnly: true },
@@ -5372,19 +5393,22 @@ function _setMemoryHeaderButtons(mode) {
 
  // ── Hindsight (first-class long-term memory) ──
 async function loadHindsightStatus(force) {
-  const profile = (S && S.activeProfile) || 'default';
+  const profile = _hindsightProfileName();
   if (_hindsightStatus && !force && _hindsightStatusProfile === profile) return _hindsightStatus;
   try {
-    _hindsightStatus = await api('/api/hindsight/status');
+    const status = await api('/api/hindsight/status');
+    if (profile !== _hindsightProfileName()) return null;
+    _hindsightStatus = status;
     _hindsightStatusProfile = profile;
   } catch (e) {
+    if (profile !== _hindsightProfileName()) return null;
     _hindsightStatus = { enabled: !!(_memoryData && _memoryData.hindsight_enabled), error: e && e.message ? e.message : String(e), reachable: false };
     _hindsightStatusProfile = profile;
   }
   return _hindsightStatus;
 }
 async function loadHindsightMemories(force) {
-  const profile = (S && S.activeProfile) || 'default';
+  const profile = _hindsightProfileName();
   if (_hindsightMemories.length && !force && _hindsightMemoriesProfile === profile) return;
   const enabled = _memoryData && _memoryData.hindsight_enabled;
   if (!enabled) return;
@@ -5393,12 +5417,15 @@ async function loadHindsightMemories(force) {
   _renderHindsight();
   try {
     const data = await api('/api/hindsight/memories?limit=20');
+    if (profile !== _hindsightProfileName()) return;
     _hindsightMemories = Array.isArray(data.memories) ? data.memories : [];
     _hindsightMemoriesTotal = data.total || _hindsightMemories.length;
     _hindsightError = '';
   } catch (e) {
+    if (profile !== _hindsightProfileName()) return;
     _hindsightError = e && e.message ? e.message : String(e);
   } finally {
+    if (profile !== _hindsightProfileName()) return;
     _hindsightMemoriesLoading = false;
     _renderHindsight();
   }
@@ -5406,6 +5433,7 @@ async function loadHindsightMemories(force) {
 async function recallHindsight() {
   if (_hindsightLoading) return;
   const seq = ++_hindsightRecallSeq;
+  const profile = _hindsightProfileName();
   const input = $('hindsightRecallQuery');
   const budgetEl = $('hindsightRecallBudget');
   const q = input ? input.value.trim() : '';
@@ -5415,16 +5443,16 @@ async function recallHindsight() {
   try {
     const budget = budgetEl ? budgetEl.value : 'mid';
     const data = await api('/api/hindsight/recall', { method: 'POST', body: JSON.stringify({ query: q, budget }) });
-    if (seq !== _hindsightRecallSeq) return;
+    if (seq !== _hindsightRecallSeq || profile !== _hindsightProfileName()) return;
     _hindsightResults = Array.isArray(data.results) ? data.results : [];
     _hindsightLastElapsed = data.elapsed_ms || 0;
     _hindsightError = '';
   } catch (e) {
-    if (seq !== _hindsightRecallSeq) return;
+    if (seq !== _hindsightRecallSeq || profile !== _hindsightProfileName()) return;
     _hindsightResults = [];
     _hindsightError = e && e.message ? e.message : String(e);
   } finally {
-    if (seq !== _hindsightRecallSeq) return;
+    if (seq !== _hindsightRecallSeq || profile !== _hindsightProfileName()) return;
     _hindsightLoading = false;
     _renderHindsight();
     const inp = $('hindsightRecallQuery'); if (inp) { inp.value = q; inp.focus(); }
@@ -5433,6 +5461,7 @@ async function recallHindsight() {
 async function reflectHindsight() {
   if (_hindsightReflectLoading) return;
   const seq = ++_hindsightReflectSeq;
+  const profile = _hindsightProfileName();
   const input = $('hindsightReflectQuery');
   const q = input ? input.value.trim() : '';
   if (!q) { _hindsightReflectError = 'Enter a question'; _renderHindsight(); return; }
@@ -5440,15 +5469,15 @@ async function reflectHindsight() {
   _hindsightReflectLoading = true; _hindsightReflectError = ''; _renderHindsight();
   try {
     const data = await api('/api/hindsight/reflect', { method: 'POST', body: JSON.stringify({ query: q, budget: 'low', include_facts: true }) });
-    if (seq !== _hindsightReflectSeq) return;
+    if (seq !== _hindsightReflectSeq || profile !== _hindsightProfileName()) return;
     _hindsightReflectText = data.text || '';
     _hindsightReflectError = '';
   } catch (e) {
-    if (seq !== _hindsightReflectSeq) return;
+    if (seq !== _hindsightReflectSeq || profile !== _hindsightProfileName()) return;
     _hindsightReflectText = '';
     _hindsightReflectError = e && e.message ? e.message : String(e);
   } finally {
-    if (seq !== _hindsightReflectSeq) return;
+    if (seq !== _hindsightReflectSeq || profile !== _hindsightProfileName()) return;
     _hindsightReflectLoading = false;
     _renderHindsight();
     const inp = $('hindsightReflectQuery'); if (inp) { inp.value = q; inp.focus(); }
@@ -6835,6 +6864,7 @@ async function _profileSwitchPanelLoad(){
   _cronPreFormDetail = null;
   _editingCronId = null;
   _cronIsDuplicate = false;
+  _resetHindsightState();
   _clearCronDetail();
   if (_currentPanel === 'skills') await loadSkills();
   if (_currentPanel === 'memory') await loadMemory();
@@ -9002,8 +9032,6 @@ function _preferencesPayloadFromUi(){
   // identically to the explicit saveSettings() path, so neither save route can
   // persist show_cron_sessions=true while show_cli_sessions=false. (#3514)
   if(showCronCb) payload.show_cron_sessions=!!(showCliCb&&showCliCb.checked&&showCronCb.checked);
-  const showMatrixCb=$('settingsShowMatrixSessions');
-  if(showMatrixCb) payload.show_matrix_sessions=!!(showCliCb&&showCliCb.checked&&showMatrixCb.checked);
   const showWebhookCb=$('settingsShowWebhookSessions');
   if(showWebhookCb) payload.show_webhook_sessions=!!(showCliCb&&showCliCb.checked&&showWebhookCb.checked);
   const showKanbanCb=$('settingsShowKanbanSessions');
@@ -9716,7 +9744,6 @@ async function loadSettingsPanel(){
     if(showCliCb){showCliCb.addEventListener('change',function(){
       const enabled=!!showCliCb.checked;
       if(showCronCb) showCronCb.disabled=!enabled;
-      if(showMatrixCb) showMatrixCb.disabled=!enabled;
       if(showClaudeCodeCb) showClaudeCodeCb.disabled=!enabled;
       _schedulePreferencesAutosave();
     },{once:false});}
@@ -9725,13 +9752,6 @@ async function loadSettingsPanel(){
       showCronCb.checked=!!settings.show_cron_sessions;
       showCronCb.disabled=showCliCb?!showCliCb.checked:true;
       showCronCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
-    }
-    const showMatrixCb=$('settingsShowMatrixSessions');
-    if(showMatrixCb){
-      showMatrixCb.checked=!!settings.show_matrix_sessions;
-      showMatrixCb.disabled=showCliCb?!showCliCb.checked:true;
-      showMatrixCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
-      if(showCliCb){showCliCb.addEventListener('change',function(){showMatrixCb.disabled=!showCliCb.checked;},{once:false});}
     }
     const showWebhookCb=$('settingsShowWebhookSessions');
     if(showWebhookCb){
@@ -12987,7 +13007,6 @@ async function saveSettings(andClose){
   const showCliSessions=!!($('settingsShowCliSessions')||{}).checked;
   const showClaudeCodeSessions=!!($('settingsShowClaudeCodeSessions')||{}).checked;
   const showCronSessions=!!($('settingsShowCronSessions')||{}).checked;
-  const showMatrixSessions=!!($('settingsShowMatrixSessions')||{}).checked;
   const showWebhookSessions=!!($('settingsShowWebhookSessions')||{}).checked;
   const showKanbanSessions=!!($('settingsShowKanbanSessions')||{}).checked;
   const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
@@ -13042,10 +13061,9 @@ async function saveSettings(andClose){
   body.show_cli_sessions=showCliSessions;
   // Persist the opt-out child independently; the read path applies the parent gate.
   body.show_claude_code_sessions=showClaudeCodeSessions;
-  // Cron, Matrix, and webhook sessions are gated on CLI sessions (server short-circuits otherwise);
+  // Cron and webhook sessions are gated on CLI sessions (server short-circuits otherwise);
   // mirror the autosave path so the explicit Save Settings button persists them too. (#3514)
   body.show_cron_sessions=showCliSessions&&showCronSessions;
-  body.show_matrix_sessions=showCliSessions&&showMatrixSessions;
   body.show_webhook_sessions=showCliSessions&&showWebhookSessions;
   body.show_kanban_sessions=showCliSessions&&showKanbanSessions;
   body.show_previous_messaging_sessions=showPreviousMessagingSessions;

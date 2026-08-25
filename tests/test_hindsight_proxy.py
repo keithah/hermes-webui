@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
 import pytest
@@ -76,40 +74,63 @@ def test_non_json_upstream_is_normalized(monkeypatch):
         def read(self, _limit):
             return b"not json"
 
-    class Opener:
-        def open(self, *args, **kwargs):
-            return Response()
-
-    monkeypatch.setattr(hindsight.urllib.request, "build_opener", lambda *args: Opener())
+    monkeypatch.setattr(hindsight, "_open_pinned", lambda *args, **kwargs: Response())
     status, body = hindsight._proxy_sync("GET", "/health", "key", "https://memory.example", timeout=1)
     assert status == 502
     assert body == {"detail": "Hindsight returned a non-JSON response"}
 
 
-def test_proxy_does_not_follow_redirects():
-    class RedirectHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(302)
-            self.send_header("Location", "http://127.0.0.1:9/private")
-            self.end_headers()
+def test_proxy_uses_pinned_no_redirect_transport(monkeypatch):
+    """A validated origin must not be re-resolved or redirect the bearer."""
+    called = {}
 
-        def log_message(self, format, *args):
-            pass
+    class Response:
+        status = 200
 
-    server = HTTPServer(("127.0.0.1", 0), RedirectHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        status, body = hindsight._proxy_sync(
-            "GET", "/public", "key", f"http://127.0.0.1:{server.server_port}", timeout=1
-        )
-    finally:
-        server.shutdown()
-        thread.join(timeout=2)
-        server.server_close()
+        def __enter__(self):
+            return self
 
-    assert status == 302
-    assert body["detail"] == "Found"
+        def __exit__(self, *_):
+            return False
+
+        def read(self, _limit):
+            return b'{"ok": true}'
+
+    def open_pinned(request, *, timeout):
+        called["url"] = request.full_url
+        called["authorization"] = request.get_header("Authorization")
+        return Response()
+
+    monkeypatch.setattr(hindsight, "_open_pinned", open_pinned)
+    monkeypatch.setattr(hindsight.urllib.request, "urlopen", lambda *_args, **_kwargs: pytest.fail("unsafe urlopen used"))
+    status, body = hindsight._proxy_sync("GET", "/health", "key", "https://memory.example", timeout=1)
+    assert (status, body) == (200, {"ok": True})
+    assert called == {"url": "https://memory.example/health", "authorization": "Bearer key"}
+
+
+def test_pinned_transport_covers_explicitly_allowed_http_origins(monkeypatch):
+    captured = []
+
+    class Opener:
+        def open(self, _request, timeout):
+            return timeout
+
+    monkeypatch.setattr(hindsight.urllib.request, "build_opener", lambda *handlers: (captured.extend(handlers), Opener())[1])
+    assert hindsight._open_pinned(hindsight.urllib.request.Request("http://memory.example/health"), timeout=3) == 3
+    assert any(type(handler).__name__ == "_PinnedHTTPHandler" for handler in captured)
+    assert any(type(handler).__name__ == "_PinnedHTTPSHandler" for handler in captured)
+
+
+def test_recall_redacts_successful_upstream_fields(monkeypatch):
+    monkeypatch.setattr(hindsight, "_hindsight_config", lambda: {"enabled": True, "recall_budget": "mid", "_api_key": "key", "api_url": "https://memory.example", "bank_id": "bank"})
+    monkeypatch.setattr(hindsight, "_proxy", lambda *_args, **_kwargs: (200, {"results": [{"text": "token=super-secret", "context": "key=super-secret"}], "trace": "token=super-secret", "entities": ["token=super-secret"]}))
+    monkeypatch.setattr("api.helpers._redact_text", lambda value, **_kwargs: str(value).replace("super-secret", "[REDACTED]"))
+    monkeypatch.setattr("api.helpers.j", lambda _handler, payload, **_kwargs: payload)
+    payload = hindsight.handle_recall(_handler(), {"query": "test"})
+    assert payload["results"][0]["text"] == "token=[REDACTED]"
+    assert payload["results"][0]["context"] == "key=[REDACTED]"
+    assert payload["trace"] == "token=[REDACTED]"
+    assert payload["entities"] == ["token=[REDACTED]"]
 
 
 def test_recall_input_limits_before_proxy(monkeypatch):
