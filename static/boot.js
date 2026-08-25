@@ -2491,7 +2491,8 @@ document.addEventListener('keydown',async e=>{
   if((e.metaKey||e.ctrlKey)&&e.key==='k'){
     const t=e.target;
     const isText=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable);
-    if(isText) return;
+    // Cmd/Ctrl+K is an explicit new-chat command. It intentionally wins over
+    // editable-field editing behavior, including when the composer is focused.
     e.preventDefault();
     // If the current session has no messages AND nothing is in flight, just focus
     // the composer rather than creating another empty session that will clutter

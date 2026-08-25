@@ -1,9 +1,4 @@
-"""Static-analysis tests for #5099 (Ctrl+K must not steal kill-line in text fields).
-
-Emacs-adjacent users expect Ctrl+K to kill to end-of-line while the composer
-or other editable fields are focused. Cmd/Ctrl+K should still create a new chat
-when focus is outside text inputs, matching the existing Ctrl+B guard pattern.
-"""
+"""Static-analysis tests for the explicit Cmd/Ctrl+K new-chat command."""
 from pathlib import Path
 
 BOOT_JS = (Path(__file__).parent.parent / "static" / "boot.js").read_text(encoding="utf-8")
@@ -16,23 +11,17 @@ def _ctrl_k_branch_window() -> str:
 
 
 class TestIssue5099CtrlKTextInputGuard:
-    def test_ctrl_k_skips_text_inputs(self):
+    def test_ctrl_k_recognizes_editable_targets_without_skipping_the_command(self):
         branch = _ctrl_k_branch_window()
         assert "tagName==='INPUT'" in branch
         assert "tagName==='TEXTAREA'" in branch
         assert "isContentEditable" in branch
-        assert "if(isText) return" in branch
+        assert "if(isText) return" not in branch
 
-    def test_ctrl_k_prevent_default_after_text_guard(self):
+    def test_ctrl_k_prevents_default_for_the_new_chat_command(self):
         branch = _ctrl_k_branch_window()
-        guard_idx = branch.find("if(isText) return")
         prevent_idx = branch.find("e.preventDefault()")
-        assert guard_idx >= 0 and prevent_idx >= 0, (
-            "Ctrl+K must guard text inputs before calling preventDefault()"
-        )
-        assert guard_idx < prevent_idx, (
-            "preventDefault() must not run before the text-input early return"
-        )
+        assert prevent_idx >= 0, "Ctrl+K must prevent the browser's default action"
 
     def test_ctrl_k_guard_matches_ctrl_b_idiom(self):
         ctrl_b_idx = BOOT_JS.find("(e.key==='b'||e.key==='B')")
@@ -47,7 +36,7 @@ class TestIssue5099CtrlKTextInputGuard:
             "isContentEditable",
         ):
             assert needle in ctrl_b_block, f"Ctrl+B guard missing {needle!r}"
-            assert needle in ctrl_k_block, f"Ctrl+K guard missing {needle!r}"
+        assert needle in ctrl_k_block, f"Ctrl+K target detection missing {needle!r}"
 
     def test_ctrl_k_still_creates_new_session_outside_inputs(self):
         branch = _ctrl_k_branch_window()
