@@ -239,10 +239,10 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """Dial a freshly validated IP while preserving hostname verification and SNI."""
+class _PinnedConnectionMixin:
+    """Shared connect path for HTTP(S), using only freshly validated addresses."""
 
-    def connect(self):
+    def _connect_pinned(self):
         last_error = None
         for address in _resolve_public_addresses(self.host, self.port):
             try:
@@ -254,6 +254,20 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             if last_error is not None:
                 raise last_error
             raise OSError("could not connect to a validated Hindsight host")
+
+
+class _PinnedHTTPConnection(_PinnedConnectionMixin, http.client.HTTPConnection):
+    """Pin HTTP too when insecure development mode is explicitly enabled."""
+
+    def connect(self):
+        self._connect_pinned()
+
+
+class _PinnedHTTPSConnection(_PinnedConnectionMixin, http.client.HTTPSConnection):
+    """Dial a freshly validated IP while preserving hostname verification and SNI."""
+
+    def connect(self):
+        self._connect_pinned()
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
@@ -262,10 +276,15 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
 
 
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PinnedHTTPConnection, req)
+
+
 def _open_pinned(request: urllib.request.Request, *, timeout: float):
     """Open a request without proxies, redirects, or post-check DNS resolution."""
     opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}), _NoRedirectHandler(), _PinnedHTTPSHandler()
+        urllib.request.ProxyHandler({}), _NoRedirectHandler(), _PinnedHTTPHandler(), _PinnedHTTPSHandler()
     )
     return opener.open(request, timeout=timeout)
 
