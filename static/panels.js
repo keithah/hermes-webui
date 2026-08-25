@@ -5393,19 +5393,22 @@ function _setMemoryHeaderButtons(mode) {
 
  // ── Hindsight (first-class long-term memory) ──
 async function loadHindsightStatus(force) {
-  const profile = (S && S.activeProfile) || 'default';
+  const profile = _hindsightProfileName();
   if (_hindsightStatus && !force && _hindsightStatusProfile === profile) return _hindsightStatus;
   try {
-    _hindsightStatus = await api('/api/hindsight/status');
+    const status = await api('/api/hindsight/status');
+    if (profile !== _hindsightProfileName()) return null;
+    _hindsightStatus = status;
     _hindsightStatusProfile = profile;
   } catch (e) {
+    if (profile !== _hindsightProfileName()) return null;
     _hindsightStatus = { enabled: !!(_memoryData && _memoryData.hindsight_enabled), error: e && e.message ? e.message : String(e), reachable: false };
     _hindsightStatusProfile = profile;
   }
   return _hindsightStatus;
 }
 async function loadHindsightMemories(force) {
-  const profile = (S && S.activeProfile) || 'default';
+  const profile = _hindsightProfileName();
   if (_hindsightMemories.length && !force && _hindsightMemoriesProfile === profile) return;
   const enabled = _memoryData && _memoryData.hindsight_enabled;
   if (!enabled) return;
@@ -5414,12 +5417,15 @@ async function loadHindsightMemories(force) {
   _renderHindsight();
   try {
     const data = await api('/api/hindsight/memories?limit=20');
+    if (profile !== _hindsightProfileName()) return;
     _hindsightMemories = Array.isArray(data.memories) ? data.memories : [];
     _hindsightMemoriesTotal = data.total || _hindsightMemories.length;
     _hindsightError = '';
   } catch (e) {
+    if (profile !== _hindsightProfileName()) return;
     _hindsightError = e && e.message ? e.message : String(e);
   } finally {
+    if (profile !== _hindsightProfileName()) return;
     _hindsightMemoriesLoading = false;
     _renderHindsight();
   }
