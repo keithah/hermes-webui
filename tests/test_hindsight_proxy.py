@@ -108,6 +108,19 @@ def test_proxy_uses_pinned_no_redirect_transport(monkeypatch):
     assert called == {"url": "https://memory.example/health", "authorization": "Bearer key"}
 
 
+def test_pinned_transport_covers_explicitly_allowed_http_origins(monkeypatch):
+    captured = []
+
+    class Opener:
+        def open(self, _request, timeout):
+            return timeout
+
+    monkeypatch.setattr(hindsight.urllib.request, "build_opener", lambda *handlers: (captured.extend(handlers), Opener())[1])
+    assert hindsight._open_pinned(hindsight.urllib.request.Request("http://memory.example/health"), timeout=3) == 3
+    assert any(type(handler).__name__ == "_PinnedHTTPHandler" for handler in captured)
+    assert any(type(handler).__name__ == "_PinnedHTTPSHandler" for handler in captured)
+
+
 def test_recall_redacts_successful_upstream_fields(monkeypatch):
     monkeypatch.setattr(hindsight, "_hindsight_config", lambda: {"enabled": True, "recall_budget": "mid", "_api_key": "key", "api_url": "https://memory.example", "bank_id": "bank"})
     monkeypatch.setattr(hindsight, "_proxy", lambda *_args, **_kwargs: (200, {"results": [{"text": "token=super-secret", "context": "key=super-secret"}], "trace": "token=super-secret", "entities": ["token=super-secret"]}))
