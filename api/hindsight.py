@@ -7,6 +7,7 @@ the configured upstream, and exposes a small, redacted proxy surface.
 from __future__ import annotations
 
 import ipaddress
+import http.client
 import json
 import logging
 import os
@@ -46,6 +47,14 @@ _RATE_LOCK = threading.Lock()
 _RATE_STATE: dict[tuple[str, str], list[float]] = {}
 _STATUS_LOCK = threading.Lock()
 _STATUS_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _resolve_public_addresses(host: str, port: int | None) -> tuple[str, ...]:
+    """Resolve an origin immediately before connecting and reject private IPs."""
+    resolved = tuple({item[4][0] for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
+    if not resolved or any(not _is_public_address(address) for address in resolved):
+        raise ValueError("Hindsight API host resolves to a private or local address")
+    return resolved
 
 
 def _active_home() -> Path:
@@ -132,11 +141,9 @@ def _validate_api_url(value: Any) -> str:
     # Resolve hostnames too: a DNS name that resolves to localhost/private space
     # is no safer than a literal private address.
     try:
-        resolved = {item[4][0] for item in socket.getaddrinfo(host, parts.port, type=socket.SOCK_STREAM)}
+        _resolve_public_addresses(host, parts.port)
     except OSError as exc:
         raise ValueError("Hindsight API host could not be resolved") from exc
-    if any(not _is_public_address(address) for address in resolved):
-        raise ValueError("Hindsight API host resolves to a private or local address")
     return url
 
 
@@ -210,6 +217,59 @@ def _redact_detail(detail: Any) -> str:
     return text[:500]
 
 
+def _redact_success_value(value: Any) -> Any:
+    """Redact strings recursively before returning upstream memory to the browser."""
+    try:
+        from api.helpers import _redact_text
+    except Exception:
+        return value
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, list):
+        return [_redact_success_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _redact_success_value(item) for key, item in value.items()}
+    return value
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so an upstream cannot bounce the bearer to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Dial a freshly validated IP while preserving hostname verification and SNI."""
+
+    def connect(self):
+        last_error = None
+        for address in _resolve_public_addresses(self.host, self.port):
+            try:
+                self.sock = socket.create_connection((address, self.port), self.timeout, self.source_address)
+                break
+            except OSError as exc:
+                last_error = exc
+        else:
+            if last_error is not None:
+                raise last_error
+            raise OSError("could not connect to a validated Hindsight host")
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_PinnedHTTPSConnection, req, context=self._context)
+
+
+def _open_pinned(request: urllib.request.Request, *, timeout: float):
+    """Open a request without proxies, redirects, or post-check DNS resolution."""
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirectHandler(), _PinnedHTTPSHandler()
+    )
+    return opener.open(request, timeout=timeout)
+
+
 def _proxy_sync(method: str, path: str, api_key: str, api_url: str, body: dict[str, Any] | None = None, timeout: float = UPSTREAM_TIMEOUT) -> tuple[int, dict[str, Any]]:
     url = api_url.rstrip("/") + path
     headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json", "User-Agent": UA}
@@ -219,7 +279,7 @@ def _proxy_sync(method: str, path: str, api_key: str, api_url: str, body: dict[s
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _open_pinned(request, timeout=timeout) as response:
             raw = response.read(4 * 1024 * 1024 + 1)
             if len(raw) > 4 * 1024 * 1024:
                 return 502, {"detail": "Hindsight response too large"}
@@ -376,8 +436,8 @@ def handle_recall(handler: Any, body: dict[str, Any]):
     for item in results[:30]:
         if not isinstance(item, dict):
             continue
-        trimmed.append({key: item.get(key) for key in ("id", "text", "type", "context", "occurred_start", "occurred_end", "mentioned_at", "created_at", "score", "tags", "chunk_id", "document_id")})
-    return j(handler, {"query": query, "budget": budget, "elapsed_ms": elapsed, "count": len(results), "results": trimmed, "trace": data.get("trace"), "entities": data.get("entities")})
+        trimmed.append(_redact_success_value({key: item.get(key) for key in ("id", "text", "type", "context", "occurred_start", "occurred_end", "mentioned_at", "created_at", "score", "tags", "chunk_id", "document_id")}))
+    return j(handler, _redact_success_value({"query": query, "budget": budget, "elapsed_ms": elapsed, "count": len(results), "results": trimmed, "trace": data.get("trace"), "entities": data.get("entities")}))
 
 
 def handle_reflect(handler: Any, body: dict[str, Any]):
@@ -407,7 +467,7 @@ def handle_reflect(handler: Any, body: dict[str, Any]):
     elapsed = round((time.monotonic() - started) * 1000)
     if status != 200:
         return _error_response(handler, status, data.get("detail"), elapsed)
-    return j(handler, {"query": query, "budget": budget, "elapsed_ms": elapsed, "text": data.get("text") or data.get("answer") or "", "based_on": data.get("based_on"), "facts": data.get("facts")})
+    return j(handler, _redact_success_value({"query": query, "budget": budget, "elapsed_ms": elapsed, "text": data.get("text") or data.get("answer") or "", "based_on": data.get("based_on"), "facts": data.get("facts")}))
 
 
 def handle_list_memories(handler: Any, parsed: Any):
@@ -439,8 +499,8 @@ def handle_list_memories(handler: Any, parsed: Any):
     trimmed = []
     for item in memories[:limit]:
         if isinstance(item, dict):
-            trimmed.append({"id": item.get("id", ""), "text": str(item.get("text", ""))[:2000], "type": item.get("type", ""), "context": item.get("context", ""), "created_at": item.get("created_at"), "updated_at": item.get("updated_at"), "tags": item.get("tags", [])})
-    return j(handler, {"total": data.get("total", len(trimmed)), "limit": limit, "offset": offset, "memories": trimmed, "query": query})
+            trimmed.append(_redact_success_value({"id": item.get("id", ""), "text": str(item.get("text", ""))[:2000], "type": item.get("type", ""), "context": item.get("context", ""), "created_at": item.get("created_at"), "updated_at": item.get("updated_at"), "tags": item.get("tags", [])}))
+    return j(handler, _redact_success_value({"total": data.get("total", len(trimmed)), "limit": limit, "offset": offset, "memories": trimmed, "query": query}))
 
 
 def handle_retain(handler: Any, body: dict[str, Any]):
