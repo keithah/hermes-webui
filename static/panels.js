@@ -5302,6 +5302,27 @@ let _hindsightReflectSeq = 0;
 let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'project_context' | 'external_notes' | 'hindsight'
 let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
 
+function _hindsightProfileName() { return (S && S.activeProfile) || 'default'; }
+function _resetHindsightState() {
+  ++_hindsightRecallSeq;
+  ++_hindsightReflectSeq;
+  _hindsightStatus = null;
+  _hindsightResults = [];
+  _hindsightReflectText = '';
+  _hindsightReflectQuery = '';
+  _hindsightMemories = [];
+  _hindsightMemoriesTotal = 0;
+  _hindsightLoading = false;
+  _hindsightReflectLoading = false;
+  _hindsightMemoriesLoading = false;
+  _hindsightError = '';
+  _hindsightReflectError = '';
+  _hindsightLastQuery = '';
+  _hindsightLastElapsed = 0;
+  _hindsightStatusProfile = '';
+  _hindsightMemoriesProfile = '';
+}
+
 const MEMORY_SECTIONS = [
   { key: 'memory', labelKey: 'my_notes', emptyKey: 'no_notes_yet', iconKey: 'brain' },
   { key: 'hindsight', labelKey: 'hindsight', emptyKey: 'hindsight_disabled', iconKey: 'eye', readOnly: true },
@@ -5406,6 +5427,7 @@ async function loadHindsightMemories(force) {
 async function recallHindsight() {
   if (_hindsightLoading) return;
   const seq = ++_hindsightRecallSeq;
+  const profile = _hindsightProfileName();
   const input = $('hindsightRecallQuery');
   const budgetEl = $('hindsightRecallBudget');
   const q = input ? input.value.trim() : '';
@@ -5415,16 +5437,16 @@ async function recallHindsight() {
   try {
     const budget = budgetEl ? budgetEl.value : 'mid';
     const data = await api('/api/hindsight/recall', { method: 'POST', body: JSON.stringify({ query: q, budget }) });
-    if (seq !== _hindsightRecallSeq) return;
+    if (seq !== _hindsightRecallSeq || profile !== _hindsightProfileName()) return;
     _hindsightResults = Array.isArray(data.results) ? data.results : [];
     _hindsightLastElapsed = data.elapsed_ms || 0;
     _hindsightError = '';
   } catch (e) {
-    if (seq !== _hindsightRecallSeq) return;
+    if (seq !== _hindsightRecallSeq || profile !== _hindsightProfileName()) return;
     _hindsightResults = [];
     _hindsightError = e && e.message ? e.message : String(e);
   } finally {
-    if (seq !== _hindsightRecallSeq) return;
+    if (seq !== _hindsightRecallSeq || profile !== _hindsightProfileName()) return;
     _hindsightLoading = false;
     _renderHindsight();
     const inp = $('hindsightRecallQuery'); if (inp) { inp.value = q; inp.focus(); }
@@ -5433,6 +5455,7 @@ async function recallHindsight() {
 async function reflectHindsight() {
   if (_hindsightReflectLoading) return;
   const seq = ++_hindsightReflectSeq;
+  const profile = _hindsightProfileName();
   const input = $('hindsightReflectQuery');
   const q = input ? input.value.trim() : '';
   if (!q) { _hindsightReflectError = 'Enter a question'; _renderHindsight(); return; }
@@ -5440,15 +5463,15 @@ async function reflectHindsight() {
   _hindsightReflectLoading = true; _hindsightReflectError = ''; _renderHindsight();
   try {
     const data = await api('/api/hindsight/reflect', { method: 'POST', body: JSON.stringify({ query: q, budget: 'low', include_facts: true }) });
-    if (seq !== _hindsightReflectSeq) return;
+    if (seq !== _hindsightReflectSeq || profile !== _hindsightProfileName()) return;
     _hindsightReflectText = data.text || '';
     _hindsightReflectError = '';
   } catch (e) {
-    if (seq !== _hindsightReflectSeq) return;
+    if (seq !== _hindsightReflectSeq || profile !== _hindsightProfileName()) return;
     _hindsightReflectText = '';
     _hindsightReflectError = e && e.message ? e.message : String(e);
   } finally {
-    if (seq !== _hindsightReflectSeq) return;
+    if (seq !== _hindsightReflectSeq || profile !== _hindsightProfileName()) return;
     _hindsightReflectLoading = false;
     _renderHindsight();
     const inp = $('hindsightReflectQuery'); if (inp) { inp.value = q; inp.focus(); }
@@ -6835,6 +6858,7 @@ async function _profileSwitchPanelLoad(){
   _cronPreFormDetail = null;
   _editingCronId = null;
   _cronIsDuplicate = false;
+  _resetHindsightState();
   _clearCronDetail();
   if (_currentPanel === 'skills') await loadSkills();
   if (_currentPanel === 'memory') await loadMemory();
