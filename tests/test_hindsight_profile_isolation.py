@@ -14,3 +14,11 @@ def test_profile_switch_invalidates_hindsight_state_and_late_requests():
     switch_start = PANELS.index("async function _profileSwitchPanelLoad()")
     switch_body = PANELS[switch_start:PANELS.index("\n}\n", switch_start) + 2]
     assert "_resetHindsightState();" in switch_body
+
+
+def test_all_hindsight_fetches_drop_late_cross_profile_responses():
+    for function_name in ("loadHindsightStatus", "loadHindsightMemories"):
+        start = PANELS.index(f"async function {function_name}")
+        body = PANELS[start:PANELS.index("\n}\n", start) + 2]
+        assert "_hindsightProfileName()" in body
+        assert "profile !== _hindsightProfileName()" in body
