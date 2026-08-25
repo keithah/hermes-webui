@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -296,6 +297,21 @@ def test_ordinary_long_prose_is_unchanged(driver_path: str) -> None:
     result = _project(driver_path, prose, surface="assistant")
 
     assert result == {"source": prose, "display": prose}
+
+
+def test_malformed_near_limit_data_image_is_linear(driver_path: str) -> None:
+    # The candidate is almost at the accepted URI limit but contains an invalid
+    # delimiter near the end. Projection must not repeatedly shorten and re-test
+    # millions of prefixes before bounding the remaining opaque text.
+    payload = "data:image/png;base64," + ("A" * 2_000_000) + "!" + ("B" * 100_000)
+
+    started = time.monotonic()
+    result = _project(driver_path, payload, surface="assistant")
+    elapsed = time.monotonic() - started
+
+    assert result["source"] == payload
+    assert elapsed < 2.0
+    assert "opaque payload abbreviated for display" in result["display"]
 
 
 def test_supported_data_image_is_left_for_media_renderer(driver_path: str) -> None:

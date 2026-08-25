@@ -2717,38 +2717,16 @@ function _projectTranscriptTextForDisplay(value, options){
   const text=String(value||'');
   const surface=String(options&&options.surface||'message');
   const safeSpans=[];
-  const _candidateScanRe = /data:image\/[^\s\]]{1,2097152}/gi;
+  // Tokenize the exact accepted data-image grammars in one linear pass. Do not
+  // discover a broad candidate and repeatedly shorten/revalidate it: malformed
+  // near-limit candidates would make the safety guard itself quadratic.
+  const _candidateScanRe = /data:image\/(?:png|jpe?g|gif|webp|avif)(?:;base64)?,[a-z0-9+/=%._~:@!$&'()*+,;-]*|data:image\/svg\+xml;base64,[a-z0-9+/=]*/gi;
   let m;
-  const seen=new Set();
   _candidateScanRe.lastIndex=0;
   while((m=_candidateScanRe.exec(text))!==null){
     const cand=m[0];
-    const start=m.index;
-    const end=start+cand.length;
-    const key=start+'-'+end;
-    if(seen.has(key)) continue;
-    seen.add(key);
-    let cur=cand;
-    let curStart=start;
-    let curEnd=end;
-    while(cur && !_isSafeDataImageUri(cur)){
-      cur=cur.slice(0,-1);
-      curEnd--;
-      if(cur.length<22) break;
-    }
-    if(cur && _isSafeDataImageUri(cur)){
-      while(curEnd < text.length && cur.length < _DATA_IMAGE_MAX_LEN){
-        const nextChar=text[curEnd];
-        if(/\s/.test(nextChar) || nextChar==='"' || nextChar==='<') break;
-        const extended=cur+nextChar;
-        if(_isSafeDataImageUri(extended)){
-          cur=extended;
-          curEnd++;
-        } else break;
-      }
-      safeSpans.push({start:curStart, end:curEnd, value:cur});
-      _candidateScanRe.lastIndex=curEnd;
-    }
+    if(!_isSafeDataImageUri(cand)) continue;
+    safeSpans.push({start:m.index, end:m.index+cand.length, value:cand});
   }
   safeSpans.sort((a,b)=>a.start-b.start);
   const merged=[];
@@ -18982,34 +18960,14 @@ function buildToolCard(tc){
   row.dataset.toolDone=String(tc&&tc.done!==false);
   row.dataset.toolError=String(!!(tc&&tc.is_error));
   row.dataset.toolActionLabel=typeof _toolActionLabelText==='function'?_toolActionLabelText(tc):_toolDisplayName(tc);
-  // Ordinal for ID-less same-name collisions: count occurrence among
-  // same (assistant_msg_idx, name) tool calls in S.toolCalls so two
-  // terminal calls in one turn get o:0 vs o:1 (r3839148863) without
-  // using tc.args/snippet (which must stay stable while streaming).
+  // ID-less calls must carry their ordinal from normalization. Never infer it
+  // from the current S.toolCalls array or object identity: both can change during
+  // streaming, reordering, and HTML-cache restoration.
   let _disclosureOrdinal='';
-  try{
-    const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id)||'';
-    if(!tid && typeof S!=='undefined' && Array.isArray(S.toolCalls)){
-      if(tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='') _disclosureOrdinal=tc._ordinal;
-      else if(tc.ordinal!==undefined&&tc.ordinal!==null&&tc.ordinal!=='') _disclosureOrdinal=tc.ordinal;
-      else {
-        let count=0; let found=false;
-        for(const c of S.toolCalls){
-          if(!c) continue;
-          if(c===tc){ _disclosureOrdinal=count; found=true; break; }
-          const ca=c.assistant_msg_idx, cb=tc.assistant_msg_idx;
-          if(ca===cb && (c.name||'tool')===(tc.name||'tool')){
-            const cid=c.tid||c.id||c.tool_call_id||c.tool_use_id||c.call_id||'';
-            if(!cid) count++;
-          }
-        }
-        if(!found){
-          // Fallback: tc not yet in S.toolCalls (e.g., derived fallback not yet committed) — use stored _ordinal or 0
-          if(tc._ordinal!==undefined) _disclosureOrdinal=tc._ordinal;
-        }
-      }
-    } else if(!tid && tc._ordinal!==undefined) _disclosureOrdinal=tc._ordinal;
-  }catch(_){}
+  if(tc){
+    if(tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='') _disclosureOrdinal=tc._ordinal;
+    else if(tc.ordinal!==undefined&&tc.ordinal!==null&&tc.ordinal!=='') _disclosureOrdinal=tc.ordinal;
+  }
   const disclosureKey=typeof _toolDisclosureIdentity==='function'?_toolDisclosureIdentity(tc, _disclosureOrdinal):'';
   if(disclosureKey) row.setAttribute('data-tool-disclosure-key', disclosureKey);
   const icon=toolIcon(tc.name);
