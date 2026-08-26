@@ -2699,7 +2699,6 @@ const _DATA_IMAGE_SVG_RE=/^data:image\/svg\+xml;base64,[a-z0-9+/=]+$/i;
 const _DATA_IMAGE_MAX_LEN=2*1024*1024;
 const _TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT=60000;
 const _TRANSCRIPT_DISPLAY_NOTICE='[opaque payload abbreviated for display]';
-const _TRANSCRIPT_DISPLAY_OPAQUE_RE=/data:(?:application|image)\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*;base64,[a-z0-9+/=\r\n]+|[a-z0-9+/=]{60001,}/ig;
 
 // The streaming renderer calls this ui-owned predicate too. Keep the dangerous
 // SVG form base64-only: URL-encoded XML is a document-shaped payload, not a
@@ -2716,48 +2715,12 @@ function _isSafeDataImageUri(ref){
 function _projectTranscriptTextForDisplay(value, options){
   const text=String(value||'');
   const surface=String(options&&options.surface||'message');
-  const safeSpans=[];
-  // Tokenize the exact accepted data-image grammars in one linear pass. Do not
-  // discover a broad candidate and repeatedly shorten/revalidate it: malformed
-  // near-limit candidates would make the safety guard itself quadratic.
-  const _candidateScanRe = /data:image\/(?:png|jpe?g|gif|webp|avif)(?:;base64)?,[a-z0-9+/=%._~:@!$&'()*+,;-]*|data:image\/svg\+xml;base64,[a-z0-9+/=]*/gi;
-  let m;
-  _candidateScanRe.lastIndex=0;
-  while((m=_candidateScanRe.exec(text))!==null){
-    const cand=m[0];
-    if(!_isSafeDataImageUri(cand)) continue;
-    safeSpans.push({start:m.index, end:m.index+cand.length, value:cand});
-  }
-  safeSpans.sort((a,b)=>a.start-b.start);
-  const merged=[];
-  for(const s of safeSpans){
-    if(!merged.length || s.start>=merged[merged.length-1].end) merged.push(s);
-    else if(s.end>merged[merged.length-1].end) merged[merged.length-1]=s;
-  }
-  let out='';
-  let pos=0;
-  _TRANSCRIPT_DISPLAY_OPAQUE_RE.lastIndex=0;
-  for(const span of merged){
-    if(pos<span.start){
-      const gap=text.slice(pos, span.start);
-      _TRANSCRIPT_DISPLAY_OPAQUE_RE.lastIndex=0;
-      out+=gap.replace(_TRANSCRIPT_DISPLAY_OPAQUE_RE, match=>{
-        if(match.length<=_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT) return match;
-        return `${match.slice(0,2048)}\n\n${_TRANSCRIPT_DISPLAY_NOTICE}`;
-      });
-    }
-    out+=span.value;
-    pos=span.end;
-  }
-  if(pos<text.length){
-    const tail=text.slice(pos);
-    _TRANSCRIPT_DISPLAY_OPAQUE_RE.lastIndex=0;
-    out+=tail.replace(_TRANSCRIPT_DISPLAY_OPAQUE_RE, match=>{
-      if(match.length<=_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT) return match;
-      return `${match.slice(0,2048)}\n\n${_TRANSCRIPT_DISPLAY_NOTICE}`;
-    });
-  }
-  return out;
+  const opaque=/data:(?:application|image)\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*;base64,[a-z0-9+/=\r\n]+|[a-z0-9+/=]{60001,}/ig;
+  return text.replace(opaque, match=>{
+    if(_isSafeDataImageUri(match)) return match;
+    if(match.length<=_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT) return match;
+    return `${match.slice(0,2048)}\n\n${_TRANSCRIPT_DISPLAY_NOTICE} (${match.length} characters; ${surface})`;
+  });
 }
 
 function _dataImageHtml(ref, altText){
@@ -8977,86 +8940,9 @@ function copyStatusSessionId(btn){
     setTimeout(()=>{btn.innerHTML=orig;btn.classList.remove('copied');},1500);
   }).catch(()=>showToast(t('copy_failed')));
 }
-function _canonicalTextForRow(row){
-  if(!row) return '';
-  try{
-    if(row._canonicalRawText) return String(row._canonicalRawText);
-  }catch(_){}
-  try{
-    // Live: check ancestor live turn's canonical (messages.js stores it)
-    const liveTurn=row.closest&&row.closest('#liveAssistantTurn');
-    if(liveTurn){
-      try{
-        if(liveTurn._canonicalRawText) return String(liveTurn._canonicalRawText);
-        const body=liveTurn.querySelector&&liveTurn.querySelector('.msg-body');
-        if(body&&body._canonicalRawText) return String(body._canonicalRawText);
-      }catch(_){}
-      if(typeof window!=='undefined' && window._lastLiveAssistantText) return String(window._lastLiveAssistantText);
-    }
-    // Also check closest ancestor with canonical
-    let cur=row.parentElement;
-    while(cur){
-      try{ if(cur._canonicalRawText) return String(cur._canonicalRawText); }catch(_){}
-      cur=cur.parentElement;
-      if(cur&&cur.id==='liveAssistantTurn') break;
-    }
-  }catch(_){}
-  try{
-    const msgIdxAttr=row.getAttribute('data-msg-idx');
-    const msgIdx=msgIdxAttr!=null?parseInt(msgIdxAttr,10):NaN;
-    if(Number.isFinite(msgIdx) && typeof S!=='undefined' && S && Array.isArray(S.messages)){
-      const m=S.messages[msgIdx];
-      if(m){
-        if(m.role==='user' || m.role==='assistant' || m._source==='process_wakeup'){
-          const c=typeof msgContent==='function'?msgContent(m): (m.content||'');
-          if(typeof c==='string' && c) return c;
-          if(Array.isArray(m.content)){
-            const t=m.content.filter(p=>p&&p.type==='text').map(p=>p.text||p.content||'').join('\n');
-            if(t) return t;
-          }
-          if(m.content) return String(m.content);
-        }
-        // Fallback for ordered transparent parts stored per-anchor? Try anchor identity
-        if(m && m._anchor_activity_scene){
-          // Anchor scene prose is stored in activity_rows; lookup by row id
-          const aid=row.getAttribute('data-anchor-row-id')||row.getAttribute('data-anchor-local-id');
-          if(aid && typeof window!=='undefined' && window._liveAnchorRegistries){
-            for(const reg of window._liveAnchorRegistries.values()){
-              if(!reg||!reg.anchor||!Array.isArray(reg.anchor.activity_events)) continue;
-              for(const ev of reg.anchor.activity_events){
-                if(ev && (ev.local_id===aid || ev.row_id===aid) && ev.payload && ev.payload.text){
-                  return String(ev.payload.text);
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }catch(_){}
-  // Last resort: the bounded DOM attribute (already projected) – copy at least something
-  try{
-    if(row.dataset && row.dataset.rawText) return String(row.dataset.rawText);
-  }catch(_){}
-  return String(row.textContent||'').trim();
-}
-function _setBoundedRawText(row, canonical, surface){
-  if(!row) return;
-  try{ row._canonicalRawText=String(canonical||''); }catch(_){}
-  try{
-    const bounded=typeof _projectTranscriptTextForDisplay==='function'?_projectTranscriptTextForDisplay(String(canonical||''),{surface:surface||'message'}):String(canonical||'');
-    // Data attributes are serialized into innerHTML for the session HTML cache.
-    // Never store the full canonical opaque payload – store only the bounded
-    // display text so the DOM/cache stays bounded.
-    row.dataset.rawText=bounded;
-  }catch(_){
-    try{ row.dataset.rawText=String(canonical||'').slice(0,60000); }catch(__){}
-  }
-}
 function copyMsg(btn){
   const row=btn.closest('[data-raw-text]');
-  if(!row) return;
-  const text=_canonicalTextForRow(row);
+  const text=row?row.dataset.rawText:'';
   if(!text)return;
   _copyText(text).then(()=>{
     const orig=btn.innerHTML;btn.innerHTML=li('check',13);btn.style.color='var(--blue)';
@@ -9066,53 +8952,8 @@ function copyMsg(btn){
 function _copyThinkingText(btn){
   const card=btn&&btn.closest?btn.closest('.thinking-card'):null;
   if(!card)return;
-  let text='';
-  // Resolve the canonical reasoning via identity so the Copy action returns the
-  // full value even though the displayed DOM is bounded. Try (1) settled
-  // message identity via data-msg-idx → S.messages, (2) Anchor scene
-  // data-anchor-row-id → live anchor registry, (3) non-serialized expando
-  // _canonicalReasoning / INFLIGHT, then fall back to displayed DOM.
-  try{
-    const seg=card.closest('[data-msg-idx]');
-    const msgIdxAttr=seg?seg.getAttribute('data-msg-idx'):null;
-    const msgIdx=msgIdxAttr!=null?parseInt(msgIdxAttr,10):NaN;
-    if(Number.isFinite(msgIdx) && typeof S!=='undefined' && S && Array.isArray(S.messages)){
-      const m=S.messages[msgIdx];
-      if(m){
-        const canon=typeof _assistantReasoningPayloadText==='function'?_assistantReasoningPayloadText(m):'';
-        if(canon) text=String(canon);
-      }
-    }
-  }catch(_){}
-  if(!text){
-    try{
-      const anchorId=card.getAttribute('data-anchor-row-id')||card.getAttribute('data-anchor-local-id')||card.getAttribute('data-thinking-key')||'';
-      if(anchorId && typeof window!=='undefined' && window._liveAnchorRegistries){
-        for(const reg of window._liveAnchorRegistries.values()){
-          if(!reg||!reg.anchor||!Array.isArray(reg.anchor.activity_events)) continue;
-          for(const ev of reg.anchor.activity_events){
-            if(ev && (ev.local_id===anchorId || ev.row_id===anchorId) && ev.source_event_type==='reasoning' && ev.payload && ev.payload.text){
-              const cand=String(ev.payload.text).trim();
-              if(cand){ text=cand; break; }
-            }
-          }
-          if(text) break;
-        }
-      }
-    }catch(_){}
-  }
-  if(!text && card._canonicalReasoning) text=String(card._canonicalReasoning);
-  if(!text && typeof window!=='undefined' && window._lastLiveReasoningText) text=String(window._lastLiveReasoningText);
-  if(!text){
-    try{
-      const sid=typeof S!=='undefined'&&S&&S.session?S.session.session_id:'';
-      if(sid && typeof INFLIGHT!=='undefined' && INFLIGHT[sid] && INFLIGHT[sid].lastReasoningText) text=String(INFLIGHT[sid].lastReasoningText);
-    }catch(_){}
-  }
-  if(!text){
-    const pre=card.querySelector('.thinking-card-body pre');
-    text=pre?pre.textContent:'';
-  }
+  const pre=card.querySelector('.thinking-card-body pre');
+  const text=pre?pre.textContent:'';
   if(!text)return;
   _copyText(text).then(()=>{
     const orig=btn.innerHTML;
@@ -9285,7 +9126,7 @@ function speakMessage(btn){
   stopTTS();
 
   const row=btn?btn.closest('[data-raw-text]'):null;
-  const text=row?_canonicalTextForRow(row):'';
+  const text=row?row.dataset.rawText:'';
   if(!text) return;
 
   const clean=_stripForTTS(text);
@@ -9470,7 +9311,7 @@ function autoReadLastAssistant(){
   const rows=document.querySelectorAll('.msg-row[data-role="assistant"], .assistant-segment[data-raw-text]');
   if(!rows.length) return;
   const last=rows[rows.length-1];
-  const text=_canonicalTextForRow(last);
+  const text=last.dataset.rawText||'';
   if(!text.trim()) return;
   const clean=_stripForTTS(text);
   if(!clean) return;
@@ -11739,11 +11580,7 @@ function _thinkingCardHtml(text, open){
   const copyBtn=`<button class="thinking-copy-btn" onclick="event.stopPropagation();_copyThinkingText(this)" title="${t('copy')}" aria-label="${t('copy')}">${li('copy',12)}</button>`;
   const shouldOpen=!!open||_worklogDetailsExpandedDefault();
   const classes=`thinking-card${shouldOpen?' open':''}`;
-  // The displayed <pre> is bounded; keep the full canonical in a JS expando
-  // at render time (not a serialized attribute) for the Copy handler to use.
-  // After an HTML-cache round-trip the expando is lost, but the settled-path
-  // fallback in _copyThinkingText (S.messages / anchor registry) still resolves.
-  return `<div class="${classes}" data-thinking-card="1"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
+  return `<div class="${classes}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-btn-row">${copyBtn}<span class="thinking-card-toggle">${li('chevron-right',12)}</span></span></div><div class="thinking-card-body"><pre>${esc(clean)}</pre></div></div>`;
 }
 function isSimplifiedToolCalling(){
   return window._simplifiedToolCalling!==false;
@@ -11754,11 +11591,6 @@ function _thinkingActivityNode(text, open, disclosureKey){
   row.setAttribute('data-worklog-thinking-card','1');
   if(disclosureKey) row.setAttribute('data-thinking-key', String(disclosureKey));
   row.innerHTML=_thinkingCardHtml(text, open);
-  try{
-    const card=row.querySelector('.thinking-card');
-    if(card) card._canonicalReasoning=String(text||'');
-    row._canonicalReasoning=String(text||'');
-  }catch(_){}
   _renderThinkingInto(row,text);
   return row;
 }
@@ -12227,15 +12059,13 @@ function _transparentToolDetailHtml(tc, status){
   // duration meta when present. (Trifecta finding V6 — reduce redundancy.)
   const meta=[];
   if(tc&&tc.duration!==undefined&&tc.duration!==null) meta.push(['duration', String(tc.duration)]);
-  const previewRaw=String((tc&&(tc.snippet||tc.preview||tc.result||tc.output))||'').trim();
-  const preview=_projectTranscriptTextForDisplay(previewRaw,{surface:'tool-detail'});
+  const preview=String((tc&&(tc.snippet||tc.preview||tc.result||tc.output))||'').trim();
   const argHtml=[...meta,...argEntries].map(([k,v])=>{
     let sv=typeof v==='string'?v:JSON.stringify(v,null,2);
     // Redact secret-bearing arg values before rendering the transparent Full
     // tab — content args can be long multi-line commands (#4928) whose later
     // lines may carry secrets the short label never showed (#4928 gate).
     if(typeof _redactToolTargetLabel==='function'){ try{ sv=_redactToolTargetLabel(sv); }catch(e){} }
-    sv=_projectTranscriptTextForDisplay(sv,{surface:'tool-detail'});
     return `<div class="tool-arg-pair"><span class="tool-arg-key">${esc(String(k))}</span><span class="tool-arg-val">${esc(sv)}</span></div>`;
   }).join('');
   return `<div class="tool-card-detail" data-transparent-detail-mode="full"><div class="transparent-detail-modes" role="tablist"><span class="transparent-detail-mode active" role="tab" tabindex="0" data-mode="full" onclick="_setTransparentDetailMode(this,'full')">Full</span><span class="transparent-detail-mode" role="tab" tabindex="0" data-mode="output" onclick="_setTransparentDetailMode(this,'output')">Output</span></div><div class="tool-card-args">${argHtml}</div>${preview?`<div class="tool-card-result"><pre>${esc(preview)}</pre></div>`:''}</div>`;
@@ -12891,7 +12721,7 @@ function _worklogReasonHtmlFromAnchor(anchor, textOverride){
   return body?body.innerHTML:esc(String(text||'').trim());
 }
 function _worklogReasonHtmlFromText(text){
-  const clean=_projectTranscriptTextForDisplay(_sanitizeThinkingDisplayText(text),{surface:'reasoning'});
+  const clean=_sanitizeThinkingDisplayText(text);
   if(!String(clean||'').trim()) return '';
   if(String(clean||'').trim()==='(empty)') return '';
   return renderMd?renderMd(clean):esc(clean);
@@ -13045,27 +12875,15 @@ function _toolIdentity(tc){
     String(tc.snippet||tc.preview||'').slice(0,160),
   ].join('|');
 }
-function _toolDisclosureIdentity(tc, ordinal){
+function _toolDisclosureIdentity(tc){
   if(!tc) return '';
   const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
   if(tid) return `id:${tid}`;
-  let ord=ordinal;
-  if(ord===undefined||ord===null||ord===''){
-    if(tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='') ord=tc._ordinal;
-    else if(tc.ordinal!==undefined&&tc.ordinal!==null&&tc.ordinal!=='') ord=tc.ordinal;
-    else if(tc._disclosureOrdinal!==undefined&&tc._disclosureOrdinal!==null&&tc._disclosureOrdinal!=='') ord=tc._disclosureOrdinal;
-    else ord='';
-  }
-  const hasAssistantIdx=tc.assistant_msg_idx!==undefined&&tc.assistant_msg_idx!==null&&tc.assistant_msg_idx!=='';
-  const hasBurst=tc.activityBurstId!==undefined&&tc.activityBurstId!==null&&String(tc.activityBurstId)!==''&&String(tc.activityBurstId)!=='0';
-  const hasSeq=tc.activitySegmentSeq!==undefined&&tc.activitySegmentSeq!==null&&String(tc.activitySegmentSeq)!==''&&String(tc.activitySegmentSeq)!=='0';
-  let owner='';
-  if(hasAssistantIdx) owner=`a:${tc.assistant_msg_idx}`;
-  else if(hasBurst||hasSeq) owner=`b:${hasBurst?tc.activityBurstId:''}:s:${hasSeq?tc.activitySegmentSeq:''}`;
-  else owner='a:';
-  const name=tc.name||'tool';
-  const ordPart=(ord!==''&&ord!==null&&ord!==undefined)?`o:${ord}`:'o:0';
-  return `derived:${owner}:${name}:${ordPart}`;
+  const stable=[
+    tc.assistant_msg_idx!==undefined?`a:${tc.assistant_msg_idx}`:'',
+    tc.name||'tool',
+  ].join('\x1f');
+  return stable.trim()?`derived:${_worklogDetailHashKey(stable)}`:'';
 }
 function _filterNewWorklogTools(cards, seenTools){
   const out=[];
@@ -13307,9 +13125,8 @@ function _anchorSceneNodeForRow(row, opts){
       node=document.createElement('div');
       node.className='assistant-segment';
       node.setAttribute('data-anchor-scene-prose','1');
-      _setBoundedRawText(node, text, 'assistant');
-      const _projAnchor=typeof _projectTranscriptTextForDisplay==='function'?_projectTranscriptTextForDisplay(text,{surface:'assistant'}):text;
-      node.innerHTML=`<div class="msg-body">${renderMd?renderMd(_projAnchor):esc(_projAnchor)}</div>`;
+      node.dataset.rawText=text;
+      node.innerHTML=`<div class="msg-body">${renderMd?renderMd(text):esc(text)}</div>`;
     }
   }else if(row.role==='thinking'){
     if(window._showThinking===false) return null;
@@ -17314,10 +17131,10 @@ function renderMessages(options){
         // serialization-independent while still rebuilding when the markup
         // genuinely changes (locale/timestamp format); open state is
         // user-driven, so it is captured and restored across rebuilds.
-        if(row._canonicalRawText!==processText||row._wakeupRenderedHtml!==nextRowHtml){
+        if(row.dataset.rawText!==processText||row._wakeupRenderedHtml!==nextRowHtml){
           const _priorCard=row.querySelector&&row.querySelector('details.process-wakeup-card');
           const _wasOpen=!!(_priorCard&&_priorCard.open);
-          _setBoundedRawText(row, processText, 'process-output');
+          row.dataset.rawText=processText;
           row._wakeupRenderedHtml=nextRowHtml;
           row.innerHTML=nextRowHtml;
           if(_wasOpen){
@@ -17333,7 +17150,7 @@ function renderMessages(options){
         row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
         row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
         row.dataset.role='process_wakeup';
-        _setBoundedRawText(row, processText, 'process-output');
+        row.dataset.rawText=processText;
         row._wakeupRenderedHtml=nextRowHtml;
         row.innerHTML=nextRowHtml;
       }
@@ -17356,8 +17173,8 @@ function renderMessages(options){
         row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
         row.dataset.role='user';
         delete row.dataset.editing;
-        if(row._canonicalRawText!==newRawText||row.innerHTML!==nextRowHtml){
-          _setBoundedRawText(row, newRawText, 'user');
+        if(row.dataset.rawText!==newRawText||row.innerHTML!==nextRowHtml){
+          row.dataset.rawText=newRawText;
           row.innerHTML=nextRowHtml;
         }
       }else{
@@ -17368,7 +17185,7 @@ function renderMessages(options){
         row.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
         row.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
         row.dataset.role='user';
-        _setBoundedRawText(row, newRawText, 'user');
+        row.dataset.rawText=newRawText;
         row.innerHTML=nextRowHtml;
       }
       // Reserve this user row's real off-screen height up front so a wipe-and-rebuild
@@ -17422,17 +17239,10 @@ function renderMessages(options){
       if(thinkingText&&window._showThinking!==false){
         if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
       }
-      const _orderedOrdCounts=new Map();
       orderedTransparentParts.forEach((part, partIdx)=>{
         if(!part) return;
         if(part.kind==='tool'){
         const toolCall=_transparentOrderedToolCall(part, rawIdx, transparentOrderedToolCallsByTid, transparentToolResultsByTid, transparentPersistedSnippetByTid);
-          if(!toolCall.tid && !toolCall.id){
-            const gk=`${rawIdx}\x1f${toolCall.name||'tool'}`;
-            const ord=_orderedOrdCounts.get(gk)||0;
-            toolCall._ordinal=ord;
-            _orderedOrdCounts.set(gk, ord+1);
-          }
           const toolRow=_decorateTransparentEventRow(buildToolCard(toolCall),{
             type:'tool',
             name:toolCall&&toolCall.name,
@@ -17452,7 +17262,7 @@ function renderMessages(options){
         orderedSeg.dataset.msgIdx=rawIdx;
         orderedSeg.dataset.sessionMsgIdx=sessionMsgIdx;
         orderedSeg.dataset.messageAnchorKey=messageAnchorKey;
-        _setBoundedRawText(orderedSeg, String(partDisplayText||'').trim(), 'assistant');
+        orderedSeg.dataset.rawText=String(partDisplayText||'').trim();
         if(m._activityBurstId!==undefined&&m._activityBurstId!==null) orderedSeg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
         if(Number.isFinite(Number(m._liveSegmentSeq))) orderedSeg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
         if(_ERR_MSG_RE.test(String(partDisplayText||'').trim())) orderedSeg.dataset.error='1';
@@ -17478,7 +17288,7 @@ function renderMessages(options){
     seg.dataset.msgIdx=rawIdx;
     seg.dataset.sessionMsgIdx=_messageSessionIndexForRawIdx(rawIdx);
     seg.dataset.messageAnchorKey=_messageViewportAnchorKeyForMessage(m);
-    _setBoundedRawText(seg, String(content).trim(), 'assistant');
+    seg.dataset.rawText=String(content).trim();
     if(m._activityBurstId!==undefined&&m._activityBurstId!==null) seg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
     if(Number.isFinite(Number(m._liveSegmentSeq))) seg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
     const messageBelongsInWorklog=!S.busy&&isCompactWorklogMode()&&_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, displayContent, {isTurnFinalAssistant});
@@ -17806,24 +17616,7 @@ function renderMessages(options){
         });
       }
     });
-    if(derived.length) {
-      // Stamp ordinal for ID-less derived tool calls so disclosure keys
-      // stay distinct without using args/snippet (which must remain stable
-      // while streaming). Ordinal is occurrence index within same
-      // (assistant_msg_idx, name) among ID-less calls.
-      const _ordCounts=new Map();
-      for(const tc of derived){
-        const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id)||'';
-        if(tid) continue;
-        const a=tc&&tc.assistant_msg_idx;
-        const name=tc&&tc.name||'tool';
-        const gk=`${a}\x1f${name}`;
-        const ord=_ordCounts.get(gk)||0;
-        tc._ordinal=ord;
-        _ordCounts.set(gk, ord+1);
-      }
-      S.toolCalls=derived;
-    }
+    if(derived.length) S.toolCalls=derived;
     if(S._settledLiveToolMetadata) S._settledLiveToolMetadata=null;
   }
   if(!S.busy || (S.toolCalls&&S.toolCalls.length)){
@@ -18960,15 +18753,7 @@ function buildToolCard(tc){
   row.dataset.toolDone=String(tc&&tc.done!==false);
   row.dataset.toolError=String(!!(tc&&tc.is_error));
   row.dataset.toolActionLabel=typeof _toolActionLabelText==='function'?_toolActionLabelText(tc):_toolDisplayName(tc);
-  // ID-less calls must carry their ordinal from normalization. Never infer it
-  // from the current S.toolCalls array or object identity: both can change during
-  // streaming, reordering, and HTML-cache restoration.
-  let _disclosureOrdinal='';
-  if(tc){
-    if(tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='') _disclosureOrdinal=tc._ordinal;
-    else if(tc.ordinal!==undefined&&tc.ordinal!==null&&tc.ordinal!=='') _disclosureOrdinal=tc.ordinal;
-  }
-  const disclosureKey=typeof _toolDisclosureIdentity==='function'?_toolDisclosureIdentity(tc, _disclosureOrdinal):'';
+  const disclosureKey=typeof _toolDisclosureIdentity==='function'?_toolDisclosureIdentity(tc):'';
   if(disclosureKey) row.setAttribute('data-tool-disclosure-key', disclosureKey);
   const icon=toolIcon(tc.name);
   const hasRawDetail=!!(tc.snippet)||(tc.args&&Object.keys(tc.args).length>0);
@@ -19000,8 +18785,7 @@ function buildToolCard(tc){
   const argPreview=_formatToolArgPreview(tc&&tc.args);
   if(toolKind==='shell'||previewText===argPreview||previewText==='Completed'||previewText==='Running'||previewText==='Failed') previewText='';
   if(isSubagent) previewText=previewText.replace(/^(?:\u{1F500}|↳)\s*/u,'');
-  const detailLeadTextRaw=hasDetail&&typeof _toolDetailLeadText==='function'?_toolDetailLeadText(toolKind,tc):'';
-  const detailLeadText=_projectTranscriptTextForDisplay(detailLeadTextRaw,{surface:'tool-detail'});
+  const detailLeadText=hasDetail&&typeof _toolDetailLeadText==='function'?_toolDetailLeadText(toolKind,tc):'';
   const detailLeadLabel=typeof _toolDetailLeadLabel==='function'?_toolDetailLeadLabel(toolKind):(toolKind==='shell'?'Shell':'Input');
   const detailLead=detailLeadText?`<div class="tool-card-detail-lead"><div class="tool-card-detail-lead-label">${esc(detailLeadLabel)}</div><pre>${esc(detailLeadText)}</pre></div>`:'';
   const argsEntries=tc.args&&Object.keys(tc.args).length?Object.entries(tc.args):[];
@@ -19021,13 +18805,12 @@ function buildToolCard(tc){
           visibleArgs.map(([k,v])=>{
             let sv=String(v);
             if(typeof _redactToolTargetLabel==='function'){ try{ sv=_redactToolTargetLabel(sv); }catch(e){} }
-            sv=_projectTranscriptTextForDisplay(sv,{surface:'tool-detail'});
             return `<div class="tool-arg-pair"><span class="tool-arg-key">${esc(k)}</span><span class="tool-arg-val">${esc(sv)}</span></div>`;
           }).join('')
         }</div>`:''}
         ${displaySnippet?`<div class="tool-card-result">
           <pre>${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?`<code class="diff-block" data-highlighted="1">${_colorDiffLines(displaySnippet)}</code>`:esc(displaySnippet)}</pre>
-          ${hasMore?`<button class="tool-card-more" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
+          ${hasMore?`<button class="tool-card-more" data-full="${esc(tc.snippet||'').replace(/"/g,'&quot;')}" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
         </div>`:''}
       </div>`:''}
     </div>`;
@@ -19071,88 +18854,15 @@ function _toggleToolDiff(btn){
   if(!pre) return;
   const isDiff=btn.dataset.isDiff==='1';
   const expanded=btn.textContent===btn.dataset.moreLabel;
-  const row=btn.closest('.tool-card-row');
-  // Expando properties are lost when the session HTML cache restores innerHTML.
-  // Recover the canonical tool call in order: (1) the live _tcData expando,
-  // (2) the anchor scene (data-anchor-row-id stamped on anchor-scene rows),
-  // (3) S.toolCalls by the durable data-tool-disclosure-key every
-  // buildToolCard row carries — ordered-transparent and worklog tool cards
-  // have no anchor attrs, so (2) alone would still fall back to the truncated
-  // preview for those.
-  const canonicalTool=row&&row._tcData
-    ? row._tcData
-    : (row&&typeof _transparentToolCallFromRowDataset==='function'
-      ? _transparentToolCallFromRowDataset(row)
-      : null);
-  const disclosureKey=row&&row.getAttribute?row.getAttribute('data-tool-disclosure-key'):'';
-  const recovered=canonicalTool||_toolCallByDisclosureKey(disclosureKey);
-  const canonicalSnippet=recovered&&recovered.snippet;
-  const raw=expanded
-    ? (canonicalSnippet==null?btn.dataset.short:String(canonicalSnippet))
-    : btn.dataset.short;
-  // Even the expanded canonical payload must stay display-bounded — a
-  // deferred Transparent Stream detail can hold an oversized opaque run
-  // (r3792269302). Projecting here keeps WKWebView from stalling on Show more.
-  let displayRaw=raw;
-  try{
-    if(expanded && typeof _projectTranscriptTextForDisplay==='function'){
-      displayRaw=_projectTranscriptTextForDisplay(raw,{surface:'tool-detail'});
-    }
-  }catch(_){}
+  const raw=expanded?btn.dataset.full:btn.dataset.short;
   if(isDiff){
     let code=pre.querySelector('code');
     if(!code){code=document.createElement('code');code.className='diff-block';pre.textContent='';pre.appendChild(code);}
-    code.innerHTML=_colorDiffLines(expanded?displayRaw:raw);
+    code.innerHTML=_colorDiffLines(raw);
   }else{
-    pre.textContent=expanded?displayRaw:raw;
+    pre.textContent=raw;
   }
   btn.textContent=expanded?btn.dataset.lessLabel:btn.dataset.moreLabel;
-}
-function _toolCallByDisclosureKey(key){
-  if(!key) return null;
-  const candidates=[];
-  if(typeof S!=='undefined'&&S&&Array.isArray(S.toolCalls)) candidates.push(...S.toolCalls);
-  if(typeof S!=='undefined'&&S&&Array.isArray(S.messages)){
-    for(const m of S.messages){
-      if(m&&Array.isArray(m.tool_calls)) candidates.push(...m.tool_calls);
-    }
-  }
-  for(const tc of candidates){
-    try{
-      const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id)||'';
-      if(tid && typeof _toolDisclosureIdentity==='function'&&_toolDisclosureIdentity(tc)===key) return tc;
-    }catch(_){}
-  }
-  const groupCounts=new Map();
-  for(const tc of candidates){
-    try{
-      const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id)||'';
-      if(tid) continue;
-      let ordinal;
-      const hasExplicit = tc&&((tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='')||(tc.ordinal!==undefined&&tc.ordinal!==null&&tc.ordinal!==''));
-      if(hasExplicit){
-        ordinal = tc._ordinal!==undefined&&tc._ordinal!==null&&tc._ordinal!=='' ? tc._ordinal : tc.ordinal;
-      } else {
-        const a=tc&&tc.assistant_msg_idx;
-        const name=tc&&tc.name||'tool';
-        const gk=`${a}\x1f${name}`;
-        ordinal=groupCounts.get(gk);
-        if(ordinal===undefined) ordinal=0;
-        groupCounts.set(gk, ordinal+1);
-      }
-      if(hasExplicit){
-        const a=tc&&tc.assistant_msg_idx;
-        const name=tc&&tc.name||'tool';
-        const gk=`${a}\x1f${name}`;
-        const cur=groupCounts.get(gk);
-        const needed = Number(ordinal)+1;
-        if(cur===undefined||cur<needed) groupCounts.set(gk, needed);
-      }
-      if(typeof _toolDisclosureIdentity==='function'&&_toolDisclosureIdentity(tc, ordinal)===key) return tc;
-      if((ordinal===0||ordinal==='0') && typeof _toolDisclosureIdentity==='function'&&_toolDisclosureIdentity(tc)===key) return tc;
-    }catch(_){}
-  }
-  return null;
 }
 
 function _syncToolCallGroupSummary(group){
@@ -19566,7 +19276,7 @@ function editMessage(btn) {
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
   const msgIdx = parseInt(row.dataset.msgIdx, 10);
-  const originalText = _canonicalTextForRow(row) || row.dataset.rawText || '';
+  const originalText = row.dataset.rawText || '';
   const body = row.querySelector('.msg-body');
   if(!body || row.dataset.editing) return;
   row.dataset.editing = '1';
@@ -20405,7 +20115,7 @@ function renderKatexBlocks(container,options){
 }
 
 function _thinkingMarkup(text=''){
-  const clean=_projectTranscriptTextForDisplay(_sanitizeThinkingDisplayText(text),{surface:'reasoning'});
+  const clean=_sanitizeThinkingDisplayText(text);
   const openClass=_worklogDetailsExpandedDefault()?' open':'';
   return (clean&&String(clean).trim())
     ? `<div class="thinking-card${openClass}"><div class="thinking-card-header" onclick="this.parentElement.classList.toggle('open')"><span class="thinking-card-icon">${li('lightbulb',14)}</span><span class="thinking-card-label">${t('thinking')}</span><span class="thinking-card-toggle">${li('chevron-right',12)}</span></div><div class="thinking-card-body"><pre>${esc(String(clean).trim())}</pre></div></div>`
@@ -20413,13 +20123,7 @@ function _thinkingMarkup(text=''){
 }
 function _renderThinkingInto(row,text=''){
   if(!row) return;
-  const clean=_projectTranscriptTextForDisplay(_sanitizeThinkingDisplayText(text),{surface:'reasoning'});
-  try{
-    const card=row.querySelector('.thinking-card');
-    if(card) card._canonicalReasoning=String(text||'');
-    row._canonicalReasoning=String(text||'');
-    if(typeof window!=='undefined') window._lastLiveReasoningText=String(text||'');
-  }catch(_){}
+  const clean=_sanitizeThinkingDisplayText(text);
   if(!clean){
     row.innerHTML=_thinkingMarkup(text);
     return;

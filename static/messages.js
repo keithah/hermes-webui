@@ -3989,8 +3989,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _anchorProseIncrementalNode(key, text, options){
     if(!window.smd || !key || typeof _safeSmdRenderer!=='function') return null;
     const finalize=!!(options&&options.finalize);
-    const _rawValue=String(text||'');
-    const value=typeof _projectTranscriptTextForDisplay==='function'?_projectTranscriptTextForDisplay(_rawValue,{surface:'assistant'}):(typeof window!=='undefined'&&typeof window._projectTranscriptTextForDisplay==='function'?window._projectTranscriptTextForDisplay(_rawValue,{surface:'assistant'}):_rawValue);
+    const value=String(text||'');
     const fade=typeof _shouldUseLiveProseFade==='function'&&_shouldUseLiveProseFade();
     let st;
     let _rewindPrevRendered='';
@@ -4059,8 +4058,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(finalize){
         _finalizeAnchorProseIncrementalNode(st);
       }
-      try{ st.node._canonicalRawText=_rawValue; }catch(_){}
-      try{ st.node.dataset.rawText=String(value).slice(0,60000); }catch(_){ st.node.dataset.rawText=String(value).slice(0,60000); }
+      st.node.dataset.rawText=value;
       return st.node;
     }catch(_){
       if(st){
@@ -4469,13 +4467,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _streamingKatexTimer=null;
       if(assistantBody&&typeof renderKatexBlocks==='function') renderKatexBlocks(assistantBody,{streaming:true});
     },150);
-  }
-  function _projectLiveDisplayText(raw){
-    try{
-      if(typeof _projectTranscriptTextForDisplay==='function') return _projectTranscriptTextForDisplay(raw,{surface:'assistant'});
-      if(typeof window!=='undefined' && typeof window._projectTranscriptTextForDisplay==='function') return window._projectTranscriptTextForDisplay(raw,{surface:'assistant'});
-    }catch(_){}
-    return String(raw||'');
   }
   // Helper: feed new displayText delta to the smd parser.
   // Only feeds chars beyond what has already been written (_smdWrittenLen).
@@ -5201,14 +5192,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(_streamFadeVisibleText.length>targetText.length) _streamFadeVisibleText=targetText;
     return {text:_streamFadeVisibleText,caughtUp:_streamFadeVisibleText===targetText,changed:true};
   }
-  function _renderStreamingFadeMarkdown(_rawDisplayText){
+  function _renderStreamingFadeMarkdown(displayText){
     if(!assistantBody) return true;
-    const displayText=_projectLiveDisplayText(_rawDisplayText);
-    try{
-      assistantBody._canonicalRawText=_rawDisplayText;
-      if(assistantRow) assistantRow._canonicalRawText=_rawDisplayText;
-      if(typeof window!=='undefined') window._lastLiveAssistantText=_rawDisplayText;
-    }catch(_){}
     const next=_streamFadeNextText(displayText);
     if(!next.changed) return next.caughtUp;
     assistantBody.classList.add('stream-fade-active');
@@ -5257,7 +5242,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(!assistantBody){onDone();return;}
       const target=_streamFadeCurrentDisplayText();
       const caughtUp=_renderStreamingFadeMarkdown(target);
-      const anchorProcessText=target;
+      const anchorProcessText=_streamFadeDomText||target;
       if(anchorProcessText) _upsertAnchorProcessProse(anchorProcessText);
       scrollIfPinned();
       if(caughtUp){
@@ -5292,20 +5277,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // so any future call-site cannot leak rendering into the wrong session.
     if(!_isActiveSession()) return;
     if(_renderPending) _cancelAnimationFramePendingStreamRender();
-    const _rawDisplayText=segmentStart===0
+    const displayText=segmentStart===0
       ? _parseStreamState().displayText
       : _stripXmlToolCalls(assistantText.slice(segmentStart));
-    const displayText=_projectLiveDisplayText(_rawDisplayText);
-    try{
-      if(assistantBody) assistantBody._canonicalRawText=_rawDisplayText;
-      if(assistantRow) assistantRow._canonicalRawText=_rawDisplayText;
-      if(typeof window!=='undefined') window._lastLiveAssistantText=_rawDisplayText;
-      if(assistantBody) try{ assistantBody.dataset.rawText=displayText; }catch(_){}
-      if(assistantRow) try{ assistantRow.dataset.rawText=displayText; }catch(_){}
-    }catch(_){}
     if(_smdParser){
       _smdWrite(displayText);
     } else if(window.smd){
+      // Parser was nulled out (e.g. by a prior segment end) but smd is
+      // available — recreate it on the existing element. Uses the non-fade
+      // renderer to match standard rendering, avoiding O(n²) innerHTML
+      // churn on long responses (#4704). Clear any content the renderMd()
+      // fallback already wrote first: _smdNewParser resets _smdWrittenText to
+      // '' but does NOT clear the element, so a following _smdWrite(displayText)
+      // would append the full accumulated segment ON TOP of the existing
+      // fallback render and duplicate the live text.
       assistantBody.innerHTML='';
       _smdNewParser(assistantBody, false);
       if(_smdParser) _smdWrite(displayText);
@@ -5314,9 +5299,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     } else {
       assistantBody.innerHTML=esc(displayText);
     }
-    // Keep anchor storage canonical so the settled transcript retains the full
-    // value; only the live DOM is bounded.
-    if(!skipAnchorProcessProse) _upsertAnchorProcessProse(_rawDisplayText,{sealed:force});
+    if(!skipAnchorProcessProse) _upsertAnchorProcessProse(displayText,{sealed:force});
     if(typeof _syncLiveWorklogReasonsForAnchor==='function') _syncLiveWorklogReasonsForAnchor(assistantRow, displayText);
   }
   function _resetAssistantSegment(){
@@ -5847,7 +5830,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const text=d.text||'';
       reasoningText += text;
       liveReasoningText += text;
-      try{ if(typeof window!=='undefined') window._lastLiveReasoningText=String(liveReasoningText||''); }catch(_){}
       if(d.text&&S.session&&S.session.session_id===activeSid) _completeAutomaticCompressionOnLiveProgress(activeSid);
       syncInflightAssistantMessage();
       if(text&&S.session&&S.session.session_id===activeSid&&S.activeStreamId===streamId){
