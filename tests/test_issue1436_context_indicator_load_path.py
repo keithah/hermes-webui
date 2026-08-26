@@ -119,6 +119,23 @@ class TestIssue1436BackendFallback:
             f"got {body['context_length']}"
         )
 
+    def test_metadata_load_does_not_build_regeneration_revision(self):
+        """The sidebar metadata probe must not read a full transcript."""
+        import api.routes as routes
+
+        captured = {}
+        session = self._stub_session(context_length=200_000, model="gpt-5")
+        handler = MagicMock()
+        parsed = urlparse("/api/session?session_id=test-1436&messages=0&resolve_model=0")
+
+        with patch("api.routes.get_session", return_value=session), \
+             patch("api.routes.j", side_effect=lambda _h, data, status=200: captured.update(data=data, status=status)), \
+             patch("api.session_ops.regeneration_state", side_effect=AssertionError("metadata load read transcript")):
+            routes.handle_get(handler, parsed)
+
+        assert captured["status"] == 200
+        assert "regeneration_revision" not in captured["data"]["session"]
+
     def test_resolved_model_load_refreshes_stale_persisted_context_length(self):
         """The deferred resolve_model=1 load must refresh stale context metadata.
 

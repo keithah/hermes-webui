@@ -472,6 +472,12 @@ _redact_fn_lru = functools.lru_cache(maxsize=4096)(_redact_fn_uncached)
 # thousands of small recurring strings that actually benefit, or balloon RSS.
 _REDACT_CACHE_MAX_TEXT_LEN = 16384
 
+# A migrated transcript can contain an accidental multi-megabyte tool dump.
+# Returning it verbatim makes the public-response redaction pass monopolize the
+# WebUI process for minutes. Keep the canonical on-disk session untouched, but
+# bound the display representation to two independently redacted excerpts.
+_PUBLIC_TRANSCRIPT_TEXT_LIMIT = 65536
+
 
 def _redact_fn_cached(text):
     if len(text) > _REDACT_CACHE_MAX_TEXT_LEN:
@@ -592,6 +598,12 @@ def _redact_text(text: str, *, _enabled: bool | None = None) -> str:
         _enabled = bool(load_settings().get("api_redact_enabled", True))
     if not _enabled:
         return text
+    if len(text) > _PUBLIC_TRANSCRIPT_TEXT_LIMIT:
+        excerpt = min(_PUBLIC_TRANSCRIPT_TEXT_LIMIT, len(text) // 2)
+        head = _redact_fn_cached(text[:excerpt])
+        tail = _redact_fn_cached(text[-excerpt:])
+        omitted = len(text) - (2 * excerpt)
+        return f"{head}\n\n[... {omitted:,} characters omitted from this WebUI view ...]\n\n{tail}"
     if not _might_contain_sensitive_text(text):
         return text
     return _redact_fn_cached(text)

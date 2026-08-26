@@ -2248,7 +2248,9 @@ async function loadSession(sid){
     // "messages already populated" early-return inside _ensureMessagesLoaded
     // does NOT skip the swap to the new transcript.
     try {
-      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+      // Metadata restores can retain a stale in-memory transcript. Force the
+      // authoritative tail fetch so the loading placeholder is always replaced.
+      await _ensureMessagesLoaded(sid, {force:true, loadGeneration:_loadGeneration});
     } catch (e) {
       if (!_isCurrentLoad()) {
         _rearmActiveSessionStream();
