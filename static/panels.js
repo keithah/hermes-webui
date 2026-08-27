@@ -9025,6 +9025,8 @@ function _preferencesPayloadFromUi(){
   if(apiRedactCb) payload.api_redact_enabled=apiRedactCb.checked;
   const showCliCb=$('settingsShowCliSessions');
   if(showCliCb) payload.show_cli_sessions=showCliCb.checked;
+  const showMatrixCb=$('settingsShowMatrixSessions');
+  if(showMatrixCb) payload.show_matrix_sessions=!!(showCliCb&&showCliCb.checked&&showMatrixCb.checked);
   const showClaudeCodeCb=$('settingsShowClaudeCodeSessions');
   if(showClaudeCodeCb) payload.show_claude_code_sessions=showClaudeCodeCb.checked;
   const showCronCb=$('settingsShowCronSessions');
@@ -9735,6 +9737,13 @@ async function loadSettingsPanel(){
     if(apiRedactCb){apiRedactCb.checked=settings.api_redact_enabled!==false;apiRedactCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
     const showCliCb=$('settingsShowCliSessions');
     if(showCliCb){showCliCb.checked=settings.show_cli_sessions!==false;showCliCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});}
+    const showMatrixCb=$('settingsShowMatrixSessions');
+    if(showMatrixCb){
+      showMatrixCb.checked=!!(settings.show_cli_sessions!==false && settings.show_matrix_sessions);
+      showMatrixCb.disabled=showCliCb?!showCliCb.checked:true;
+      showMatrixCb.addEventListener('change',_schedulePreferencesAutosave,{once:false});
+      if(showCliCb){showCliCb.addEventListener('change',function(){showMatrixCb.disabled=!showCliCb.checked;},{once:false});}
+    }
     const showClaudeCodeCb=$('settingsShowClaudeCodeSessions');
     if(showClaudeCodeCb){
       showClaudeCodeCb.checked=!!settings.show_claude_code_sessions;
@@ -9744,6 +9753,7 @@ async function loadSettingsPanel(){
     if(showCliCb){showCliCb.addEventListener('change',function(){
       const enabled=!!showCliCb.checked;
       if(showCronCb) showCronCb.disabled=!enabled;
+      if(showMatrixCb) showMatrixCb.disabled=!enabled;
       if(showClaudeCodeCb) showClaudeCodeCb.disabled=!enabled;
       _schedulePreferencesAutosave();
     },{once:false});}
@@ -13007,6 +13017,7 @@ async function saveSettings(andClose){
   const showCliSessions=!!($('settingsShowCliSessions')||{}).checked;
   const showClaudeCodeSessions=!!($('settingsShowClaudeCodeSessions')||{}).checked;
   const showCronSessions=!!($('settingsShowCronSessions')||{}).checked;
+  const showMatrixSessions=!!($('settingsShowMatrixSessions')||{}).checked;
   const showWebhookSessions=!!($('settingsShowWebhookSessions')||{}).checked;
   const showKanbanSessions=!!($('settingsShowKanbanSessions')||{}).checked;
   const showPreviousMessagingSessions=!!($('settingsShowPreviousMessagingSessions')||{}).checked;
@@ -13061,9 +13072,10 @@ async function saveSettings(andClose){
   body.show_cli_sessions=showCliSessions;
   // Persist the opt-out child independently; the read path applies the parent gate.
   body.show_claude_code_sessions=showClaudeCodeSessions;
-  // Cron and webhook sessions are gated on CLI sessions (server short-circuits otherwise);
+  // Cron, Matrix, and webhook sessions are gated on CLI sessions (server short-circuits otherwise);
   // mirror the autosave path so the explicit Save Settings button persists them too. (#3514)
   body.show_cron_sessions=showCliSessions&&showCronSessions;
+  body.show_matrix_sessions=showCliSessions&&showMatrixSessions;
   body.show_webhook_sessions=showCliSessions&&showWebhookSessions;
   body.show_kanban_sessions=showCliSessions&&showKanbanSessions;
   body.show_previous_messaging_sessions=showPreviousMessagingSessions;
