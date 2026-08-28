@@ -8510,34 +8510,23 @@ def _close_cached_agent_entry_at_session_boundary(session_id: str, cache_entry) 
 
 
 def _close_ephemeral_agent(agent) -> None:
-    """Release resources owned by an uncached, short-lived streaming agent.
+    """Release an uncached agent through its owner-aware lifecycle boundary.
 
     Ephemeral agents (currently used by ``/btw``) are deliberately not placed in
     ``SESSION_AGENT_CACHE``.  Unlike cached agents they therefore cannot reach
-    the LRU eviction cleanup path; leaving their memory manager and SessionDB
-    alive leaks provider writer/sync threads and SQLite descriptors per request.
+    the LRU eviction cleanup path.  ``AIAgent.close()`` owns the complete,
+    idempotent teardown: it shuts down the memory provider and closes only a
+    SessionDB handle that the agent owns.  Do not duplicate either operation
+    here, because WebUI may have supplied a borrowed/shared handle.
     """
     if agent is None:
         return
-    try:
-        shutdown_memory_provider = getattr(agent, "shutdown_memory_provider", None)
-        if callable(shutdown_memory_provider):
-            messages = vars(agent).get("_session_messages", [])
-            shutdown_memory_provider(messages)
-    except Exception:
-        logger.debug("Failed to shut down ephemeral agent memory provider", exc_info=True)
     try:
         close_agent = getattr(agent, "close", None)
         if callable(close_agent):
             close_agent()
     except Exception:
         logger.debug("Failed to close ephemeral agent", exc_info=True)
-    try:
-        session_db = getattr(agent, "_session_db", None)
-        if session_db is not None:
-            session_db.close()
-    except Exception:
-        logger.debug("Failed to close ephemeral agent session DB", exc_info=True)
 
 
 def _refresh_cached_agent_runtime(agent, agent_kwargs: dict) -> bool:
@@ -12825,7 +12814,11 @@ def _run_agent_streaming(
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
         _clear_thread_env()  # TD1: always clear thread-local context
+        # Remove the registry reference before potentially blocking teardown so
+        # concurrent cancellation/inspection cannot retrieve a closed agent.
         if ephemeral and agent is not None:
+            with STREAMS_LOCK:
+                AGENT_INSTANCES.pop(stream_id, None)
             _close_ephemeral_agent(agent)
         if _streaming_cron_profile_home_token is not None:
             _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)
@@ -12851,7 +12844,6 @@ def _run_agent_streaming(
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)
-            AGENT_INSTANCES.pop(stream_id, None)  # Clean up agent instance reference
             STREAM_PARTIAL_TEXT.pop(stream_id, None)  # Clean up partial text buffer (#893)
             STREAM_REASONING_TEXT.pop(stream_id, None)  # Clean up reasoning trace (#1361 §A)
             STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)  # Clean up tool calls (#1361 §B)
