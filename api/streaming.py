@@ -8509,6 +8509,37 @@ def _close_cached_agent_entry_at_session_boundary(session_id: str, cache_entry) 
     return _close_evicted_agent_at_session_boundary(session_id, agent)
 
 
+def _close_ephemeral_agent(agent) -> None:
+    """Release resources owned by an uncached, short-lived streaming agent.
+
+    Ephemeral agents (currently used by ``/btw``) are deliberately not placed in
+    ``SESSION_AGENT_CACHE``.  Unlike cached agents they therefore cannot reach
+    the LRU eviction cleanup path; leaving their memory manager and SessionDB
+    alive leaks provider writer/sync threads and SQLite descriptors per request.
+    """
+    if agent is None:
+        return
+    try:
+        shutdown_memory_provider = getattr(agent, "shutdown_memory_provider", None)
+        if callable(shutdown_memory_provider):
+            messages = vars(agent).get("_session_messages", [])
+            shutdown_memory_provider(messages)
+    except Exception:
+        logger.debug("Failed to shut down ephemeral agent memory provider", exc_info=True)
+    try:
+        close_agent = getattr(agent, "close", None)
+        if callable(close_agent):
+            close_agent()
+    except Exception:
+        logger.debug("Failed to close ephemeral agent", exc_info=True)
+    try:
+        session_db = getattr(agent, "_session_db", None)
+        if session_db is not None:
+            session_db.close()
+    except Exception:
+        logger.debug("Failed to close ephemeral agent session DB", exc_info=True)
+
+
 def _refresh_cached_agent_runtime(agent, agent_kwargs: dict) -> bool:
     """Refresh volatile runtime credentials on a reused cached AIAgent.
 
@@ -12794,6 +12825,8 @@ def _run_agent_streaming(
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
         _clear_thread_env()  # TD1: always clear thread-local context
+        if ephemeral and agent is not None:
+            _close_ephemeral_agent(agent)
         if _streaming_cron_profile_home_token is not None:
             _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)
         if _restore_streaming_skill_home_modules and _streaming_skill_home_snapshot is not None:
