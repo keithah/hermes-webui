@@ -177,7 +177,16 @@ def _parse_config(home: Path) -> dict[str, Any]:
 
 
 def _hindsight_config() -> dict[str, Any]:
-    """Resolve and validate the active profile's non-secret Hindsight config."""
+    """Resolve and validate the active profile's non-secret Hindsight config.
+
+    Resolves provider/memory_enabled/api_key (all local, no network) FIRST,
+    and only calls _validate_api_url/_validate_bank_id — which resolve DNS
+    via socket.getaddrinfo — when the profile is actually plausibly enabled.
+    Every GET /api/memory load calls this (see api/routes.py) even for
+    profiles that never configure Hindsight; unconditionally resolving DNS
+    here blocked the whole (otherwise-local) Memory panel on an unrelated
+    optional service, including on offline installs.
+    """
     home = _active_home()
     data = _parse_config(home)
     # A truncated/corrupted config.json must fail closed, not silently fall
@@ -188,16 +197,6 @@ def _hindsight_config() -> dict[str, Any]:
     if config_unreadable:
         data = {}
     env = _load_env_file(home / ".env")
-    api_url = _validate_api_url(data.get("api_url") or data.get("apiUrl") or env.get("HINDSIGHT_API_URL") or DEFAULT_API)
-
-    bank_value = data.get("bank_id") or data.get("bankId") or data.get("bank")
-    if isinstance(bank_value, dict):
-        bank_value = bank_value.get("bankId")
-    if not bank_value:
-        banks = data.get("banks")
-        if isinstance(banks, dict) and isinstance(banks.get("hermes"), dict):
-            bank_value = banks["hermes"].get("bankId")
-    bank_id = _validate_bank_id(bank_value or env.get("HINDSIGHT_BANK_ID") or DEFAULT_BANK)
     api_key = _profile_secret("HINDSIGHT_API_KEY", home)
 
     provider = ""
@@ -221,6 +220,28 @@ def _hindsight_config() -> dict[str, Any]:
     except Exception as exc:
         logger.debug("Hindsight provider config lookup failed: %s", type(exc).__name__)
 
+    would_be_enabled = (not config_unreadable) and provider == "hindsight" and memory_enabled and bool(api_key)
+
+    raw_api_url = data.get("api_url") or data.get("apiUrl") or env.get("HINDSIGHT_API_URL") or DEFAULT_API
+    bank_value = data.get("bank_id") or data.get("bankId") or data.get("bank")
+    if isinstance(bank_value, dict):
+        bank_value = bank_value.get("bankId")
+    if not bank_value:
+        banks = data.get("banks")
+        if isinstance(banks, dict) and isinstance(banks.get("hermes"), dict):
+            bank_value = banks["hermes"].get("bankId")
+    raw_bank_id = bank_value or env.get("HINDSIGHT_BANK_ID") or DEFAULT_BANK
+
+    if would_be_enabled:
+        api_url = _validate_api_url(raw_api_url)
+        bank_id = _validate_bank_id(raw_bank_id)
+    else:
+        # Not enabled regardless of what the upstream host validates to —
+        # skip DNS/private-address resolution and any bank-id shape check;
+        # these values are display-only in this state (the disabled hint UI).
+        api_url = str(raw_api_url or DEFAULT_API).strip().rstrip("/")
+        bank_id = str(raw_bank_id or DEFAULT_BANK).strip()
+
     return {
         "api_url": api_url,
         "bank_id": bank_id,
@@ -231,7 +252,7 @@ def _hindsight_config() -> dict[str, Any]:
         "recall_budget": data.get("recall_budget", "mid"),
         "provider": provider,
         "memory_enabled": memory_enabled,
-        "enabled": (not config_unreadable) and provider == "hindsight" and memory_enabled and bool(api_key),
+        "enabled": would_be_enabled,
     }
 
 
