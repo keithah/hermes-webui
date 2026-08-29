@@ -368,3 +368,76 @@ def test_returned_enumeration_is_isolated_from_mutation(monkeypatch):
     hit[0]["nested"]["k"].append(100)
     hit_again = config._list_available_providers_cached("default")
     assert hit_again == [{"id": "openai", "authenticated": True, "nested": {"k": [1, 2]}}]
+
+
+def test_invalidate_provider_models_cache_drops_provider_enum_cache(monkeypatch):
+    """invalidate_provider_models_cache() (the POST /api/models/refresh path
+    hit right after a provider is authenticated) must clear the provider-enum
+    cache and bump the generation exactly like invalidate_models_cache() does
+    — otherwise a just-authenticated provider stays missing from the picker
+    for up to the 120s TTL, and a detached rebuild in flight when the auth
+    happened can't detect the invalidation and publishes a stale catalog."""
+    import api.config as config
+
+    def enumerate_providers():
+        return [{"id": "openai", "authenticated": True}]
+
+    _install_fake_models(monkeypatch, enumerate_providers)
+    _clear_cache(config)
+
+    assert config._list_available_providers_cached("default") == [
+        {"id": "openai", "authenticated": True}
+    ]
+    generation_before = config._available_models_cache_generation
+
+    config.invalidate_provider_models_cache("anthropic")
+
+    assert config._available_models_cache_generation > generation_before
+    with config._PROVIDER_ENUM_CACHE_LOCK:
+        assert "default" not in config._PROVIDER_ENUM_CACHE
+    assert not config._cache_build_in_progress
+
+
+def test_follower_fails_open_after_deadline_instead_of_waiting_forever(monkeypatch):
+    """A follower must not loop on a hung owner's 30s wait forever: past its
+    overall deadline it fails open with the last known (even if stale)
+    enumeration rather than blocking indefinitely."""
+    import api.config as config
+
+    hang = threading.Event()
+
+    def enumerate_providers():
+        # Owner never returns — simulates a probe that hangs completely.
+        hang.wait(timeout=10)
+        return [{"id": "should-not-be-seen", "authenticated": True}]
+
+    _install_fake_models(monkeypatch, enumerate_providers)
+    _clear_cache(config)
+    # Prime a stale-but-present entry so the fallback has something to return.
+    with config._PROVIDER_ENUM_CACHE_LOCK:
+        config._PROVIDER_ENUM_CACHE["default"] = (
+            time.monotonic() - config._PROVIDER_ENUM_CACHE_TTL_SECONDS - 1,
+            [{"id": "stale-openai", "authenticated": True}],
+        )
+    monkeypatch.setattr(config, "_PROVIDER_ENUM_CACHE_FOLLOWER_DEADLINE_SECONDS", 0.2)
+
+    owner_started = threading.Event()
+
+    def _own_the_refresh():
+        owner_started.set()
+        config._list_available_providers_cached("default")
+
+    owner_thread = threading.Thread(target=_own_the_refresh, daemon=True)
+    owner_thread.start()
+    assert owner_started.wait(timeout=5)
+    time.sleep(0.05)  # let the owner install itself as inflight before we follow
+
+    started = time.monotonic()
+    result = config._list_available_providers_cached("default")
+    elapsed = time.monotonic() - started
+
+    assert result == [{"id": "stale-openai", "authenticated": True}]
+    assert elapsed < 5.0, "follower waited far past its configured deadline"
+
+    hang.set()
+    owner_thread.join(timeout=5)
