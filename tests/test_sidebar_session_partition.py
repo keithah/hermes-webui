@@ -51,7 +51,7 @@ def test_partition_helper_applies_message_source_project_and_archive_gates():
     assert "activeSourceFilters.some(source=>source!=='webui')" in block
     assert "const selectedOrigins=new Set(activeSourceFilters);" in block
     assert "selectedOrigins.has(effectiveOrigin(s))" in block
-    assert "parent&&_isChildSession(s)?_sessionOrigin(parent):_sessionOrigin(s)" in block
+    assert "visited" in block and "_isChildSession" in block and "effectiveOrigin" in block
     assert "if(!_showArchived&&s.archived) continue;" in block
     assert "if(s.archived){" in block
     assert "const serverArchivedCount=(selectedOrigins.has('webui')?_archivedWebuiCount:0)" in block

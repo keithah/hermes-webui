@@ -66,18 +66,28 @@ from api.shares import create_or_refresh_share, load_share, revoke_share
 logger = logging.getLogger(__name__)
 
 
+_SIDEBAR_SOURCES_MAX_VALUES = 8
+
 def _normalize_sidebar_sources(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...] | None:
     if not values:
         return None
+    # Treat blank strings as not specified (e.g. ?sidebar_source=).
+    filtered = [str(v or "").strip() for v in values if str(v or "").strip() != ""]
+    if not filtered:
+        return None
+    if len(filtered) > _SIDEBAR_SOURCES_MAX_VALUES:
+        raise ValueError("Too many sidebar_source values")
     normalized: list[str] = []
     seen: set[str] = set()
-    for value in values:
-        source = str(value or "").strip().lower()
+    for value in filtered:
+        source = str(value).strip().lower()
         if len(source) > 48 or not re.fullmatch(r"[a-z0-9_]+", source):
             raise ValueError("Invalid sidebar_source")
         if source not in seen:
             seen.add(source)
             normalized.append(source)
+    if len(normalized) > _SIDEBAR_SOURCES_MAX_VALUES:
+        raise ValueError("Too many sidebar_source values")
     return tuple(normalized)
 
 
@@ -2566,12 +2576,56 @@ def _build_session_list_cache_payload(
         if s.get("archived") and _is_cli_session_for_settings(s)
     )
     archived_count = archived_webui_count + archived_cli_count
+    full_scoped_all_sources = archived_scoped if include_archived else visible_scoped
+    # ── Effective origin: walk parent chain (bounded, cycle-safe) ──────
+    # Build profile-scoped map before filtering so children can resolve to
+    # external parents even when the parent row is archived/hidden.
+    _effective_session_by_id: dict[str, dict] = {}
+    for _s in scoped:  # scoped is profile-scoped merged before messaging dedupe
+        _sid = str(_s.get("session_id") or "").strip()
+        if _sid:
+            _effective_session_by_id[_sid] = _s
+    for _s in full_scoped_all_sources:
+        _sid = str(_s.get("session_id") or "").strip()
+        if _sid and _sid not in _effective_session_by_id:
+            _effective_session_by_id[_sid] = _s
+    # Also include archived rows in map so grandchild can reach grandparent.
+    for _s in archived_scoped:
+        _sid = str(_s.get("session_id") or "").strip()
+        if _sid and _sid not in _effective_session_by_id:
+            _effective_session_by_id[_sid] = _s
+
+    def _effective_sidebar_origin(session: dict) -> str:
+        if not isinstance(session, dict):
+            return "other"
+        visited: set[str] = set()
+        cur: dict | None = session
+        for _ in range(16):
+            if not isinstance(cur, dict):
+                break
+            origin = _sidebar_session_origin(cur)
+            # A non-webui origin is definitive; subagent/all-webui continues.
+            # _sidebar_session_origin never returns "subagent", so sentinel is webui.
+            if origin != "webui":
+                return origin
+            # origin is webui — if markers were all subagent, try parent.
+            pid = str(cur.get("parent_session_id") or "").strip()
+            if not pid or pid in visited:
+                break
+            visited.add(pid)
+            parent = _effective_session_by_id.get(pid)
+            if parent is None:
+                # Parent not in visible scoped set — try state.db lookup
+                # for profile-scoped inheritance (bounded, best-effort).
+                break
+            cur = parent
+        return _sidebar_session_origin(session)
+
     def _filter_sidebar_source(rows: list[dict]) -> list[dict]:
         if selected_sidebar_source_set:
-            return [s for s in rows if _sidebar_session_origin(s) in selected_sidebar_source_set]
+            return [s for s in rows if _effective_sidebar_origin(s) in selected_sidebar_source_set]
         return list(rows)
 
-    full_scoped_all_sources = archived_scoped if include_archived else visible_scoped
     webui_session_count = sum(
         1 for s in full_scoped_all_sources
         if not _is_cli_session_for_settings(s)
@@ -2583,12 +2637,11 @@ def _build_session_list_cache_payload(
     session_origin_counts: dict[str, int] = defaultdict(int)
     session_origin_labels: dict[str, str] = {}
     for session in full_scoped_all_sources:
-        origin = _sidebar_session_origin(session)
+        origin = _effective_sidebar_origin(session)
         session_origin_counts[origin] += 1
         session_origin_labels.setdefault(origin, _sidebar_session_origin_label(origin))
-    for origin, count in _sidebar_state_origin_counts().items():
-        session_origin_counts[origin] = max(session_origin_counts[origin], count)
-        session_origin_labels.setdefault(origin, _sidebar_session_origin_label(origin))
+    # Intentionally do NOT merge _sidebar_state_origin_counts() via max():
+    # that helper is unscoped and would advertise origins with zero filtered rows.
     visible_scoped_filtered = _filter_sidebar_source(visible_scoped)
     archived_scoped_filtered = _filter_sidebar_source(archived_scoped)
     scoped = _filter_sidebar_source(full_scoped_all_sources)

@@ -2643,12 +2643,14 @@ function _sessionSourceFilterModel(renderedWebuiSessionCount, renderedCliSession
 }
 
 function _renderSessionSourceMenuItem(item,onToggle){
-  const row=document.createElement('label');
+  const row=document.createElement('div');
   row.className='session-source-menu-item'+(item.selected?' active':'');
-  row.setAttribute('role','menuitemcheckbox');row.setAttribute('aria-checked',item.selected?'true':'false');
+  row.setAttribute('role','presentation');
   const checkbox=document.createElement('input');
   checkbox.type='checkbox';checkbox.className='session-source-menu-checkbox';checkbox.checked=item.selected;
   checkbox.dataset.origin=item.origin;
+  checkbox.setAttribute('role','menuitemcheckbox');
+  checkbox.setAttribute('aria-checked',item.selected?'true':'false');
   checkbox.setAttribute('aria-label',item.label);
   checkbox.onchange=(event)=>{event.stopPropagation();onToggle(item.origin,checkbox.checked);};
   const label=document.createElement('span');label.className='session-source-menu-label';label.textContent=item.label;
@@ -2667,10 +2669,13 @@ function _renderSessionSourceFilterControl(renderedWebuiSessionCount, renderedCl
   const trigger=document.createElement('button');
   trigger.type='button';trigger.className='session-source-menu-trigger';
   trigger.setAttribute('aria-haspopup','menu');trigger.setAttribute('aria-expanded','false');
-  trigger.textContent=`Sources ${model.originCount}`;
+  trigger.textContent=t('session_source_trigger', {count: model.originCount});
   control.appendChild(trigger);
   const menu=document.createElement('div');
   menu.className='session-source-menu';menu.setAttribute('role','menu');menu.hidden=true;
+  const menuId='session-source-menu-'+String(Date.now())+'-'+String(Math.random()).slice(2,6);
+  menu.id=menuId;
+  trigger.setAttribute('aria-controls', menuId);
   let outsideHandler=null;
   let outsideTimer=0;
   const releaseOutsideHandler=()=>{
@@ -2693,31 +2698,33 @@ function _renderSessionSourceFilterControl(renderedWebuiSessionCount, renderedCl
       outsideHandler=(outsideEvent)=>{if(!control.contains(outsideEvent.target))close(false);};
       outsideTimer=setTimeout(()=>{outsideTimer=0;if(!menu.hidden)document.addEventListener('pointerdown',outsideHandler);},0);
       const selected=menu.querySelector('.session-source-menu-checkbox:checked');
-      if(selected)selected.focus();
+      const first=menu.querySelector('.session-source-menu-checkbox');
+      (selected||first)?.focus();
     }else close(false);
   };
   const refreshSelectedState=()=>{
     const nextModel=_sessionSourceFilterModel(renderedWebuiSessionCount,renderedCliSessionCount);
     selectedBar.innerHTML='';
+    trigger.textContent=t('session_source_trigger', {count: nextModel.originCount});
     for(const chip of nextModel.visibleChips){
       const node=document.createElement('div');node.className='session-source-filter-chip';node.title=chip.label;
       const text=document.createElement('span');text.textContent=chip.label;node.appendChild(text);
       const remove=document.createElement('button');remove.type='button';remove.className='session-source-chip-remove';
-      remove.textContent='\u00d7';remove.setAttribute('aria-label',`Remove ${chip.label}`);
+      remove.textContent='\u00d7';remove.setAttribute('aria-label',t('session_source_remove', {label: chip.label}));
       remove.onclick=(event)=>{event.stopPropagation();_toggleSessionSourceFilter(chip.origin,false,{renderCache:false});refreshSelectedState();};
       node.appendChild(remove);selectedBar.appendChild(node);
     }
     if(nextModel.overflowCount){
       const overflow=document.createElement('button');overflow.type='button';overflow.className='session-source-overflow';
-      overflow.textContent=`+${nextModel.overflowCount}`;overflow.setAttribute('aria-label',`${nextModel.overflowCount} more selected sources`);
+      overflow.textContent=`+${nextModel.overflowCount}`;overflow.setAttribute('aria-label',t('session_source_overflow', {count: nextModel.overflowCount}));
       overflow.onclick=openMenu;selectedBar.appendChild(overflow);
     }
     const selectedSet=new Set(nextModel.selectedOrigins);
     menu.querySelectorAll('.session-source-menu-item').forEach(row=>{
       const checkbox=row.querySelector('.session-source-menu-checkbox');
       const selected=checkbox&&selectedSet.has(checkbox.dataset.origin);
-      if(checkbox)checkbox.checked=selected;
-      row.classList.toggle('active',selected);row.setAttribute('aria-checked',selected?'true':'false');
+      if(checkbox){checkbox.checked=selected;checkbox.setAttribute('aria-checked',selected?'true':'false');}
+      row.classList.toggle('active',selected);
     });
   };
   for(const item of model.items){
@@ -2730,7 +2737,22 @@ function _renderSessionSourceFilterControl(renderedWebuiSessionCount, renderedCl
     menu.appendChild(row);
   }
   trigger.onclick=openMenu;
-  control.onkeydown=(event)=>{if(event.key==='Escape'&&!menu.hidden){event.preventDefault();event.stopPropagation();close(true);}};
+  const _focusMenuItem = (delta) => {
+    const items=[...menu.querySelectorAll('.session-source-menu-checkbox')];
+    if(!items.length) return;
+    const idx=items.indexOf(document.activeElement);
+    let next=0;
+    if(idx>=0) next=(idx+delta+items.length)%items.length;
+    else next=delta>0?0:items.length-1;
+    items[next].focus();
+  };
+  control.onkeydown=(event)=>{
+    if(event.key==='Escape'&&!menu.hidden){event.preventDefault();event.stopPropagation();close(true);}
+    else if(!menu.hidden && event.key==='ArrowDown'){event.preventDefault();_focusMenuItem(1);}
+    else if(!menu.hidden && event.key==='ArrowUp'){event.preventDefault();_focusMenuItem(-1);}
+    else if(!menu.hidden && event.key==='Home'){event.preventDefault();const f=menu.querySelector('.session-source-menu-checkbox');f&&f.focus();}
+    else if(!menu.hidden && event.key==='End'){event.preventDefault();const all=[...menu.querySelectorAll('.session-source-menu-checkbox')];all[all.length-1]?.focus();}
+  };
   control.appendChild(menu);
   refreshSelectedState();
   return control;
@@ -7915,8 +7937,21 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   const selectedOrigins=new Set(activeSourceFilters);
   const sourceRowsById=new Map(allMatched.filter(Boolean).map(s=>[s.session_id,s]));
   const effectiveOrigin=s=>{
-    const parent=s&&s.parent_session_id?sourceRowsById.get(s.parent_session_id):null;
-    return parent&&_isChildSession(s)?_sessionOrigin(parent):_sessionOrigin(s);
+    if(!s) return _sessionOrigin(s);
+    let cur=s;
+    const visited=new Set();
+    for(let i=0;i<16;i++){
+      const origin=_sessionOrigin(cur);
+      if(origin!=='webui') return origin;
+      const pid=cur&&cur.parent_session_id?String(cur.parent_session_id):'';
+      if(!pid||visited.has(pid)) break;
+      visited.add(pid);
+      const parent=sourceRowsById.get(pid);
+      if(!parent) break;
+      if(!_isChildSession(cur)) break;
+      cur=parent;
+    }
+    return _sessionOrigin(s);
   };
   const selectedProfileFiltered=webuiProfileFiltered.concat(cliProfileFiltered).filter(s=>selectedOrigins.has(effectiveOrigin(s)));
   const selectedSessionsRaw=webuiSessionsRaw.concat(cliSessionsRaw).filter(s=>selectedOrigins.has(effectiveOrigin(s)));

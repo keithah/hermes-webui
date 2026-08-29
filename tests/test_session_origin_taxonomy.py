@@ -105,17 +105,21 @@ console.log(JSON.stringify({{
   checkboxTag: checkbox.tagName,
   checkboxType: checkbox.type,
   origin: checkbox.dataset.origin,
-  initialSelected: row.attrs['aria-checked'],
+  initialSelected: checkbox.attrs['aria-checked'],
+  rowRole: row.attrs['role'],
+  checkboxRole: checkbox.attrs['role'],
   changes,
 }}));
 """
     result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
     assert json.loads(result.stdout) == {
-        "rowTag": "LABEL",
+        "rowTag": "DIV",
         "checkboxTag": "INPUT",
         "checkboxType": "checkbox",
         "origin": "slack",
         "initialSelected": "false",
+        "rowRole": "presentation",
+        "checkboxRole": "menuitemcheckbox",
         "changes": [["slack", True]],
     }
 
@@ -246,10 +250,9 @@ def test_webui_filtered_payload_counts_available_state_db_origins(monkeypatch, t
     )
 
     assert [row["session_id"] for row in payload["sessions"]] == ["webui-1"]
+    # session_origin_counts now only from filtered scoped rows, not max-merged state.db aggregate
     assert payload["session_origin_counts"] == {
         "webui": 1,
-        "matrix": 1,
-        "telegram": 1,
     }
 
 
@@ -258,7 +261,7 @@ def test_sidebar_payload_exposes_origin_metadata_fields():
     source = routes.read_text(encoding="utf-8")
     assert '"session_origin_counts"' in source
     assert '"session_origin_labels"' in source
-    assert "_sidebar_session_origin(s) in selected_sidebar_source_set" in source
+    assert "_effective_sidebar_origin(s) in selected_sidebar_source_set" in source
     assert '"session_origin",' in source
 
 
