@@ -2669,7 +2669,7 @@ function _renderSessionSourceFilterControl(renderedWebuiSessionCount, renderedCl
   const trigger=document.createElement('button');
   trigger.type='button';trigger.className='session-source-menu-trigger';
   trigger.setAttribute('aria-haspopup','menu');trigger.setAttribute('aria-expanded','false');
-  trigger.textContent=t('session_source_trigger', {count: model.originCount});
+  trigger.textContent=t('session_source_trigger', model.originCount);
   control.appendChild(trigger);
   const menu=document.createElement('div');
   menu.className='session-source-menu';menu.setAttribute('role','menu');menu.hidden=true;
@@ -2705,18 +2705,18 @@ function _renderSessionSourceFilterControl(renderedWebuiSessionCount, renderedCl
   const refreshSelectedState=()=>{
     const nextModel=_sessionSourceFilterModel(renderedWebuiSessionCount,renderedCliSessionCount);
     selectedBar.innerHTML='';
-    trigger.textContent=t('session_source_trigger', {count: nextModel.originCount});
+    trigger.textContent=t('session_source_trigger', nextModel.originCount);
     for(const chip of nextModel.visibleChips){
       const node=document.createElement('div');node.className='session-source-filter-chip';node.title=chip.label;
       const text=document.createElement('span');text.textContent=chip.label;node.appendChild(text);
       const remove=document.createElement('button');remove.type='button';remove.className='session-source-chip-remove';
-      remove.textContent='\u00d7';remove.setAttribute('aria-label',t('session_source_remove', {label: chip.label}));
+      remove.textContent='\u00d7';remove.setAttribute('aria-label',t('session_source_remove', chip.label));
       remove.onclick=(event)=>{event.stopPropagation();_toggleSessionSourceFilter(chip.origin,false,{renderCache:false});refreshSelectedState();};
       node.appendChild(remove);selectedBar.appendChild(node);
     }
     if(nextModel.overflowCount){
       const overflow=document.createElement('button');overflow.type='button';overflow.className='session-source-overflow';
-      overflow.textContent=`+${nextModel.overflowCount}`;overflow.setAttribute('aria-label',t('session_source_overflow', {count: nextModel.overflowCount}));
+      overflow.textContent=`+${nextModel.overflowCount}`;overflow.setAttribute('aria-label',t('session_source_overflow', nextModel.overflowCount));
       overflow.onclick=openMenu;selectedBar.appendChild(overflow);
     }
     const selectedSet=new Set(nextModel.selectedOrigins);
@@ -7942,7 +7942,11 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
     const visited=new Set();
     for(let i=0;i<16;i++){
       const origin=_sessionOrigin(cur);
-      if(origin!=='webui') return origin;
+      // 'subagent' is a compatibility sentinel for an unclassified child row
+      // (mirrors the server's inheritable child marker), not a definitive
+      // origin like 'matrix'/'cli' — keep walking to the parent instead of
+      // stopping here, same as the 'webui' default.
+      if(origin!=='webui'&&origin!=='subagent') return origin;
       const pid=cur&&cur.parent_session_id?String(cur.parent_session_id):'';
       if(!pid||visited.has(pid)) break;
       visited.add(pid);
@@ -8284,8 +8288,8 @@ function renderSessionListFromCache(){
     empty.className='session-empty-note';
     const selectedLabels=_sessionSourceFilters.map(source=>_sessionOriginLabel(source));
     empty.textContent=window._showCliSessions||!_sessionSourceFilters.includes('cli')
-      ? `No sessions found for ${selectedLabels.join(', ')}.`
-      : 'Enable Show agent sessions in Settings to list CLI sessions here.';
+      ? t('session_empty_no_sessions', selectedLabels.join(', '))
+      : t('session_empty_enable_cli');
     list.appendChild(empty);
   } else if(_activeProject&&sessions.length===0){
     const empty=document.createElement('div');

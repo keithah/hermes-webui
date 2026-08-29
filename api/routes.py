@@ -2595,6 +2595,23 @@ def _build_session_list_cache_payload(
         if _sid and _sid not in _effective_session_by_id:
             _effective_session_by_id[_sid] = _s
 
+    def _effective_origin_fallback_lookup(pid: str):
+        """One bounded, profile-scoped metadata-only read for a lineage
+        ancestor the request's own visible/archived scope didn't include.
+
+        Session.load_metadata_only() reads only the compact metadata prefix
+        of that one sidecar file (no messages, no full session load) and is
+        already scoped to the active profile's SESSION_DIR — the same
+        primitive used for single-session lookups elsewhere in this module.
+        Any failure (missing file, unreadable sidecar) fails closed to None
+        so the caller falls back to the child's own origin, unchanged from
+        before this fallback existed.
+        """
+        try:
+            return Session.load_metadata_only(pid)
+        except Exception:
+            return None
+
     def _effective_sidebar_origin(session: dict) -> str:
         if not isinstance(session, dict):
             return "other"
@@ -2615,9 +2632,28 @@ def _build_session_list_cache_payload(
             visited.add(pid)
             parent = _effective_session_by_id.get(pid)
             if parent is None:
-                # Parent not in visible scoped set — try state.db lookup
-                # for profile-scoped inheritance (bounded, best-effort).
-                break
+                # Parent not in the visible/archived scoped set (e.g. paged
+                # out, or excluded from this request's window) — one bounded
+                # metadata-only sidecar read for just this id, same as the
+                # single-session lookups elsewhere in this module. Cache the
+                # result so a sidebar with many orphaned-from-scope children
+                # doesn't re-read the same ancestor's sidecar file on every
+                # row's walk.
+                parent_obj = _effective_origin_fallback_lookup(pid)
+                if parent_obj is None:
+                    break
+                parent = {
+                    "session_origin": getattr(parent_obj, "session_origin", None),
+                    "source_tag": getattr(parent_obj, "source_tag", None),
+                    "raw_source": getattr(parent_obj, "raw_source", None),
+                    "source": getattr(parent_obj, "source", None),
+                    "platform": getattr(parent_obj, "platform", None),
+                    "source_label": getattr(parent_obj, "source_label", None),
+                    "session_source": getattr(parent_obj, "session_source", None),
+                    "is_cli_session": getattr(parent_obj, "is_cli_session", None),
+                    "parent_session_id": getattr(parent_obj, "parent_session_id", None),
+                }
+                _effective_session_by_id[pid] = parent
             cur = parent
         return _sidebar_session_origin(session)
 
