@@ -361,3 +361,10 @@ def test_returned_enumeration_is_isolated_from_mutation(monkeypatch):
 
     again = config._list_available_providers_cached("default")
     assert again == [{"id": "openai", "authenticated": True, "nested": {"k": [1, 2]}}]
+
+    # Also verify the warm-hit path deepcopies (mutate hit copy, not just cold miss)
+    hit = config._list_available_providers_cached("default")
+    hit.append({"id": "hit-injected", "authenticated": True})
+    hit[0]["nested"]["k"].append(100)
+    hit_again = config._list_available_providers_cached("default")
+    assert hit_again == [{"id": "openai", "authenticated": True, "nested": {"k": [1, 2]}}]
