@@ -14,6 +14,17 @@ NODE = shutil.which("node")
 
 def _extract_function(source_text, function_name):
     marker = f"function {function_name}("
+    return _extract_from_marker(source_text, marker)
+
+
+def _extract_from_marker(source_text, marker):
+    """Brace-match a code block starting at the first `{` after `marker`.
+
+    Unlike `_extract_function`, `marker` need not be a `function name(...)`
+    declaration — this also pulls out `const x=(...)=>{...}` closures like
+    `effectiveOrigin`, so the test exercises the actual literal source instead
+    of a hand-copied reimplementation that can silently drift from it.
+    """
     start = source_text.index(marker)
     brace_start = source_text.index("{", start)
     depth = 0
@@ -25,7 +36,7 @@ def _extract_function(source_text, function_name):
             depth -= 1
             if depth == 0:
                 return source_text[start : index + 1]
-    raise AssertionError(f"Could not extract {function_name}")
+    raise AssertionError(f"Could not extract block at marker: {marker!r}")
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -272,3 +283,91 @@ def test_sidebar_frontend_renders_origin_tabs_and_accepts_non_cli_origins():
     assert "_sessionOriginKeys" in source
     assert "selectedOrigins.has(_sessionOrigin(s))" in source
     assert "session_origin" in source
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_effective_origin_inherits_plain_webui_grandparent_through_subagent_child():
+    """A legacy subagent-marked child with no explicit session_origin must
+    resolve to its grandparent's real origin, not stay stuck on the
+    'subagent' compatibility sentinel — the exact case CHANGES_REQUESTED
+    review round 2 on #6985 flagged: the walk previously fell back to
+    `_sessionOrigin(s)` (the *original* argument) instead of `_sessionOrigin(cur)`
+    (the resolved ancestor), silently discarding the walk whenever every
+    hop in the chain was itself a placeholder ('webui' or 'subagent')."""
+    source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    order_line = next(line for line in source.splitlines() if line.startswith("const _SESSION_ORIGIN_ORDER="))
+    origin_fn = _extract_function(source, "_sessionOrigin")
+    is_child_fn = _extract_function(source, "_isChildSession")
+    is_cli_fn = _extract_function(source, "_isCliSession")
+    is_messaging_fn = _extract_function(source, "_isMessagingSession")
+    # Pull the REAL sourceRowsById + effectiveOrigin closure straight out of
+    # sessions.js (not a hand-copied reimplementation) so this test tracks the
+    # actual shipped fix instead of silently drifting from it.
+    source_rows_line = next(
+        line for line in source.splitlines()
+        if line.strip().startswith("const sourceRowsById=")
+    )
+    effective_origin_block = _extract_from_marker(source, "const effectiveOrigin=s=>{")
+    script = f"""
+{order_line}
+const _MESSAGING_RAW_SOURCES = new Set();
+{is_messaging_fn}
+{is_cli_fn}
+{origin_fn}
+{is_child_fn}
+const allMatched = [
+  {{session_id:'grandparent', title:'root'}},
+  {{session_id:'child', parent_session_id:'grandparent', relationship_type:'child_session', session_origin:'subagent'}},
+  {{session_id:'grandchild', parent_session_id:'child', relationship_type:'child_session', session_origin:'subagent'}},
+];
+{source_rows_line}
+const effectiveOrigin={effective_origin_block.split("=", 1)[1]}
+console.log(JSON.stringify({{
+  child: effectiveOrigin(sourceRowsById.get('child')),
+  grandchild: effectiveOrigin(sourceRowsById.get('grandchild')),
+}}));
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == {"child": "webui", "grandchild": "webui"}
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_source_chip_labels_pass_scalar_args_not_objects():
+    """#6985 review round 2: the localized source-chip controls called
+    `t(key, {{count: n}})` / `t(key, {{label: x}})`, but `t()` forwards its
+    arguments positionally to the locale function, which expects a bare
+    scalar. The object form rendered literal '[object Object]' text and
+    made `Number({{count:1}})` (NaN) so the singular branch could never
+    fire. Assert both the count-1 (singular) and count-many (plural) shapes
+    render real text, not '[object Object]' or 'NaN'."""
+    source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    trigger_line = next(
+        line for line in source.splitlines()
+        if "t('session_source_trigger'" in line and "textContent" in line
+    )
+    remove_line = next(
+        line for line in source.splitlines()
+        if "t('session_source_remove'" in line
+    )
+    assert "{count:" not in trigger_line and "{ count:" not in trigger_line
+    assert "{label:" not in remove_line and "{ label:" not in remove_line
+    script = """
+global.t = (key, arg) => {
+  if (key === 'session_source_trigger') {
+    const n = Number(arg);
+    return n === 1 ? 'Source' : `Sources (${n})`;
+  }
+  if (key === 'session_source_remove') return `Remove ${arg}`;
+  return key;
+};
+console.log(JSON.stringify({
+  singular: global.t('session_source_trigger', 1),
+  plural: global.t('session_source_trigger', 5),
+  remove: global.t('session_source_remove', 'Slack'),
+}));
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    rendered = json.loads(result.stdout)
+    assert rendered == {"singular": "Source", "plural": "Sources (5)", "remove": "Remove Slack"}
+    assert "[object Object]" not in json.dumps(rendered)
+    assert "NaN" not in json.dumps(rendered)

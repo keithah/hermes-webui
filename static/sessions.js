@@ -7955,7 +7955,14 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
       if(!_isChildSession(cur)) break;
       cur=parent;
     }
-    return _sessionOrigin(s);
+    // Fall back to the last resolved position, not the original argument:
+    // once the walk has moved past a subagent/webui hop, the original `s`
+    // no longer reflects the ancestor chain's own placeholder classification
+    // (e.g. s='subagent' but cur ended up 'webui' after walking to a plain
+    // parent) — returning _sessionOrigin(s) here would silently discard the
+    // walk and reintroduce the exact misclassification this function exists
+    // to resolve.
+    return _sessionOrigin(cur);
   };
   const selectedProfileFiltered=webuiProfileFiltered.concat(cliProfileFiltered).filter(s=>selectedOrigins.has(effectiveOrigin(s)));
   const selectedSessionsRaw=webuiSessionsRaw.concat(cliSessionsRaw).filter(s=>selectedOrigins.has(effectiveOrigin(s)));
