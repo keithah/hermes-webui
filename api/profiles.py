@@ -1793,7 +1793,22 @@ def _skills_stats_lock_for(profile_dir: Path) -> threading.Lock:
 
 
 def _skill_tree_max_mtime_ns(skills_dir: Path, config_path: Path) -> int:
-    """Return the max st_mtime_ns across config.yaml, skill dirs, and SKILL.md files."""
+    """Return a cheap max st_mtime_ns signature for the skill tree.
+
+    perf(session-load-latency): this probe runs on EVERY /api/profiles call,
+    cache hit or not (see ``_get_profile_skills_stats``), so it must stay
+    O(#categories), not O(#skill files). It previously did a full
+    ``os.walk`` over every skill directory (SKILL.md + references/scripts/
+    assets subtrees) on each call — cheap on a quiet disk, but on a loaded
+    system (e.g. another process saturating I/O) that walk could stall for
+    tens of seconds and block this request thread, since nothing bounded it.
+    Mirrors ``hermes_cli.profiles._skills_dir_signature``: stat skills_dir
+    and its immediate children (category dirs) only — one ``scandir``, no
+    recursion. A skill add/remove bumps its category dir's mtime, an edit
+    deep inside a skill (SKILL.md content change with no dir mtime bump) is
+    caught by ``_SKILLS_STATS_CACHE``'s TTL safety net instead, same as the
+    CLI's cache already relies on.
+    """
     max_ns = 0
     try:
         if config_path.exists():
@@ -1803,42 +1818,15 @@ def _skill_tree_max_mtime_ns(skills_dir: Path, config_path: Path) -> int:
     if not skills_dir.is_dir():
         return max_ns
     try:
-        from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
-    except Exception:
-        EXCLUDED_SKILL_DIRS = frozenset()
-        SKILL_SUPPORT_DIRS = frozenset()
-    try:
-        # Directory mtimes catch nested out-of-band deletes that leave file mtimes unchanged.
-        # followlinks=True mirrors agent.skill_utils.iter_skill_index_files (the compute
-        # path), so a symlinked skill directory is descended into and edits to its target
-        # SKILL.md change the probe value — otherwise such edits would stay stale up to the TTL.
-        for root, dirnames, filenames in os.walk(skills_dir, followlinks=True):
-            root_path = Path(root)
-            # Prune the SAME trees iter_skill_index_files prunes (.git/.venv/
-            # node_modules/site-packages + skill support dirs), so a skill that
-            # vendors a dependency tree doesn't make this every-call probe walk
-            # thousands of irrelevant files and defeat the cache's perf goal.
-            has_skill_md = "SKILL.md" in filenames
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in EXCLUDED_SKILL_DIRS
-                and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
-            ]
-            try:
-                max_ns = max(max_ns, root_path.stat().st_mtime_ns)
-            except OSError:
-                pass
-            for dirname in dirnames:
+        max_ns = max(max_ns, skills_dir.stat().st_mtime_ns)
+        with os.scandir(skills_dir) as it:
+            for entry in it:
                 try:
-                    max_ns = max(max_ns, (root_path / dirname).stat().st_mtime_ns)
+                    if entry.is_dir(follow_symlinks=False):
+                        max_ns = max(max_ns, entry.stat(follow_symlinks=False).st_mtime_ns)
                 except OSError:
-                    pass
-            if "SKILL.md" in filenames:
-                try:
-                    max_ns = max(max_ns, (root_path / "SKILL.md").stat().st_mtime_ns)
-                except OSError:
-                    pass
-    except Exception:
+                    continue
+    except OSError:
         pass
     return max_ns
 

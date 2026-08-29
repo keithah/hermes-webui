@@ -14258,7 +14258,7 @@ def handle_get(handler, parsed) -> bool:
                 and (not raw.get("is_cli_session") or imported_turn_marker)
             ):
                 from api.session_ops import regeneration_authority, regeneration_state
-                canonical_state = regeneration_state(s)
+                canonical_state = regeneration_state(s, use_sidecar=True)
                 revision = regeneration_authority(
                     s,
                     rows=canonical_state[0],
