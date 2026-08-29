@@ -89,7 +89,7 @@ def test_invalidation_during_disk_write_deletes_stale_resurrected_file(tmp_path,
 
     real_save = cfg._save_models_cache_to_disk
 
-    def _invalidate_then_save(cache):
+    def _invalidate_then_save(cache, **kwargs):
         # Simulate the actual race: an invalidation's own disk delete lands
         # FIRST (e.g. a credential edit fired while this write was still in
         # flight), and only THEN does this stale build's rename land on top
@@ -97,7 +97,7 @@ def test_invalidation_during_disk_write_deletes_stale_resurrected_file(tmp_path,
         # own side effects — if this write's rename completes afterward
         # with no further fencing, the stale data resurrects right back.
         cfg.invalidate_models_cache()
-        real_save(cache)
+        real_save(cache, **kwargs)
 
     monkeypatch.setattr(cfg, "_save_models_cache_to_disk", _invalidate_then_save)
 
@@ -239,3 +239,56 @@ def test_timed_out_follower_does_not_start_second_build_and_fails_open(tmp_path,
     )
 
     g0_hang.set()
+
+
+def test_disk_read_before_lock_cannot_resurrect_a_generation_the_writer_lost(tmp_path, monkeypatch):
+    """#7007 round 6: finding 1's write-then-delete-if-invalidated pair
+    narrows the resurrection window but does not close it —
+    `_load_models_cache_from_disk()` is deliberately called BEFORE
+    acquiring `_available_models_cache_lock` (see its docstring: "lets
+    concurrent requests skip entirely"), so a reader can land in the exact
+    gap between a stale build's write completing and its own
+    delete-on-invalidation cleanup running, and would read the resurrected
+    file before the delete ever happens — the delete only prevents FUTURE
+    reads, it can't retroactively un-read one that already happened.
+
+    This exercises the real (unmocked) `_load_models_cache_from_disk` /
+    `_is_loadable_disk_cache` path directly: a file is written stamped with
+    an OLD generation (simulating the stale build's write landing, however
+    briefly, before its cleanup deletes it), and the live generation has
+    since moved on (simulating the invalidation that retired that build).
+    The read must reject it regardless of whether the delete has run yet.
+    """
+    import json as _json
+    import api.config as cfg
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("{}", encoding="utf-8")
+    cache_path = tmp_path / "models_cache.json"
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
+    monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-test")
+
+    stale_generation = cfg._available_models_cache_generation
+    cfg._save_models_cache_to_disk(_catalog("stale-build"), generation=stale_generation)
+    assert cache_path.exists()
+
+    # Simulate the invalidation that retired the build which just wrote
+    # this file — its own delete-on-mismatch cleanup has NOT run yet (that's
+    # exactly the gap this test targets), so the stale file is still sitting
+    # on disk when this read happens.
+    monkeypatch.setattr(
+        cfg, "_available_models_cache_generation", stale_generation + 1, raising=False
+    )
+
+    assert cache_path.exists(), "the file must still be present for this to test the real race"
+    loaded = cfg._load_models_cache_from_disk()
+    assert loaded is None, (
+        "a disk file stamped with an older generation than the current live "
+        "one must be rejected on read, independent of whether the writer's "
+        "own delete-if-invalidated cleanup has landed yet"
+    )
+
+    # Sanity: the same file, re-stamped with the CURRENT generation, loads fine.
+    cfg._save_models_cache_to_disk(_catalog("fresh-build"), generation=stale_generation + 1)
+    assert cfg._load_models_cache_from_disk() is not None

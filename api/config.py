@@ -6478,6 +6478,28 @@ def _is_loadable_disk_cache(cache: object) -> bool:
             runtime_sources,
         )
         return False
+    # #7007 round 5/6: _load_models_cache_from_disk() is deliberately called
+    # BEFORE acquiring _available_models_cache_lock (perf — lets concurrent
+    # requests skip entirely), so it can race a stale build's disk write/
+    # delete-if-invalidated finalizer: the delete only stops FUTURE reads,
+    # it cannot retroactively un-read a file a concurrent reader already
+    # loaded in the gap between the write completing and the delete landing.
+    # Stamping every write with the generation live at BUILD START and
+    # rejecting a mismatch here closes that gap without needing a lock
+    # around the disk read: a file written by a build whose generation has
+    # since been bumped (invalidated) can never pass this check, regardless
+    # of exactly when the concurrent reader's file open landed relative to
+    # the writer's own delete. Missing field (pre-fix cache, or the rare
+    # early-init save before this stamp could be resolved) is treated as a
+    # mismatch, same convention as the `_webui_version` stamp above — worst
+    # case one extra rebuild, never a resurrected stale catalog.
+    if cache.get("_generation") != _available_models_cache_generation:
+        logger.debug(
+            "models cache rejected: generation=%r vs runtime=%r",
+            cache.get("_generation"),
+            _available_models_cache_generation,
+        )
+        return False
     return True
 
 
@@ -6585,7 +6607,7 @@ def _load_stale_models_cache_from_disk() -> dict | None:
         return None
 
 
-def _save_models_cache_to_disk(cache: dict) -> None:
+def _save_models_cache_to_disk(cache: dict, *, generation: int | None = None) -> None:
     """Save cache to disk so it survives server restarts.
 
     Stamps the payload with `_webui_version` and `_schema_version` (#1633) so
@@ -6608,6 +6630,21 @@ def _save_models_cache_to_disk(cache: dict) -> None:
     `_delete_models_cache_on_disk()` if ownership was lost during the write
     (#7007 round 5 finding 1: an invalidation landing mid-write must not let
     a stale rename's result survive on disk).
+
+    `generation` (#7007 round 6): stamps the payload with the generation
+    that was live when the CALLER'S BUILD STARTED (its captured
+    `_build_owner[0]`, not whatever `_available_models_cache_generation` is
+    right now) — the whole point is to record what generation this data is
+    actually FROM, so `_is_loadable_disk_cache` can reject it later if an
+    invalidation has bumped the live generation since, independent of
+    whether this write's own delete-on-mismatch cleanup ran in time (see
+    that function's docstring for why the write/delete pair alone can't
+    close the race by itself). Defaults to the live generation at save time
+    when omitted, so every existing direct call site (there are many, in
+    tests exercising the disk-cache save/load round trip with no build-
+    ownership context at all) keeps behaving exactly as before — passing
+    the true build-start value is what production's two owner-gated
+    finalizers do, and is what actually matters for the fix.
     """
     try:
         if not _is_valid_models_cache(cache):
@@ -6615,6 +6652,10 @@ def _save_models_cache_to_disk(cache: dict) -> None:
         payload = {
             "_schema_version": _MODELS_CACHE_SCHEMA_VERSION,
             "_source_fingerprint": _models_cache_source_fingerprint(),
+            "_generation": (
+                generation if generation is not None
+                else _available_models_cache_generation
+            ),
             "active_provider": cache["active_provider"],
             "default_model": cache["default_model"],
             "configured_model_badges": cache["configured_model_badges"],
@@ -8748,7 +8789,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 # itself was already retired by whatever invalidated/took
                 # over — this stale build owns nothing to release.
                 return copy.deepcopy(result)
-            _save_models_cache_to_disk(result)
+            _save_models_cache_to_disk(result, generation=_build_owner[0])
             with _cache_build_cv:
                 if _is_current_build_owner(_build_owner):
                     _cache_build_in_progress = False
@@ -8827,7 +8868,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             # deleted the file it was replacing. If ownership was lost
             # while the write was in flight, delete what we just wrote
             # instead of letting it resurrect stale data.
-            _save_models_cache_to_disk(result)
+            _save_models_cache_to_disk(result, generation=_build_owner[0])
             with _cache_build_cv:
                 if not _is_current_build_owner(_build_owner):
                     _delete_models_cache_on_disk()
