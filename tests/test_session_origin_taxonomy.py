@@ -912,3 +912,36 @@ def test_effective_sidebar_origin_classifies_definitive_ancestor_reached_exactly
     assert _run_payload_all_profiles(
         routes, [leaf_row_2], active_profile="default2", sidebar_source="webui"
     ) == ["beyond_1"]
+
+
+def test_sidebar_response_item_normalizes_renamed_root_profile_alias(monkeypatch):
+    """The client's profile-scoped lineage map (static/sessions.js's
+    `_rowProfileKey`) only trims/defaults a row's raw `.profile` field — it
+    has no way to replicate the server's `_is_root_profile()` alias-folding
+    rule itself. If a renamed-root profile's raw alias string reached the
+    wire unnormalized, two rows the server treats as the same profile (one
+    tagged with the literal alias, one tagged 'default') would get different
+    client-side lineage-map keys, silently breaking cross-row ancestor
+    resolution for that profile on the client even though the server-side
+    walk resolves them identically. `_sidebar_session_response_item` must
+    normalize `profile` before it's ever serialized, so the client's naive
+    read is always already-canonical."""
+    import api.routes as routes
+
+    monkeypatch.setattr(routes, "_is_root_profile", lambda name: name == "my-renamed-root")
+
+    aliased = routes._sidebar_session_response_item(
+        {"session_id": "s1", "profile": "my-renamed-root"}
+    )
+    literal_default = routes._sidebar_session_response_item(
+        {"session_id": "s2", "profile": "default"}
+    )
+    blank = routes._sidebar_session_response_item({"session_id": "s3", "profile": ""})
+    other = routes._sidebar_session_response_item(
+        {"session_id": "s4", "profile": "genuinely-other-profile"}
+    )
+
+    assert aliased["profile"] == "default"
+    assert literal_default["profile"] == "default"
+    assert blank["profile"] == "default"
+    assert other["profile"] == "genuinely-other-profile"

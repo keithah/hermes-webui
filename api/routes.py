@@ -2578,21 +2578,6 @@ def _build_session_list_cache_payload(
     archived_count = archived_webui_count + archived_cli_count
     full_scoped_all_sources = archived_scoped if include_archived else visible_scoped
 
-    def _canonical_row_profile(raw) -> str:
-        """Normalize a row's ``profile`` field to a stable map/cache key.
-
-        Mirrors ``_profiles_match``'s equivalence rules (missing/blank ->
-        'default', any renamed-root alias -> 'default') so two rows that
-        ``_profiles_match`` would treat as the same profile always share one
-        lineage-map/cache key, while two rows from genuinely different
-        profiles never collide on a bare session id (#6985 round 4: an
-        ``all_profiles=True`` payload mixes rows from every profile, and a
-        session id existing in more than one profile's state.db must not let
-        one profile's origin leak into another's child).
-        """
-        name = str(raw or "").strip() or "default"
-        return "default" if _is_root_profile(name) else name
-
     # ── Effective origin: walk parent chain (bounded, cycle-safe) ──────
     # Build profile-scoped map before filtering so children can resolve to
     # external parents even when the parent row is archived/hidden. Keyed by
@@ -11150,6 +11135,31 @@ def _session_attention_summary(session_id: str) -> dict | None:
     return None
 
 
+def _canonical_row_profile(raw) -> str:
+    """Normalize a row's ``profile`` field to a stable map/cache/wire key.
+
+    Mirrors ``_profiles_match``'s equivalence rules (missing/blank ->
+    'default', any renamed-root alias -> 'default') so two rows that
+    ``_profiles_match`` would treat as the same profile always share one
+    lineage-map/cache key, while two rows from genuinely different profiles
+    never collide on a bare session id (#6985 round 4: an
+    ``all_profiles=True`` payload mixes rows from every profile, and a
+    session id existing in more than one profile's state.db must not let one
+    profile's origin leak into another's child).
+
+    Module-level (not a closure inside ``_build_session_list_cache_payload``)
+    so ``_sidebar_session_response_item`` can apply the SAME normalization to
+    the ``profile`` field before it's serialized to the client — the client's
+    `_rowProfileKey()` (static/sessions.js) only trims/defaults and has no way
+    to replicate this server-side alias-folding rule itself, so without this
+    a renamed-root profile's raw alias string reaching the wire unnormalized
+    could make the client's own profile-scoped lineage map fail to match rows
+    the server would correctly treat as the same profile.
+    """
+    name = str(raw or "").strip() or "default"
+    return "default" if _is_root_profile(name) else name
+
+
 _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "session_id",
     "title",
@@ -11232,6 +11242,10 @@ def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None
         for key, value in dict(session).items()
         if key in _SIDEBAR_SESSION_RESPONSE_FIELDS
     }
+    if "profile" in item:
+        # Normalize before the wire, not just for the server's own lineage
+        # map — see _canonical_row_profile's docstring (#6985 round 4).
+        item["profile"] = _canonical_row_profile(item.get("profile"))
     if isinstance(item.get("title"), str):
         item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
     _redact_sidebar_title_fields(item, redact_enabled)
