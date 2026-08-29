@@ -401,13 +401,24 @@ def test_invalidate_provider_models_cache_drops_provider_enum_cache(monkeypatch)
 def test_follower_fails_open_after_deadline_instead_of_waiting_forever(monkeypatch):
     """A follower must not loop on a hung owner's 30s wait forever: past its
     overall deadline it fails open with the last known (even if stale)
-    enumeration rather than blocking indefinitely."""
+    enumeration rather than blocking indefinitely.
+
+    Round 5: the owner installs itself into `_PROVIDER_ENUM_CACHE_INFLIGHT`
+    (while holding `_PROVIDER_ENUM_CACHE_LOCK`) BEFORE calling the probe —
+    so entry into the fake probe below is itself proof the owner is already
+    installed. Signal that from inside the probe instead of a bare
+    `sleep(0.05)` guess at scheduler timing.
+    """
     import api.config as config
 
     hang = threading.Event()
+    owner_probing = threading.Event()
 
     def enumerate_providers():
         # Owner never returns — simulates a probe that hangs completely.
+        # Reaching this line proves the owner already installed itself as
+        # inflight (that happens before the probe is ever called).
+        owner_probing.set()
         hang.wait(timeout=10)
         return [{"id": "should-not-be-seen", "authenticated": True}]
 
@@ -421,16 +432,12 @@ def test_follower_fails_open_after_deadline_instead_of_waiting_forever(monkeypat
         )
     monkeypatch.setattr(config, "_PROVIDER_ENUM_CACHE_FOLLOWER_DEADLINE_SECONDS", 0.2)
 
-    owner_started = threading.Event()
-
-    def _own_the_refresh():
-        owner_started.set()
-        config._list_available_providers_cached("default")
-
-    owner_thread = threading.Thread(target=_own_the_refresh, daemon=True)
+    owner_thread = threading.Thread(
+        target=lambda: config._list_available_providers_cached("default"),
+        daemon=True,
+    )
     owner_thread.start()
-    assert owner_started.wait(timeout=5)
-    time.sleep(0.05)  # let the owner install itself as inflight before we follow
+    assert owner_probing.wait(timeout=5), "owner never reached the probe — not installed as inflight"
 
     started = time.monotonic()
     result = config._list_available_providers_cached("default")
