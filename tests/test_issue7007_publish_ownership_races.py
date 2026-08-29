@@ -1,0 +1,241 @@
+"""Regression coverage for #7007 round-5 publish/ownership races.
+
+The reviewer's round-5 re-gate (exact head 2f1c3d9e) found three concrete
+races in the outer catalog build's publish/ownership lifecycle, on top of
+the already-fixed bounded-follower-wait and generation-bump issues:
+
+1. A stale detached build's disk write could complete its rename AFTER an
+   invalidation deleted the file it was replacing, resurrecting stale data.
+2. A late-failing worker could clear a NEWER owner's in-progress flag just
+   because it happened to finish after an invalidation retired it and a new
+   caller took over.
+3. A timed-out non-force follower could start a SECOND competing rebuild
+   under the same generation, since nothing checked `_cache_build_in_progress`
+   before barging in and setting it True again.
+
+Fixed via an immutable `(generation, owner_token)` identity
+(`_try_claim_build_owner` / `_is_current_build_owner` /
+`_release_build_owner_if_current`) that every finalizer must own before it
+may mutate shared state. These tests reproduce each race deterministically
+(explicit events/monkeypatched primitives, not sleeps) and were verified to
+fail against the pre-fix code.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from pathlib import Path
+
+
+def _catalog(label: str) -> dict:
+    return {
+        "active_provider": "openai",
+        "default_model": label,
+        "configured_model_badges": {},
+        "groups": [
+            {
+                "provider": "OpenAI",
+                "provider_id": "openai",
+                "models": [{"id": label, "label": label, "supports_fast_tier": False}],
+            }
+        ],
+        "aliases": {},
+    }
+
+
+def _reset_models_memory_cache(monkeypatch):
+    import api.config as cfg
+
+    monkeypatch.setattr(cfg, "_available_models_cache", None, raising=False)
+    monkeypatch.setattr(cfg, "_available_models_cache_ts", 0.0, raising=False)
+    monkeypatch.setattr(cfg, "_available_models_live_rebuild_ts", 0.0, raising=False)
+    monkeypatch.setattr(cfg, "_available_models_cache_source_fingerprint", None, raising=False)
+    monkeypatch.setattr(cfg, "_cache_build_in_progress", False, raising=False)
+    monkeypatch.setattr(cfg, "_active_build_owner", None, raising=False)
+
+
+def _isolate_disk_and_config(monkeypatch, tmp_path):
+    import api.config as cfg
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("{}", encoding="utf-8")
+    cache_path = tmp_path / "models_cache.json"
+
+    monkeypatch.setattr(cfg, "_get_config_path", lambda: config_path)
+    monkeypatch.setattr(cfg, "_cfg_path", config_path, raising=False)
+    monkeypatch.setattr(cfg, "_cfg_mtime", config_path.stat().st_mtime, raising=False)
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: None)
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: None)
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
+    return cache_path
+
+
+def test_invalidation_during_disk_write_deletes_stale_resurrected_file(tmp_path, monkeypatch):
+    """Finding 1: an invalidation landing WHILE the winning build's disk
+    write is in flight must not let that write's rename survive — otherwise
+    a stale detached build resurrects data the invalidation meant to
+    discard. The old code only re-checked the generation before starting
+    the write, never after it actually landed on disk."""
+    import api.config as cfg
+
+    _reset_models_memory_cache(monkeypatch)
+    cache_path = _isolate_disk_and_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 5.0, raising=False)
+
+    rebuilt = _catalog("rebuilt-model")
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", lambda _builder: rebuilt)
+
+    real_save = cfg._save_models_cache_to_disk
+
+    def _invalidate_then_save(cache):
+        # Simulate the actual race: an invalidation's own disk delete lands
+        # FIRST (e.g. a credential edit fired while this write was still in
+        # flight), and only THEN does this stale build's rename land on top
+        # of it. `invalidate_models_cache()` deletes the file as one of its
+        # own side effects — if this write's rename completes afterward
+        # with no further fencing, the stale data resurrects right back.
+        cfg.invalidate_models_cache()
+        real_save(cache)
+
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", _invalidate_then_save)
+
+    result = cfg.get_available_models(force_refresh=True)
+
+    assert result == rebuilt
+    assert not cache_path.exists(), (
+        "a build whose disk write raced an invalidation must not leave the "
+        "stale file behind — it should be deleted, not resurrected"
+    )
+    # The invalidation's own generation bump must be the one callers see —
+    # confirms this isn't accidentally passing via a totally separate path.
+    assert cfg._cache_build_in_progress is False
+
+
+def test_late_failed_worker_does_not_clear_newer_owners_flag(tmp_path, monkeypatch):
+    """Finding 2: G0's worker remains live (blocked), an invalidation
+    retires G0 and a fresh G1 build claims ownership, and only THEN does
+    G0's stale worker finally raise. G0's failure cleanup must be a no-op —
+    it must NOT clear G1's in-progress flag out from under it."""
+    import api.config as cfg
+
+    _reset_models_memory_cache(monkeypatch)
+    _isolate_disk_and_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.1, raising=False)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda *_a, **_k: None)
+
+    g0_release = threading.Event()
+    g1_release = threading.Event()
+    g1_probing = threading.Event()
+    call_count = [0]
+
+    def _invoke(_builder):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            assert g0_release.wait(timeout=5), "test setup failed to release G0"
+            raise RuntimeError("G0 probe failed (arrives late, after G1 started)")
+        # G1 must still be "in progress" when we check below, not finished
+        # and already published — block it on its own release too.
+        g1_probing.set()
+        assert g1_release.wait(timeout=5), "test setup failed to release G1"
+        return _catalog("g1-result")
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _invoke)
+
+    cleanup_attempted = threading.Event()
+    real_release = cfg._release_build_owner_if_current
+
+    def _tracking_release(owner):
+        real_release(owner)
+        cleanup_attempted.set()
+
+    monkeypatch.setattr(cfg, "_release_build_owner_if_current", _tracking_release)
+
+    # G0: budget is tiny (0.1s) so the foreground gives up immediately and
+    # returns a fallback while G0's worker keeps running in the background,
+    # blocked on g0_release.
+    cfg.get_available_models(force_refresh=True)
+    assert cfg._cache_build_in_progress is True, "G0's worker should still own the build"
+
+    # An invalidation retires G0 (e.g. a credential edit landed).
+    cfg.invalidate_models_cache()
+    assert cfg._cache_build_in_progress is False
+
+    # G1 starts a fresh build and claims ownership. Same tiny budget, so
+    # this also returns immediately via the budget-exceeded fallback while
+    # G1's own worker (call #2, blocked on g1_release) keeps running.
+    cfg.get_available_models(force_refresh=True)
+    assert g1_probing.wait(timeout=5), "G1 never reached its probe"
+    assert cfg._cache_build_in_progress is True, "G1 should now own the build"
+
+    # NOW let G0's stale worker finally fail.
+    g0_release.set()
+    assert cleanup_attempted.wait(timeout=5), "G0's late failure cleanup never ran"
+
+    # G1's flag must have survived G0's late (now-stale) failure untouched.
+    assert cfg._cache_build_in_progress is True, (
+        "a late-failing stale owner (G0) must not be able to clear a "
+        "newer owner's (G1) in-progress flag"
+    )
+
+    g1_release.set()
+
+
+def test_timed_out_follower_does_not_start_second_build_and_fails_open(tmp_path, monkeypatch):
+    """Finding 3 + the no-stale-snapshot follower fallback: a non-force
+    caller whose bounded wait times out because the owner is STILL
+    genuinely building (no invalidation happened) must not barge in and
+    start a second competing rebuild under the same generation — and, with
+    no stale disk snapshot available either, it must still return a sane
+    fallback rather than hang or start that redundant build."""
+    import api.config as cfg
+
+    _reset_models_memory_cache(monkeypatch)
+    _isolate_disk_and_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 5.0, raising=False)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda *_a, **_k: None)
+
+    g0_hang = threading.Event()
+    g0_probing = threading.Event()
+    build_calls = []
+
+    def _invoke(_builder):
+        build_calls.append(1)
+        g0_probing.set()
+        g0_hang.wait(timeout=10)
+        return _catalog("g0-result")
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _invoke)
+
+    # Kick off G0 (force_refresh, tiny-relative-to-real-60s budget so the
+    # foreground gives up fast while the worker keeps running, blocked).
+    t0 = threading.Thread(
+        target=lambda: cfg.get_available_models(force_refresh=True),
+        daemon=True,
+    )
+    t0.start()
+    assert g0_probing.wait(timeout=5), "G0 never reached its probe"
+    t0.join(timeout=5)
+    assert cfg._cache_build_in_progress is True, "G0 should still be building"
+
+    # A non-force follower's wait_for(timeout=60) would time out here
+    # because G0 is genuinely still live — fake that outcome instead of
+    # actually waiting 60 real seconds.
+    def _fake_wait_for(_predicate, timeout=None):
+        return False  # "timed out, predicate still false" — owner still live
+
+    monkeypatch.setattr(cfg._cache_build_cv, "wait_for", _fake_wait_for)
+
+    result = cfg.get_available_models()  # plain non-force caller
+
+    assert build_calls == [1], (
+        "a timed-out follower must not start a second competing rebuild "
+        "while the first owner is still live"
+    )
+    assert result == cfg._static_models_catalog_without_live_probes(), (
+        "with no stale disk snapshot available either, the follower must "
+        "fail open with the network-free static fallback, not hang or error"
+    )
+
+    g0_hang.set()
