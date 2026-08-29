@@ -5293,12 +5293,16 @@ let _hindsightReflectLoading = false;
 let _hindsightMemoriesLoading = false;
 let _hindsightError = '';
 let _hindsightReflectError = '';
+let _hindsightListError = '';
 let _hindsightLastQuery = '';
 let _hindsightLastElapsed = 0;
 let _hindsightStatusProfile = '';
 let _hindsightMemoriesProfile = '';
 let _hindsightRecallSeq = 0;
 let _hindsightReflectSeq = 0;
+let _hindsightMemoriesSeq = 0;
+let _hindsightRetainSeq = 0;
+let _hindsightRetainLoading = false;
 let _currentMemorySection = null; // 'memory' | 'user' | 'soul' | 'project_context' | 'external_notes' | 'hindsight'
 let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
 
@@ -5306,6 +5310,8 @@ function _hindsightProfileName() { return (S && S.activeProfile) || 'default'; }
 function _resetHindsightState() {
   ++_hindsightRecallSeq;
   ++_hindsightReflectSeq;
+  ++_hindsightMemoriesSeq;
+  ++_hindsightRetainSeq;
   _hindsightStatus = null;
   _hindsightResults = [];
   _hindsightReflectText = '';
@@ -5315,8 +5321,10 @@ function _resetHindsightState() {
   _hindsightLoading = false;
   _hindsightReflectLoading = false;
   _hindsightMemoriesLoading = false;
+  _hindsightRetainLoading = false;
   _hindsightError = '';
   _hindsightReflectError = '';
+  _hindsightListError = '';
   _hindsightLastQuery = '';
   _hindsightLastElapsed = 0;
   _hindsightStatusProfile = '';
@@ -5412,20 +5420,24 @@ async function loadHindsightMemories(force) {
   if (_hindsightMemories.length && !force && _hindsightMemoriesProfile === profile) return;
   const enabled = _memoryData && _memoryData.hindsight_enabled;
   if (!enabled) return;
+  // Sequence-guard like recall/reflect: two overlapping loads (e.g. a manual
+  // refresh racing the auto-refresh retain triggers) must not let the older
+  // response overwrite the newer one.
+  const seq = ++_hindsightMemoriesSeq;
   _hindsightMemoriesLoading = true;
   _hindsightMemoriesProfile = profile;
   _renderHindsight();
   try {
     const data = await api('/api/hindsight/memories?limit=20');
-    if (profile !== _hindsightProfileName()) return;
+    if (seq !== _hindsightMemoriesSeq || profile !== _hindsightProfileName()) return;
     _hindsightMemories = Array.isArray(data.memories) ? data.memories : [];
     _hindsightMemoriesTotal = data.total || _hindsightMemories.length;
-    _hindsightError = '';
+    _hindsightListError = '';
   } catch (e) {
-    if (profile !== _hindsightProfileName()) return;
-    _hindsightError = e && e.message ? e.message : String(e);
+    if (seq !== _hindsightMemoriesSeq || profile !== _hindsightProfileName()) return;
+    _hindsightListError = e && e.message ? e.message : String(e);
   } finally {
-    if (profile !== _hindsightProfileName()) return;
+    if (seq !== _hindsightMemoriesSeq || profile !== _hindsightProfileName()) return;
     _hindsightMemoriesLoading = false;
     _renderHindsight();
   }
@@ -5484,26 +5496,39 @@ async function reflectHindsight() {
   }
 }
 async function retainHindsight() {
+  if (_hindsightRetainLoading) return;
+  const seq = ++_hindsightRetainSeq;
+  const profile = _hindsightProfileName();
   const contentEl = $('hindsightRetainContent');
   const ctxEl = $('hindsightRetainContext');
   const errEl = $('hindsightRetainError');
   const content = contentEl ? contentEl.value.trim() : '';
   if (!content) { if (errEl) { errEl.textContent = t('hindsight_content_required'); errEl.style.display=''; } return; }
   const context = ctxEl ? ctxEl.value.trim() : '';
-  const btn = $('hindsightRetainBtn');
-  if (btn) btn.disabled = true;
   if (errEl) errEl.style.display='none';
+  // Drive the button's disabled/loading state from _renderHindsight() instead
+  // of a direct DOM reference: any other in-flight Hindsight call (recall,
+  // reflect, status, recent-memories) re-renders this section and replaces
+  // the button node, which would silently re-enable a stale `btn` reference
+  // and let a second click submit the same memory twice.
+  _hindsightRetainLoading = true;
+  _renderHindsight();
   try {
     await api('/api/hindsight/retain', { method: 'POST', body: JSON.stringify({ content, context }) });
-    if (contentEl) contentEl.value = '';
-    if (ctxEl) ctxEl.value = '';
+    if (seq !== _hindsightRetainSeq || profile !== _hindsightProfileName()) return;
+    const c = $('hindsightRetainContent'); if (c) c.value = '';
+    const cx = $('hindsightRetainContext'); if (cx) cx.value = '';
     showToast(t('hindsight_saved'));
     _hindsightMemories = [];
     loadHindsightMemories(true);
   } catch (e) {
-    if (errEl) { errEl.textContent = e && e.message ? e.message : String(e); errEl.style.display=''; }
+    if (seq !== _hindsightRetainSeq || profile !== _hindsightProfileName()) return;
+    const err = $('hindsightRetainError');
+    if (err) { err.textContent = e && e.message ? e.message : String(e); err.style.display=''; }
   } finally {
-    if (btn) btn.disabled = false;
+    if (seq !== _hindsightRetainSeq || profile !== _hindsightProfileName()) return;
+    _hindsightRetainLoading = false;
+    _renderHindsight();
   }
 }
 function _renderHindsight() {
@@ -5559,6 +5584,7 @@ function _renderHindsight() {
   const reflectHtml = _hindsightReflectText
     ? `<div class="memory-content preview-md" style="margin-top:8px">${renderMd(_hindsightReflectText)}</div>`
     : (_hindsightReflectQuery && !_hindsightReflectLoading ? `<div class="memory-empty">No answer yet</div>` : '');
+  const listError = _hindsightListError ? `<div class="detail-form-error">${esc(_hindsightListError)}</div>` : '';
   const memLoading = _hindsightMemoriesLoading ? `<div class="memory-detail-mtime">${li('loader',12)} loading…</div>` : '';
   const memList = _hindsightMemories.length
     ? `<div style="margin-top:8px">${_hindsightMemories.map(m=>{ const d=m.created_at?new Date(m.created_at).toLocaleDateString():''; return `<div class="notes-result-card" style="cursor:default;text-align:left"><strong>${esc((m.text||'').slice(0,220))}${(m.text||'').length>220?'…':''}</strong><span>${esc(m.type||'')}${m.type&&d?' · ':''}${esc(d)}${m.tags&&m.tags.length?` · ${esc(m.tags.slice(0,3).join(', '))}`:''}</span></div>`; }).join('')}</div><div class="memory-detail-mtime">${_hindsightMemoriesTotal || _hindsightMemories.length} total · <button class="btn-secondary" style="padding:2px 8px;font-size:11px" onclick="loadHindsightMemories(true)">${li('refresh-cw',10)} ${esc(t('hindsight_refresh'))}</button></div>`
@@ -5592,7 +5618,7 @@ function _renderHindsight() {
     </section>
     <section class="notes-source-card">
       <div class="notes-source-card-head"><strong>${li('clock',14)} ${esc(t('hindsight_recent'))}</strong><button class="btn-secondary" style="padding:2px 8px;font-size:11px" onclick="loadHindsightMemories(true)">${li('refresh-cw',10)} ${esc(t('hindsight_refresh'))}</button></div>
-      ${memList}
+      ${listError}${memList}
     </section>
     <section class="notes-source-card">
       <div class="notes-source-card-head"><strong>${li('save',14)} ${esc(t('hindsight_retain'))}</strong><span class="detail-badge">${esc(t('hindsight_store'))}</span></div>
@@ -5603,7 +5629,7 @@ function _renderHindsight() {
         <input id="hindsightRetainContext" aria-label="${esc(t('hindsight_context_aria'))}" type="text" maxlength="4000" placeholder="Context (optional) — e.g. user preference" style="width:100%" />
       </div>
       <div id="hindsightRetainError" class="detail-form-error" style="display:none"></div>
-      <div style="margin-top:8px;display:flex;justify-content:flex-end"><button id="hindsightRetainBtn" class="btn-secondary" onclick="retainHindsight()">${li('plus',12)} ${esc(t('hindsight_retain'))}</button></div>
+      <div style="margin-top:8px;display:flex;justify-content:flex-end"><button id="hindsightRetainBtn" class="btn-secondary" onclick="retainHindsight()" ${_hindsightRetainLoading?'disabled':''}>${_hindsightRetainLoading?li('loader',12)+' '+esc(t('hindsight_retain')):li('plus',12)+' '+esc(t('hindsight_retain'))}</button></div>
     </section>
   </div>`;
   const restoredContent = $('hindsightRetainContent');

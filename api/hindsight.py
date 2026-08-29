@@ -6,6 +6,7 @@ the configured upstream, and exposes a small, redacted proxy surface.
 """
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import http.client
 import json
@@ -49,7 +50,7 @@ _RATE_LOCK = threading.Lock()
 _RATE_STATE: dict[tuple[str, str], list[float]] = {}
 _RATE_STATE_MAX = 1024
 _STATUS_LOCK = threading.Lock()
-_STATUS_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+_STATUS_CACHE: dict[tuple[str, str, str, str, str], tuple[float, dict[str, Any]]] = {}
 _STATUS_CACHE_MAX = 256
 
 
@@ -94,13 +95,22 @@ def _load_env_file(path: Path) -> dict[str, str]:
 
 
 def _profile_secret(name: str, home: Path) -> str:
-    """Read only the active profile's secret, never another profile's env."""
+    """Read only the active profile's secret, never another profile's env.
+
+    ``get_secret`` falls back to raw ``os.environ`` when no profile scope is
+    installed (see agent.secret_scope docstring) — that's the process-wide
+    env, which for a named (non-default) profile can be the DEFAULT profile's
+    key. Enter the same read-only per-request profile scope api/profiles.py
+    uses for provider/model reads so this fallback stays profile-isolated.
+    """
     env_value = _load_env_file(home / ".env").get(name, "")
     if env_value:
         return env_value
     try:
         from agent.secret_scope import get_secret
-        return str(get_secret(name, "") or "")
+        from api.profiles import profile_env_for_active_request_readonly
+        with profile_env_for_active_request_readonly("hindsight secret read"):
+            return str(get_secret(name, "") or "")
     except Exception:
         return ""
 
@@ -151,6 +161,9 @@ def _validate_api_url(value: Any) -> str:
     return url
 
 
+_CONFIG_UNREADABLE = object()  # sentinel: file exists but failed to parse
+
+
 def _parse_config(home: Path) -> dict[str, Any]:
     path = home / "hindsight" / "config.json"
     if not path.is_file():
@@ -159,7 +172,7 @@ def _parse_config(home: Path) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         logger.warning("Unable to read Hindsight config for profile %s: %s", home.name, type(exc).__name__)
-        return {}
+        return _CONFIG_UNREADABLE
     return data if isinstance(data, dict) else {}
 
 
@@ -167,6 +180,13 @@ def _hindsight_config() -> dict[str, Any]:
     """Resolve and validate the active profile's non-secret Hindsight config."""
     home = _active_home()
     data = _parse_config(home)
+    # A truncated/corrupted config.json must fail closed, not silently fall
+    # through to DEFAULT_API/DEFAULT_BANK below with a still-valid api_key —
+    # that would send a profile's private memory to the wrong (public
+    # default) service instead of its configured self-hosted upstream.
+    config_unreadable = data is _CONFIG_UNREADABLE
+    if config_unreadable:
+        data = {}
     env = _load_env_file(home / ".env")
     api_url = _validate_api_url(data.get("api_url") or data.get("apiUrl") or env.get("HINDSIGHT_API_URL") or DEFAULT_API)
 
@@ -188,7 +208,16 @@ def _hindsight_config() -> dict[str, Any]:
         memory = cfg.get("memory") if isinstance(cfg, dict) else {}
         if isinstance(memory, dict):
             provider = str(memory.get("provider") or "")
-            memory_enabled = bool(memory.get("memory_enabled", True))
+            _memory_enabled_raw = memory.get("memory_enabled", True)
+            if isinstance(_memory_enabled_raw, str):
+                # An env-expanded value like "${MEMORY_ENABLED}" can resolve to
+                # the STRING "false" — bool("false") is True, which would keep
+                # Hindsight active despite an explicit opt-out. Reuse the same
+                # normalization api/routes.py's Memory routes apply.
+                from api.routes import _webui_truthy
+                memory_enabled = _webui_truthy(_memory_enabled_raw)
+            else:
+                memory_enabled = bool(_memory_enabled_raw)
     except Exception as exc:
         logger.debug("Hindsight provider config lookup failed: %s", type(exc).__name__)
 
@@ -202,7 +231,7 @@ def _hindsight_config() -> dict[str, Any]:
         "recall_budget": data.get("recall_budget", "mid"),
         "provider": provider,
         "memory_enabled": memory_enabled,
-        "enabled": provider == "hindsight" and memory_enabled and bool(api_key),
+        "enabled": (not config_unreadable) and provider == "hindsight" and memory_enabled and bool(api_key),
     }
 
 
@@ -219,6 +248,18 @@ def _redact_detail(detail: Any) -> str:
     except Exception:
         pass
     return text[:500]
+
+
+def _coerce_upstream_text(value: Any) -> str:
+    """Coerce an upstream text field to a plain string.
+
+    Upstream is a trust boundary: a malformed or compromised response can
+    return a truthy non-string 'text' (e.g. a dict). The browser calls
+    .slice()/.replace() on recall/reflect text unconditionally and throws,
+    breaking the whole Memory panel — coerce here instead of passing it
+    through.
+    """
+    return value if isinstance(value, str) else ""
 
 
 def _redact_success_value(value: Any) -> Any:
@@ -479,7 +520,12 @@ def handle_status(handler: Any):
     except ValueError as exc:
         return j(handler, {"enabled": False, "reachable": False, "error": _redact_detail(exc)}, status=503)
     payload = {key: cfg[key] for key in ("enabled", "provider", "api_url", "bank_id", "mode", "memory_mode", "recall_budget", "api_key_present")}
-    cache_key = (_active_home().as_posix(), cfg["api_url"], cfg["bank_id"])
+    # Key on the full credential identity (a digest, never the raw key) so a
+    # provider/key rotation invalidates the cache immediately instead of
+    # serving a stale reachable/auth-failure result for up to STATUS_TTL —
+    # api_url+bank_id alone can stay identical across a key change.
+    key_fingerprint = hashlib.sha256(cfg["_api_key"].encode("utf-8")).hexdigest() if cfg["_api_key"] else ""
+    cache_key = (_active_home().as_posix(), cfg["api_url"], cfg["bank_id"], cfg["provider"], key_fingerprint)
     now = time.monotonic()
     with _STATUS_LOCK:
         cached = _STATUS_CACHE.get(cache_key)
@@ -539,7 +585,9 @@ def handle_recall(handler: Any, body: dict[str, Any]):
     for item in results[:30]:
         if not isinstance(item, dict):
             continue
-        trimmed.append(_redact_success_value({key: item.get(key) for key in ("id", "text", "type", "context", "occurred_start", "occurred_end", "mentioned_at", "created_at", "score", "tags", "chunk_id", "document_id")}))
+        row = {key: item.get(key) for key in ("id", "text", "type", "context", "occurred_start", "occurred_end", "mentioned_at", "created_at", "score", "tags", "chunk_id", "document_id")}
+        row["text"] = _coerce_upstream_text(row["text"])
+        trimmed.append(_redact_success_value(row))
     return j(handler, _redact_success_value({"query": query, "budget": budget, "elapsed_ms": elapsed, "count": len(results), "results": trimmed, "trace": data.get("trace"), "entities": data.get("entities")}))
 
 
@@ -570,7 +618,8 @@ def handle_reflect(handler: Any, body: dict[str, Any]):
     elapsed = round((time.monotonic() - started) * 1000)
     if status != 200:
         return _error_response(handler, status, data.get("detail"), elapsed)
-    return j(handler, _redact_success_value({"query": query, "budget": budget, "elapsed_ms": elapsed, "text": data.get("text") or data.get("answer") or "", "based_on": data.get("based_on"), "facts": data.get("facts")}))
+    reflect_text = _coerce_upstream_text(data.get("text")) or _coerce_upstream_text(data.get("answer"))
+    return j(handler, _redact_success_value({"query": query, "budget": budget, "elapsed_ms": elapsed, "text": reflect_text, "based_on": data.get("based_on"), "facts": data.get("facts")}))
 
 
 def handle_list_memories(handler: Any, parsed: Any):
