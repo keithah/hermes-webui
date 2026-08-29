@@ -453,6 +453,12 @@ def test_transparent_stream_hidden_body_appends_plain_text_only():
     script = (
         function_block(MESSAGES_JS, "_renderStreamingFadeMarkdown")
         + r"""
+// #7040: _renderStreamingFadeMarkdown now routes raw text through the
+// large-transcript display projection before handing it to the fade
+// renderer. That projection is covered by its own dedicated tests
+// (test_transcript_display_projection.py) -- stub it here as identity so
+// this test keeps exercising fade-playout behavior in isolation.
+function _projectLiveDisplayText(t){ return t; }
 let _streamFadeDomText='';
 let _smdParser=null;
 let _smdReconnect=false;

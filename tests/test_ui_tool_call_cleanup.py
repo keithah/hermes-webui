@@ -346,8 +346,13 @@ class TestToolCallGroupingStatic:
         assert ".tool-card-preview" not in tool_body, (
             "Tool-card disclosure keys must not depend on result preview text."
         )
-        assert "_toolDisclosureIdentity(tc)" in build_tool_fn, (
-            "buildToolCard() must stamp a stable disclosure key on each tool row."
+        assert "_toolDisclosureIdentity(tc, _disclosureOrdinal)" in build_tool_fn, (
+            "buildToolCard() must resolve the disclosure key via the immutable "
+            "ordinal already carried on tc from normalization (not re-infer one)."
+        )
+        assert "globalThis._toolDisclosureOrdinalCounters" not in build_tool_fn, (
+            "buildToolCard() must not allocate ordinals via a process-global "
+            "counter -- that reintroduces render-order-dependent identity."
         )
         assert "tc.snippet" not in _function_body(UI_JS, "_toolDisclosureIdentity"), (
             "Derived tool disclosure keys must not include changing result snippets."
