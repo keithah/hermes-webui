@@ -8251,19 +8251,34 @@ def _state_db_lineage_lookup(pid: str, profile: str | None):
     Used by ``_effective_sidebar_origin``'s missing-ancestor fallback (#6985
     review round 3): a WebUI-sidecar-only lookup misses every delegated
     subagent ancestor that ran server-side (#5307), since those have no
-    sidecar at all — state.db is their only record. Scoped to ``profile``
-    (never the globally active profile when the caller is building a payload
-    for a different one) via ``_agent_state_db_path``, so an ancestor id that
-    only exists in a DIFFERENT profile's state.db is correctly treated as
-    absent here, not leaked across profiles. Only the two lineage columns the
-    caller needs (``source``, ``parent_session_id``) are read — no messages,
-    no full row.
+    sidecar at all — state.db is their only record. Only the two lineage
+    columns the caller needs (``source``, ``parent_session_id``) are read —
+    no messages, no full row.
+
+    Deliberately does NOT use ``_agent_state_db_path()`` for a named
+    ``profile``: that helper falls back to ``_active_state_db_path()`` (the
+    server-wide currently-active session's db) whenever the named profile's
+    own state.db file doesn't exist yet. That fallback is fine for its other
+    callers, but here it would silently serve a DIFFERENT profile's data —
+    a profile queried for the first time (no state.db of its own created
+    yet) would leak whatever profile happens to be globally active at that
+    moment instead of correctly resolving to nothing. Verified: a probe that
+    populates only the mocked active-session db (not the target profile's
+    own) with a foreign ancestor row reproduces the leak via
+    ``_agent_state_db_path`` and is closed by resolving the named profile's
+    path directly with no such fallback. ``profile=None`` (no specific
+    profile requested) still legitimately means "the current active
+    session," so that case alone still resolves via
+    ``_active_state_db_path()``.
     """
     if not pid or not is_safe_session_id(pid):
         return None
     try:
-        from api.models import _agent_state_db_path
-        db_path = _agent_state_db_path(profile=profile)
+        from api.models import _active_state_db_path, _get_profile_home
+        if isinstance(profile, str) and profile:
+            db_path = _get_profile_home(profile) / "state.db"
+        else:
+            db_path = _active_state_db_path()
         if not db_path or not Path(db_path).exists():
             return None
         with closing(open_state_db_readonly(Path(db_path))) as conn:

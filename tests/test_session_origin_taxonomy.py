@@ -535,17 +535,26 @@ def test_effective_sidebar_origin_does_not_leak_ancestor_across_profiles(
     """The state.db fallback must be profile-scoped: an ancestor that only
     exists in a DIFFERENT profile's state.db must not be found when
     resolving a child under the active profile — the sidebar filter must
-    fall back to 'webui', not leak the other profile's classification."""
+    fall back to 'webui', not leak the other profile's classification.
+
+    Deliberately does NOT create the "default" profile's own state.db file
+    first. Verified this reproduces a real leak against the original
+    implementation: ``_state_db_lineage_lookup`` used to resolve the target
+    profile's db via ``_agent_state_db_path()``, which falls back to
+    ``_active_state_db_path()`` (the server-wide currently-active session's
+    db, independent of the profile this payload is being built for)
+    whenever the named profile's own db file doesn't exist yet — silently
+    serving a foreign profile's data instead of correctly resolving to
+    nothing. Populating the mocked "active" db (not "default"'s own) with
+    the foreign row reproduces that leak; the fix resolves the named
+    profile's path directly with no such fallback.
+    """
     import api.routes as routes
     from api.models import _get_profile_home
 
     other_home = _get_profile_home("other-profile")
     _make_state_db_rows(other_home / "state.db", [("cross-profile-ancestor", "matrix", None)])
-    # The active profile's own (empty) state.db must exist so
-    # _agent_state_db_path doesn't silently fall back to the active/default
-    # db and accidentally find the other profile's row anyway.
-    active_home = _get_profile_home("default")
-    _make_state_db_rows(active_home / "state.db", [])
+    _make_state_db_rows(origin_fallback_env["default_db"], [("cross-profile-ancestor", "matrix", None)])
 
     child_row = {
         "session_id": "child-of-cross-profile-ghost",
@@ -622,30 +631,52 @@ def test_effective_sidebar_origin_cycle_falls_back_to_webui_without_hanging(
 def test_effective_origin_fallback_lookup_queries_state_db_at_most_once_per_ancestor(
     origin_fallback_env, monkeypatch,
 ):
-    """Repeated-miss/query-bound: many children sharing the same
-    out-of-scope ancestor must trigger at most one underlying state.db
-    query for that ancestor id — the fallback's memoization (which also
-    covers misses, per _effective_origin_fallback_lookup's own docstring)
-    must not re-query per descendant."""
+    """Repeated-miss/query-bound (#6985 review round 3, item 1).
+
+    A HIT (the ancestor resolves successfully) is already deduped by the
+    pre-existing ``_effective_session_by_id`` cache regardless of whether
+    ``_effective_origin_fallback_lookup``'s own ``_origin_fallback_cache``
+    exists at all: `_effective_session_by_id[pid] = parent` only runs on a
+    successful resolution, so re-testing that path proves nothing about the
+    NEW memoization layer (verified: deleting `_origin_fallback_cache`'s
+    early-return still passes a same-ancestor-HIT version of this test).
+
+    The new cache's actual, distinct value is deduping repeated MISSES: on
+    a miss `_effective_origin_fallback_lookup` returns None and the caller
+    `break`s BEFORE ever writing to `_effective_session_by_id` — so without
+    `_origin_fallback_cache` covering the miss too, every child referencing
+    the same nonexistent ancestor re-triggers a full sidecar-then-state.db
+    lookup. Assert both the sidecar read (`Session.load_metadata_only`) and
+    the state.db read are each invoked at most once despite 5 children all
+    missing on the same nonexistent ancestor id.
+    """
+    import api.models as models
     import api.routes as routes
     from api.models import _get_profile_home
 
     home = _get_profile_home("default")
-    _make_state_db_rows(home / "state.db", [("shared-ancestor", "matrix", None)])
+    _make_state_db_rows(home / "state.db", [])  # ancestor id never exists
 
-    call_count = {"n": 0}
-    real_lookup = routes._state_db_lineage_lookup
+    sidecar_calls = {"n": 0}
+    state_db_calls = {"n": 0}
+    real_state_db_lookup = routes._state_db_lineage_lookup
+    real_load_metadata_only = models.Session.load_metadata_only
 
-    def _counting_lookup(pid, profile):
-        call_count["n"] += 1
-        return real_lookup(pid, profile)
+    def _counting_state_db_lookup(pid, profile):
+        state_db_calls["n"] += 1
+        return real_state_db_lookup(pid, profile)
 
-    monkeypatch.setattr(routes, "_state_db_lineage_lookup", _counting_lookup)
+    def _counting_load_metadata_only(pid):
+        sidecar_calls["n"] += 1
+        return real_load_metadata_only(pid)
+
+    monkeypatch.setattr(routes, "_state_db_lineage_lookup", _counting_state_db_lookup)
+    monkeypatch.setattr(models.Session, "load_metadata_only", staticmethod(_counting_load_metadata_only))
 
     rows = [
         {
             "session_id": f"child-{i}",
-            "parent_session_id": "shared-ancestor",
+            "parent_session_id": "nonexistent-ancestor",
             "message_count": 1,
             "project_id": None,
             "profile": "default",
@@ -655,6 +686,7 @@ def test_effective_origin_fallback_lookup_queries_state_db_at_most_once_per_ance
     ]
     monkeypatch.setattr(routes, "all_sessions", lambda diag=None: rows)
 
-    result = _run_payload(routes, rows[0], active_profile="default", sidebar_source="matrix")
+    result = _run_payload(routes, rows[0], active_profile="default", sidebar_source="webui")
     assert sorted(result) == [f"child-{i}" for i in range(5)]
-    assert call_count["n"] == 1, f"expected exactly one state.db query for the shared ancestor, got {call_count['n']}"
+    assert sidecar_calls["n"] == 1, f"expected exactly one sidecar lookup for the shared missing ancestor, got {sidecar_calls['n']}"
+    assert state_db_calls["n"] == 1, f"expected exactly one state.db query for the shared missing ancestor, got {state_db_calls['n']}"
