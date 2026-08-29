@@ -17,6 +17,31 @@ def _extract_function(source_text, function_name):
     return _extract_from_marker(source_text, marker)
 
 
+def _extract_statement(source_text, marker):
+    """Return the full statement starting at `marker`, up through the `;`
+    that closes it at bracket/paren/brace depth 0.
+
+    Unlike `_extract_from_marker` (single brace-matched block), this handles
+    a multi-line statement like `const sourceRowsById=new Map(\n  ...\n);` —
+    depth tracks all three bracket kinds so a statement can span function
+    calls, array/object literals, and arrow bodies before its terminating
+    semicolon.
+    """
+    start = source_text.index(marker)
+    depth = 0
+    openers = "([{"
+    closers = ")]}"
+    for index in range(start, len(source_text)):
+        char = source_text[index]
+        if char in openers:
+            depth += 1
+        elif char in closers:
+            depth -= 1
+        elif char == ";" and depth == 0:
+            return source_text[start : index + 1]
+    raise AssertionError(f"Could not find closing ';' at depth 0 for marker: {marker!r}")
+
+
 def _extract_from_marker(source_text, marker):
     """Brace-match a code block starting at the first `{` after `marker`.
 
@@ -285,6 +310,42 @@ def test_sidebar_frontend_renders_origin_tabs_and_accepts_non_cli_origins():
     assert "session_origin" in source
 
 
+def _client_effective_origin_script(all_matched_js, lookups_js):
+    """Build a script that runs the REAL effectiveOrigin closure (and its
+    real sourceRowsById/_rowProfileKey/_rowLineageKey helpers) straight out
+    of sessions.js — not a hand-copied reimplementation — against a test
+    `allMatched` array, then logs whatever `lookups_js` (a JS object literal
+    body referencing `bySid`, a plain by-session_id Map, and `effectiveOrigin`)
+    produces. Shared by every client-side effectiveOrigin test so a change to
+    sessions.js's helper set only needs updating once.
+    """
+    source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    order_line = next(line for line in source.splitlines() if line.startswith("const _SESSION_ORIGIN_ORDER="))
+    origin_fn = _extract_function(source, "_sessionOrigin")
+    is_child_fn = _extract_function(source, "_isChildSession")
+    is_cli_fn = _extract_function(source, "_isCliSession")
+    is_messaging_fn = _extract_function(source, "_isMessagingSession")
+    row_profile_key_stmt = _extract_statement(source, "const _rowProfileKey=")
+    row_lineage_key_stmt = _extract_statement(source, "const _rowLineageKey=")
+    source_rows_stmt = _extract_statement(source, "const sourceRowsById=")
+    effective_origin_block = _extract_from_marker(source, "const effectiveOrigin=s=>{")
+    return f"""
+{order_line}
+const _MESSAGING_RAW_SOURCES = new Set();
+{is_messaging_fn}
+{is_cli_fn}
+{origin_fn}
+{is_child_fn}
+const allMatched = {all_matched_js};
+{row_profile_key_stmt}
+{row_lineage_key_stmt}
+{source_rows_stmt}
+const effectiveOrigin={effective_origin_block.split("=", 1)[1]}
+const bySid = new Map(allMatched.map(s => [s.session_id, s]));
+console.log(JSON.stringify({lookups_js}));
+"""
+
+
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_effective_origin_inherits_plain_webui_grandparent_through_subagent_child():
     """A legacy subagent-marked child with no explicit session_origin must
@@ -294,39 +355,17 @@ def test_effective_origin_inherits_plain_webui_grandparent_through_subagent_chil
     `_sessionOrigin(s)` (the *original* argument) instead of `_sessionOrigin(cur)`
     (the resolved ancestor), silently discarding the walk whenever every
     hop in the chain was itself a placeholder ('webui' or 'subagent')."""
-    source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
-    order_line = next(line for line in source.splitlines() if line.startswith("const _SESSION_ORIGIN_ORDER="))
-    origin_fn = _extract_function(source, "_sessionOrigin")
-    is_child_fn = _extract_function(source, "_isChildSession")
-    is_cli_fn = _extract_function(source, "_isCliSession")
-    is_messaging_fn = _extract_function(source, "_isMessagingSession")
-    # Pull the REAL sourceRowsById + effectiveOrigin closure straight out of
-    # sessions.js (not a hand-copied reimplementation) so this test tracks the
-    # actual shipped fix instead of silently drifting from it.
-    source_rows_line = next(
-        line for line in source.splitlines()
-        if line.strip().startswith("const sourceRowsById=")
+    script = _client_effective_origin_script(
+        """[
+  {session_id:'grandparent', title:'root'},
+  {session_id:'child', parent_session_id:'grandparent', relationship_type:'child_session', session_origin:'subagent'},
+  {session_id:'grandchild', parent_session_id:'child', relationship_type:'child_session', session_origin:'subagent'},
+]""",
+        """{
+  child: effectiveOrigin(bySid.get('child')),
+  grandchild: effectiveOrigin(bySid.get('grandchild')),
+}""",
     )
-    effective_origin_block = _extract_from_marker(source, "const effectiveOrigin=s=>{")
-    script = f"""
-{order_line}
-const _MESSAGING_RAW_SOURCES = new Set();
-{is_messaging_fn}
-{is_cli_fn}
-{origin_fn}
-{is_child_fn}
-const allMatched = [
-  {{session_id:'grandparent', title:'root'}},
-  {{session_id:'child', parent_session_id:'grandparent', relationship_type:'child_session', session_origin:'subagent'}},
-  {{session_id:'grandchild', parent_session_id:'child', relationship_type:'child_session', session_origin:'subagent'}},
-];
-{source_rows_line}
-const effectiveOrigin={effective_origin_block.split("=", 1)[1]}
-console.log(JSON.stringify({{
-  child: effectiveOrigin(sourceRowsById.get('child')),
-  grandchild: effectiveOrigin(sourceRowsById.get('grandchild')),
-}}));
-"""
     result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
     assert json.loads(result.stdout) == {"child": "webui", "grandchild": "webui"}
 
@@ -341,39 +380,62 @@ def test_effective_origin_resolves_real_external_ancestor_and_falls_back_determi
     correctly through a subagent child, and (2) a parent_session_id cycle among
     loaded rows terminates via the existing visited-set bound and falls back
     to 'webui' instead of hanging or returning something else raw."""
-    source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
-    order_line = next(line for line in source.splitlines() if line.startswith("const _SESSION_ORIGIN_ORDER="))
-    origin_fn = _extract_function(source, "_sessionOrigin")
-    is_child_fn = _extract_function(source, "_isChildSession")
-    is_cli_fn = _extract_function(source, "_isCliSession")
-    is_messaging_fn = _extract_function(source, "_isMessagingSession")
-    source_rows_line = next(
-        line for line in source.splitlines()
-        if line.strip().startswith("const sourceRowsById=")
+    script = _client_effective_origin_script(
+        """[
+  {session_id:'external-ancestor', session_origin:'matrix'},
+  {session_id:'subagent-child', parent_session_id:'external-ancestor', relationship_type:'child_session', session_origin:'subagent'},
+  {session_id:'cycle-a', parent_session_id:'cycle-b', relationship_type:'child_session', session_origin:'subagent'},
+  {session_id:'cycle-b', parent_session_id:'cycle-a', relationship_type:'child_session', session_origin:'subagent'},
+]""",
+        """{
+  externalAncestor: effectiveOrigin(bySid.get('subagent-child')),
+  cycle: effectiveOrigin(bySid.get('cycle-a')),
+}""",
     )
-    effective_origin_block = _extract_from_marker(source, "const effectiveOrigin=s=>{")
-    script = f"""
-{order_line}
-const _MESSAGING_RAW_SOURCES = new Set();
-{is_messaging_fn}
-{is_cli_fn}
-{origin_fn}
-{is_child_fn}
-const allMatched = [
-  {{session_id:'external-ancestor', session_origin:'matrix'}},
-  {{session_id:'subagent-child', parent_session_id:'external-ancestor', relationship_type:'child_session', session_origin:'subagent'}},
-  {{session_id:'cycle-a', parent_session_id:'cycle-b', relationship_type:'child_session', session_origin:'subagent'}},
-  {{session_id:'cycle-b', parent_session_id:'cycle-a', relationship_type:'child_session', session_origin:'subagent'}},
-];
-{source_rows_line}
-const effectiveOrigin={effective_origin_block.split("=", 1)[1]}
-console.log(JSON.stringify({{
-  externalAncestor: effectiveOrigin(sourceRowsById.get('subagent-child')),
-  cycle: effectiveOrigin(sourceRowsById.get('cycle-a')),
-}}));
-"""
     result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
     assert json.loads(result.stdout) == {"externalAncestor": "matrix", "cycle": "webui"}
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_effective_origin_classifies_definitive_ancestor_reached_exactly_at_hop_limit():
+    """#6985 review round 4: both walks classify `cur` then advance to its
+    parent, so if the walk's LAST permitted hop is the one that resolves an
+    external ancestor, the loop ran out of iterations before ever
+    classifying it — silently dropping a genuinely-resolved ancestor to the
+    'webui' give-up value instead of honoring it. Covers the exact boundary
+    (ancestor reached on hop 16, the last one allowed) and one hop beyond it
+    (ancestor would need hop 17, which must still fail closed to 'webui')."""
+    # A chain of 16 subagent hops (child_1 -> child_2 -> ... -> child_16)
+    # whose parent_session_id finally points at a real external ancestor.
+    # child_1's own walk: hop 1 resolves child_2 ... hop 16 resolves the
+    # external ancestor itself — exactly the last permitted iteration.
+    at_limit = [
+        f"{{session_id:'child_{i}', parent_session_id:'{'external-ancestor' if i == 16 else f'child_{i + 1}'}', relationship_type:'child_session', session_origin:'subagent'}}"
+        for i in range(1, 17)
+    ]
+    at_limit.append("{session_id:'external-ancestor', session_origin:'matrix'}")
+    script = _client_effective_origin_script(
+        "[\n  " + ",\n  ".join(at_limit) + ",\n]",
+        "{ atLimit: effectiveOrigin(bySid.get('child_1')) }",
+    )
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == {"atLimit": "matrix"}
+
+    # One hop further: the external ancestor is now 17 hops away from
+    # child_1 (child_1 -> ... -> child_17 -> external-ancestor), one past
+    # what the bound allows — must still fail closed to 'webui', not error
+    # or classify something reached beyond the bound.
+    beyond_limit = [
+        f"{{session_id:'child_{i}', parent_session_id:'{'external-ancestor' if i == 17 else f'child_{i + 1}'}', relationship_type:'child_session', session_origin:'subagent'}}"
+        for i in range(1, 18)
+    ]
+    beyond_limit.append("{session_id:'external-ancestor', session_origin:'matrix'}")
+    script = _client_effective_origin_script(
+        "[\n  " + ",\n  ".join(beyond_limit) + ",\n]",
+        "{ beyondLimit: effectiveOrigin(bySid.get('child_1')) }",
+    )
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == {"beyondLimit": "webui"}
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -690,3 +752,163 @@ def test_effective_origin_fallback_lookup_queries_state_db_at_most_once_per_ance
     assert sorted(result) == [f"child-{i}" for i in range(5)]
     assert sidecar_calls["n"] == 1, f"expected exactly one sidecar lookup for the shared missing ancestor, got {sidecar_calls['n']}"
     assert state_db_calls["n"] == 1, f"expected exactly one state.db query for the shared missing ancestor, got {state_db_calls['n']}"
+
+
+def _run_payload_all_profiles(routes, rows, *, active_profile, sidebar_source):
+    monkeypatch_unused = routes  # noqa: F841  (kept for call-site symmetry with _run_payload)
+    payload = routes._build_session_list_cache_payload(
+        active_profile=active_profile,
+        all_profiles=True,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        show_matrix_sessions=True,
+        sidebar_source=sidebar_source,
+    )
+    return [s["session_id"] for s in payload["sessions"]]
+
+
+def test_effective_sidebar_origin_resolves_missing_ancestor_in_the_rows_own_profile(
+    origin_fallback_env, monkeypatch,
+):
+    """#6985 review round 4, item 1 (the important one): an all_profiles=True
+    payload mixes rows from EVERY profile, but the missing-ancestor fallback
+    used to always query the REQUEST's active_profile's state.db, never the
+    child row's OWN profile. A child owned by profile B whose ancestor only
+    exists in B's state.db (absent from the active profile A entirely) must
+    still resolve to B's ancestor's real origin — not silently fall back to
+    webui because A's db has no such row.
+    """
+    import api.routes as routes
+    from api.models import _get_profile_home
+
+    # Ancestor exists ONLY in profile-b's state.db — profile-a's db (the
+    # request's active_profile) has no row for it at all.
+    _make_state_db_rows(_get_profile_home("profile-a") / "state.db", [])
+    _make_state_db_rows(
+        _get_profile_home("profile-b") / "state.db",
+        [("b-only-ancestor", "matrix", None)],
+    )
+
+    child_row = {
+        "session_id": "child-of-profile-b",
+        "parent_session_id": "b-only-ancestor",
+        "message_count": 1,
+        "project_id": None,
+        "profile": "profile-b",
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [child_row])
+
+    assert _run_payload_all_profiles(
+        routes, [child_row], active_profile="profile-a", sidebar_source="matrix"
+    ) == ["child-of-profile-b"]
+    assert _run_payload_all_profiles(
+        routes, [child_row], active_profile="profile-a", sidebar_source="webui"
+    ) == []
+
+
+def test_effective_sidebar_origin_same_ancestor_id_in_two_profiles_never_borrows_the_wrong_one(
+    origin_fallback_env, monkeypatch,
+):
+    """#6985 review round 4, item 1: the reviewer's exact collision case —
+    an ancestor session id exists in BOTH profile A's and profile B's
+    state.db, with DIFFERENT origins (A=matrix, B=telegram). A child owned
+    by profile B must resolve via B's row, never A's, even though both
+    rows share the same session id and the active profile is A.
+    """
+    import api.routes as routes
+    from api.models import _get_profile_home
+
+    _make_state_db_rows(
+        _get_profile_home("profile-a") / "state.db",
+        [("shared-ancestor-id", "matrix", None)],
+    )
+    _make_state_db_rows(
+        _get_profile_home("profile-b") / "state.db",
+        [("shared-ancestor-id", "telegram", None)],
+    )
+
+    child_row = {
+        "session_id": "child-of-profile-b-2",
+        "parent_session_id": "shared-ancestor-id",
+        "message_count": 1,
+        "project_id": None,
+        "profile": "profile-b",
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [child_row])
+
+    # Filtering for the ACTIVE profile's (A's) origin must NOT reveal B's
+    # child — B's ancestor is telegram, not matrix, regardless of what a
+    # same-id row in A's own db says.
+    assert _run_payload_all_profiles(
+        routes, [child_row], active_profile="profile-a", sidebar_source="matrix"
+    ) == []
+    # Filtering for B's actual (telegram) origin correctly reveals it.
+    assert _run_payload_all_profiles(
+        routes, [child_row], active_profile="profile-a", sidebar_source="telegram"
+    ) == ["child-of-profile-b-2"]
+
+
+def test_effective_sidebar_origin_classifies_definitive_ancestor_reached_exactly_at_hop_limit(
+    origin_fallback_env, monkeypatch,
+):
+    """#6985 review round 4, item 2 (server side): both walks classify `cur`
+    then advance to its parent, so a definitive external ancestor resolved
+    on the walk's LAST permitted hop was never classified — the loop simply
+    ran out of iterations first, silently dropping it to the 'webui'
+    give-up value. Covers the exact boundary (16 hops, the last one
+    allowed) and one hop beyond it (17 hops, which must still fail closed).
+    """
+    import api.routes as routes
+    from api.models import _get_profile_home
+
+    # child_1 -> child_2 -> ... -> child_16 -> external-ancestor: 16 hops
+    # from child_1 to the ancestor, exactly the bound.
+    at_limit_rows = [
+        (f"child_{i}", None, f"child_{i + 1}" if i < 16 else "external-ancestor")
+        for i in range(1, 17)
+    ]
+    at_limit_rows.append(("external-ancestor", "matrix", None))
+    _make_state_db_rows(_get_profile_home("default") / "state.db", at_limit_rows)
+
+    leaf_row = {
+        "session_id": "child_1",
+        "parent_session_id": "child_2",
+        "relationship_type": "child_session",
+        "message_count": 1,
+        "project_id": None,
+        "profile": "default",
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [leaf_row])
+    assert _run_payload(routes, leaf_row, active_profile="default", sidebar_source="matrix") == [
+        "child_1"
+    ]
+
+    # One hop further: 17 hops from child_1 to the ancestor — one past what
+    # the bound allows. Must still fail closed to webui, not error.
+    beyond_limit_rows = [
+        (f"beyond_{i}", None, f"beyond_{i + 1}" if i < 17 else "external-ancestor-2")
+        for i in range(1, 18)
+    ]
+    beyond_limit_rows.append(("external-ancestor-2", "matrix", None))
+    _make_state_db_rows(_get_profile_home("default2") / "state.db", beyond_limit_rows)
+
+    leaf_row_2 = {
+        "session_id": "beyond_1",
+        "parent_session_id": "beyond_2",
+        "relationship_type": "child_session",
+        "message_count": 1,
+        "project_id": None,
+        "profile": "default2",
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [leaf_row_2])
+    assert _run_payload_all_profiles(
+        routes, [leaf_row_2], active_profile="default2", sidebar_source="matrix"
+    ) == []
+    assert _run_payload_all_profiles(
+        routes, [leaf_row_2], active_profile="default2", sidebar_source="webui"
+    ) == ["beyond_1"]
