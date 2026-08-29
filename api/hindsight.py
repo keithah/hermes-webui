@@ -43,10 +43,14 @@ _TAG_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 # A slow Hindsight backend may consume at most four outbound slots; callers get
 # a bounded response instead of creating an unbounded pile of socket threads.
 _UPSTREAM_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hindsight-proxy")
+_HINDSIGHT_MAX_PENDING = 16
+_HINDSIGHT_SEM = __import__('threading').Semaphore(_HINDSIGHT_MAX_PENDING)
 _RATE_LOCK = threading.Lock()
 _RATE_STATE: dict[tuple[str, str], list[float]] = {}
+_RATE_STATE_MAX = 1024
 _STATUS_LOCK = threading.Lock()
 _STATUS_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+_STATUS_CACHE_MAX = 256
 
 
 def _resolve_public_addresses(host: str, port: int | None) -> tuple[str, ...]:
@@ -321,28 +325,103 @@ def _proxy_sync(method: str, path: str, api_key: str, api_url: str, body: dict[s
 
 
 def _proxy(*args: Any, **kwargs: Any) -> tuple[int, dict[str, Any]]:
-    """Run one upstream call through a bounded executor."""
+    """Run one upstream call through a bounded executor.
+
+    A semaphore gates submissions so the executor's unbounded queue cannot
+    grow without bound. When the semaphore is exhausted we return 503
+    immediately (backpressure). Timed-out futures are cancelled when still
+    queued; running tasks cannot be cancelled and will release the slot via
+    the done-callback when they finish.
+    """
     timeout = float(kwargs.get("timeout", UPSTREAM_TIMEOUT))
+    if not _HINDSIGHT_SEM.acquire(blocking=False):
+        return 503, {"detail": "Hindsight proxy is busy"}
     try:
         future = _UPSTREAM_EXECUTOR.submit(_proxy_sync, *args, **kwargs)
-        return future.result(timeout=timeout + 1.0)
-    except FutureTimeout:
-        return 504, {"detail": "Hindsight upstream timed out"}
+        # Release semaphore when the work finishes (success, error, or cancel).
+        def _release(_f):
+            try:
+                _HINDSIGHT_SEM.release()
+            except ValueError:
+                pass
+        try:
+            future.add_done_callback(_release)
+        except Exception:
+            pass
+        try:
+            return future.result(timeout=timeout + 1.0)
+        except FutureTimeout:
+            # If still queued, cancel to free worker; running task will
+            # release via callback when done.
+            try:
+                future.cancel()
+            except Exception:
+                pass
+            return 504, {"detail": "Hindsight upstream timed out"}
+        except RuntimeError:
+            return 503, {"detail": "Hindsight proxy is busy"}
     except RuntimeError:
+        # Submit itself raised (e.g. executor shutdown) — release semaphore.
+        try:
+            _HINDSIGHT_SEM.release()
+        except ValueError:
+            pass
         return 503, {"detail": "Hindsight proxy is busy"}
 
 
+def _client_key(handler: Any) -> str:
+    """Return a rate-limit key aware of reverse proxies.
+
+    When behind a proxy (documented Hermes remote-access mode), client_address
+    is the proxy itself. Prefer X-Forwarded-For's leftmost entry when present,
+    falling back to the socket peer. This is not a security boundary — it is
+    only for rate-limit bucketing.
+    """
+    try:
+        headers = getattr(handler, "headers", None)
+        if headers is not None:
+            # headers may be http.client.HTTPMessage or dict-like
+            xff = None
+            try:
+                xff = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
+            except Exception:
+                xff = None
+            if xff:
+                # Leftmost is original client
+                candidate = xff.split(",")[0].strip()
+                if candidate:
+                    return candidate
+    except Exception:
+        pass
+    return str(getattr(handler, "client_address", ("unknown",))[0])
+
 def _rate_limit(handler: Any, operation: str, limit: int) -> bool:
     now = time.monotonic()
-    address = getattr(handler, "client_address", ("unknown",))[0]
-    key = (str(address), operation)
+    address = _client_key(handler)
+    key = (address, operation)
     with _RATE_LOCK:
+        # Time-based sweep: drop expired samples per-key
         samples = [stamp for stamp in _RATE_STATE.get(key, []) if now - stamp < 60.0]
         if len(samples) >= limit:
             _RATE_STATE[key] = samples
             return False
         samples.append(now)
         _RATE_STATE[key] = samples
+        # Eviction: cap number of distinct client buckets to prevent unbounded growth
+        if len(_RATE_STATE) > _RATE_STATE_MAX:
+            # Evict oldest entries: remove keys with oldest last-sample or fewest samples
+            # Simplest: evict arbitrary excess keys (first inserted). Ordered dict preserves insertion order.
+            excess = len(_RATE_STATE) - _RATE_STATE_MAX
+            for k in list(_RATE_STATE.keys())[:excess]:
+                if k != key:
+                    _RATE_STATE.pop(k, None)
+                elif excess > 1:
+                    # Don't evict the just-updated key unless we must
+                    pass
+            # If still over (because we skipped current key), evict it last
+            while len(_RATE_STATE) > _RATE_STATE_MAX:
+                oldest = next(iter(_RATE_STATE))
+                _RATE_STATE.pop(oldest, None)
     return True
 
 
@@ -419,6 +498,11 @@ def handle_status(handler: Any):
             result["total_memories"] = data["total"]
     with _STATUS_LOCK:
         _STATUS_CACHE[cache_key] = (now, result)
+        # Evict oldest entries if unbounded growth (per-profile cache)
+        if len(_STATUS_CACHE) > _STATUS_CACHE_MAX:
+            excess = len(_STATUS_CACHE) - _STATUS_CACHE_MAX
+            for k in list(_STATUS_CACHE.keys())[:excess]:
+                _STATUS_CACHE.pop(k, None)
     return j(handler, {**payload, **result})
 
 

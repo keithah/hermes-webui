@@ -10296,6 +10296,7 @@ def _run_agent_streaming(
             # ── Agent cache: reuse across messages in the same session ──
             # Mirrors gateway _agent_cache.  Keeps _user_turn_count alive so
             # injectionFrequency: "first-turn" actually suppresses after turn 1.
+            _agent_sig = None
             if ephemeral:
                 agent = _AIAgent(**_agent_kwargs)
                 logger.debug('[webui] Created ephemeral agent for session %s', session_id)
@@ -11213,9 +11214,10 @@ def _run_agent_streaming(
                             with STREAMS_LOCK:
                                 AGENT_INSTANCES[stream_id] = agent
                             from api.config import SESSION_AGENT_CACHE as _SAC, SESSION_AGENT_CACHE_LOCK as _SAC_L
-                            with _SAC_L:
-                                _SAC[session_id] = (agent, _agent_sig)
-                                _SAC.move_to_end(session_id)
+                            if not ephemeral and _agent_sig is not None:
+                                with _SAC_L:
+                                    _SAC[session_id] = (agent, _agent_sig)
+                                    _SAC.move_to_end(session_id)
                             # Retry the conversation once with fresh credentials
                             _self_healed = True
                             _token_sent = False
@@ -12511,10 +12513,15 @@ def _run_agent_streaming(
                     _heal_agent = _AIAgent(**_heal_kwargs)
                     with STREAMS_LOCK:
                         AGENT_INSTANCES[stream_id] = _heal_agent
-                    from api.config import SESSION_AGENT_CACHE as _SAC2, SESSION_AGENT_CACHE_LOCK as _SAC2_L
-                    with _SAC2_L:
-                        _SAC2[session_id] = (_heal_agent, _agent_sig)
-                        _SAC2.move_to_end(session_id)
+                    # Do not cache ephemeral agents: the finally block will close them.
+                    if not ephemeral and _agent_sig is not None:
+                        from api.config import SESSION_AGENT_CACHE as _SAC2, SESSION_AGENT_CACHE_LOCK as _SAC2_L
+                        with _SAC2_L:
+                            _SAC2[session_id] = (_heal_agent, _agent_sig)
+                            _SAC2.move_to_end(session_id)
+                    # Except-path self-heal must update `agent` so the finally
+                    # block closes the healed agent, not the stale original.
+                    agent = _heal_agent
                     # Retry the conversation
                     _token_sent = False
                     try:
@@ -12814,12 +12821,14 @@ def _run_agent_streaming(
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
         _clear_thread_env()  # TD1: always clear thread-local context
-        # Remove the registry reference before potentially blocking teardown so
-        # concurrent cancellation/inspection cannot retrieve a closed agent.
-        if ephemeral and agent is not None:
-            with STREAMS_LOCK:
-                AGENT_INSTANCES.pop(stream_id, None)
-            _close_ephemeral_agent(agent)
+        # Capture ephemeral agent for blocking close AFTER non-blocking registry
+        # teardown. AGENT_INSTANCES is popped unconditionally for every stream
+        # (ephemeral or not) to avoid leaking non-ephemeral agents; the
+        # blocking close runs last so STREAMS/CANCEL_FLAGS/ACTIVE_RUNS are
+        # released without delay.
+        _ephemeral_agent_to_close = agent if (ephemeral and agent is not None) else None
+        with STREAMS_LOCK:
+            AGENT_INSTANCES.pop(stream_id, None)
         if _streaming_cron_profile_home_token is not None:
             _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)
         if _restore_streaming_skill_home_modules and _streaming_skill_home_snapshot is not None:
@@ -12872,6 +12881,12 @@ def _run_agent_streaming(
             # POST /api/chat/start round-trip and erase the marker before
             # the next stream can read it, breaking the goal-continuation
             # chain. Stage-326 critical fix per Opus advisor review.
+
+        # Blocking ephemeral teardown last: STREAMS/CANCEL_FLAGS/ACTIVE_RUNS
+        # have already been released above, so a slow memory-provider shutdown
+        # does not delay active-run release.
+        if _ephemeral_agent_to_close is not None:
+            _close_ephemeral_agent(_ephemeral_agent_to_close)
 
         # ── Defer-path fix: turn-teardown idle-hook ────────────────────────
         # The session has just transitioned active→idle: unregister_active_run

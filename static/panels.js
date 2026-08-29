@@ -5437,7 +5437,7 @@ async function recallHindsight() {
   const input = $('hindsightRecallQuery');
   const budgetEl = $('hindsightRecallBudget');
   const q = input ? input.value.trim() : '';
-  if (!q) { _hindsightError = 'Enter a query'; _renderHindsight(); return; }
+  if (!q) { _hindsightError = t('hindsight_query_required'); _renderHindsight(); return; }
   _hindsightLastQuery = q;
   _hindsightLoading = true; _hindsightError = ''; _renderHindsight();
   try {
@@ -5464,7 +5464,7 @@ async function reflectHindsight() {
   const profile = _hindsightProfileName();
   const input = $('hindsightReflectQuery');
   const q = input ? input.value.trim() : '';
-  if (!q) { _hindsightReflectError = 'Enter a question'; _renderHindsight(); return; }
+  if (!q) { _hindsightReflectError = t('hindsight_question_required'); _renderHindsight(); return; }
   _hindsightReflectQuery = q;
   _hindsightReflectLoading = true; _hindsightReflectError = ''; _renderHindsight();
   try {
@@ -5488,7 +5488,7 @@ async function retainHindsight() {
   const ctxEl = $('hindsightRetainContext');
   const errEl = $('hindsightRetainError');
   const content = contentEl ? contentEl.value.trim() : '';
-  if (!content) { if (errEl) { errEl.textContent = 'Content is required'; errEl.style.display=''; } return; }
+  if (!content) { if (errEl) { errEl.textContent = t('hindsight_content_required'); errEl.style.display=''; } return; }
   const context = ctxEl ? ctxEl.value.trim() : '';
   const btn = $('hindsightRetainBtn');
   if (btn) btn.disabled = true;
@@ -5497,7 +5497,7 @@ async function retainHindsight() {
     await api('/api/hindsight/retain', { method: 'POST', body: JSON.stringify({ content, context }) });
     if (contentEl) contentEl.value = '';
     if (ctxEl) ctxEl.value = '';
-    showToast('Saved to Hindsight');
+    showToast(t('hindsight_saved'));
     _hindsightMemories = [];
     loadHindsightMemories(true);
   } catch (e) {
@@ -5528,7 +5528,7 @@ function _renderHindsight() {
   else statusBadge = `<span class="detail-badge">${esc(t('hindsight_checking'))}</span>`;
   let hintHtml = '';
   if (!enabled) {
-    const hint = (hs && hs.hint) || 'Set memory.provider to hindsight and configure HINDSIGHT_API_KEY. Run: hermes memory setup';
+    const hint = (hs && hs.hint) || t('hindsight_disabled_hint') + ' Run: hermes memory setup';
     hintHtml = `<div class="memory-detail-mtime" style="color:var(--warning)">${esc(hint)}</div><div class="memory-detail-mtime">API: ${esc(apiUrl || '—')} · Bank: ${esc(bankId)}</div>`;
   } else {
     const total = hs && hs.total_memories != null ? `${hs.total_memories} memories` : (_hindsightMemoriesTotal ? `${_hindsightMemoriesTotal} memories` : '');
@@ -5537,7 +5537,7 @@ function _renderHindsight() {
     if (hs && hs.hint) hintHtml += `<div class="memory-detail-mtime">${esc(hs.hint)}</div>`;
   }
   if (!enabled) {
-    body.innerHTML = `<div class="main-view-content"><div class="memory-detail-mtime" style="display:flex;align-items:center;gap:8px">${li('eye',16)} Hindsight — long-term memory ${statusBadge}</div>${hintHtml}<div class="memory-empty" style="margin-top:12px">${esc(_memorySectionEmpty(_memorySectionMeta('hindsight')))}</div><div class="detail-form-row" style="margin-top:12px"><button class="btn-secondary" onclick="loadHindsightStatus(true).then(()=>_renderHindsight())">${li('refresh-cw',12)} Recheck</button></div></div>`;
+    body.innerHTML = `<div class="main-view-content"><div class="memory-detail-mtime" style="display:flex;align-items:center;gap:8px">${li('eye',16)} ${esc(t('hindsight'))} — long-term memory ${statusBadge}</div>${hintHtml}<div class="memory-empty" style="margin-top:12px">${esc(_memorySectionEmpty(_memorySectionMeta('hindsight')))}</div><div class="detail-form-row" style="margin-top:12px"><button class="btn-secondary" onclick="loadHindsightStatus(true).then(()=>_renderHindsight())">${li('refresh-cw',12)} ${esc(t('hindsight_recheck'))}</button></div></div>`;
     body.style.display=''; if(empty) empty.style.display='none'; _memoryMode='read'; _setMemoryHeaderButtons('read'); return;
   }
   const recallError = _hindsightError ? `<div class="detail-form-error">${esc(_hindsightError)}</div>` : '';
@@ -5550,57 +5550,60 @@ function _renderHindsight() {
         const ctx = r.context ? `<em>${esc(r.context)}</em>` : '';
         return `<div class="notes-result-card" style="cursor:default;text-align:left"><strong>${esc((r.text||'').slice(0,280))}${(r.text||'').length>280?'…':''}</strong><span style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:4px">${typ} ${tags} ${when?`${li('clock',10)} ${esc(when)}`:''} ${ctx?`· ${ctx}`:''}</span></div>`;
       }).join('')}</div><div class="memory-detail-mtime">${_hindsightResults.length} results${_hindsightLastElapsed ? ` · ${Math.round(_hindsightLastElapsed)}ms` : ''}${_hindsightLastQuery ? ` for "${esc(_hindsightLastQuery)}"` : ''}</div>`
-    : (_hindsightLastQuery && !_hindsightLoading ? `<div class="memory-empty">No results for "${esc(_hindsightLastQuery)}"</div>` : `<div class="memory-empty">Search your long-term memory — e.g. “how is hindsight deployed?”</div>`);
+    : (_hindsightLastQuery && !_hindsightLoading ? `<div class="memory-empty">No results for "${esc(_hindsightLastQuery)}"</div>` : `<div class="memory-empty">${esc(t('hindsight_search_empty'))}</div>`);
   const reflectError = _hindsightReflectError ? `<div class="detail-form-error">${esc(_hindsightReflectError)}</div>` : '';
   const reflectLoading = _hindsightReflectLoading ? `<div class="memory-detail-mtime">${li('loader',12)} reflecting…</div>` : '';
+  // Hindsight reflect text is rendered as markdown (same trust boundary as LLM output).
+  // The backing bank is profile-scoped and server-proxied; treat stored memories as
+  // semi-trusted and avoid rendering raw HTML from upstream without escaping.
   const reflectHtml = _hindsightReflectText
     ? `<div class="memory-content preview-md" style="margin-top:8px">${renderMd(_hindsightReflectText)}</div>`
     : (_hindsightReflectQuery && !_hindsightReflectLoading ? `<div class="memory-empty">No answer yet</div>` : '');
   const memLoading = _hindsightMemoriesLoading ? `<div class="memory-detail-mtime">${li('loader',12)} loading…</div>` : '';
   const memList = _hindsightMemories.length
-    ? `<div style="margin-top:8px">${_hindsightMemories.map(m=>{ const d=m.created_at?new Date(m.created_at).toLocaleDateString():''; return `<div class="notes-result-card" style="cursor:default;text-align:left"><strong>${esc((m.text||'').slice(0,220))}${(m.text||'').length>220?'…':''}</strong><span>${esc(m.type||'')}${m.type&&d?' · ':''}${esc(d)}${m.tags&&m.tags.length?` · ${esc(m.tags.slice(0,3).join(', '))}`:''}</span></div>`; }).join('')}</div><div class="memory-detail-mtime">${_hindsightMemoriesTotal || _hindsightMemories.length} total · <button class="btn-secondary" style="padding:2px 8px;font-size:11px" onclick="loadHindsightMemories(true)">${li('refresh-cw',10)} refresh</button></div>`
-    : (memLoading || `<div class="memory-empty">No recent memories yet — retain something below.</div>`);
-  const authNote = `<div class="memory-detail-mtime" style="opacity:.7">Uses Hermes auth — server proxies to <code>${esc(host)}</code> with your profile’s HINDSIGHT_API_KEY. <a href="#" onclick="event.preventDefault(); loadHindsightStatus(true).then(()=>_renderHindsight())" style="color:var(--accent)">recheck</a> · <a href="#" onclick="event.preventDefault(); loadHindsightMemories(true)" style="color:var(--accent)">reload recent</a></div>`;
+    ? `<div style="margin-top:8px">${_hindsightMemories.map(m=>{ const d=m.created_at?new Date(m.created_at).toLocaleDateString():''; return `<div class="notes-result-card" style="cursor:default;text-align:left"><strong>${esc((m.text||'').slice(0,220))}${(m.text||'').length>220?'…':''}</strong><span>${esc(m.type||'')}${m.type&&d?' · ':''}${esc(d)}${m.tags&&m.tags.length?` · ${esc(m.tags.slice(0,3).join(', '))}`:''}</span></div>`; }).join('')}</div><div class="memory-detail-mtime">${_hindsightMemoriesTotal || _hindsightMemories.length} total · <button class="btn-secondary" style="padding:2px 8px;font-size:11px" onclick="loadHindsightMemories(true)">${li('refresh-cw',10)} ${esc(t('hindsight_refresh'))}</button></div>`
+    : (memLoading || `<div class="memory-empty">${esc(t('hindsight_no_recent'))}</div>`);
+  const authNote = `<div class="memory-detail-mtime" style="opacity:.7">${esc(t('hindsight_auth_note'))} <code>${esc(host)}</code>. <a href="#" onclick="event.preventDefault(); loadHindsightStatus(true).then(()=>_renderHindsight())" style="color:var(--accent)">${esc(t('hindsight_recheck'))}</a> · <a href="#" onclick="event.preventDefault(); loadHindsightMemories(true)" style="color:var(--accent)">${esc(t('hindsight_refresh'))}</a></div>`;
   body.innerHTML = `<div class="main-view-content">
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">${li('eye',16)} <strong>Hindsight</strong> ${statusBadge}</div>
     ${hintHtml}
     ${authNote}
     <section class="notes-source-card" style="margin-top:12px">
-      <div class="notes-source-card-head"><strong>${li('search',14)} Recall</strong><span class="detail-badge">${esc(bankId)}</span></div>
+      <div class="notes-source-card-head"><strong>${li('search',14)} ${esc(t('hindsight_recall'))}</strong><span class="detail-badge">${esc(bankId)}</span></div>
       <form class="notes-search-form" onsubmit="event.preventDefault(); recallHindsight();" style="display:flex;gap:8px;align-items:center">
-        <input id="hindsightRecallQuery" aria-label="Search Hindsight memories" type="search" placeholder="Search memories — e.g. proxmox, airbnb, tunnels" maxlength="4000" style="flex:1 1 200px" value="${esc(_hindsightLastQuery)}" />
+        <input id="hindsightRecallQuery" aria-label="${esc(t('hindsight_recall_aria'))}" type="search" placeholder="${esc(t('hindsight_search_placeholder'))}" maxlength="4000" style="flex:1 1 200px" value="${esc(_hindsightLastQuery)}" />
         <label class="sr-only" for="hindsightRecallBudget">Recall budget</label>
         <select id="hindsightRecallBudget" aria-label="Recall budget">
           <option value="low" ${(_memoryData && _memoryData.hindsight_budget)==='low'?'selected':''}>low</option>
           <option value="mid" ${(!_memoryData || _memoryData.hindsight_budget==='mid' || !_memoryData.hindsight_budget)?'selected':''}>mid</option>
           <option value="high" ${(_memoryData && _memoryData.hindsight_budget)==='high'?'selected':''}>high</option>
         </select>
-        <button type="submit" class="btn-secondary" ${_hindsightLoading?'disabled':''}>${_hindsightLoading?li('loader',12)+' Searching': 'Search'}</button>
+        <button type="submit" class="btn-secondary" ${_hindsightLoading?'disabled':''}>${_hindsightLoading?li('loader',12)+' '+esc(t('hindsight_recall')): esc(t('hindsight_recall'))}</button>
       </form>
       ${recallError}${recallLoading}${recallResultsHtml}
     </section>
     <section class="notes-source-card">
-      <div class="notes-source-card-head"><strong>${li('sparkles',14)} Reflect</strong><span class="detail-badge">synthesis</span></div>
+      <div class="notes-source-card-head"><strong>${li('sparkles',14)} ${esc(t('hindsight_reflect'))}</strong><span class="detail-badge">${esc(t('hindsight_synthesis'))}</span></div>
       <form class="notes-search-form" onsubmit="event.preventDefault(); reflectHindsight();" style="display:flex;gap:8px;align-items:center">
-        <input id="hindsightReflectQuery" aria-label="Ask Hindsight" type="search" placeholder="Ask Hindsight — e.g. What did we decide about kanban?" maxlength="4000" style="flex:1 1 200px" value="${esc(_hindsightReflectQuery)}" />
-        <button type="submit" class="btn-secondary" ${_hindsightReflectLoading?'disabled':''}>${_hindsightReflectLoading?li('loader',12)+' Reflecting':'Reflect'}</button>
+        <input id="hindsightReflectQuery" aria-label="${esc(t('hindsight_reflect_aria'))}" type="search" placeholder="${esc(t('hindsight_reflect_placeholder'))}" maxlength="4000" style="flex:1 1 200px" value="${esc(_hindsightReflectQuery)}" />
+        <button type="submit" class="btn-secondary" ${_hindsightReflectLoading?'disabled':''}>${_hindsightReflectLoading?li('loader',12)+' '+esc(t('hindsight_reflect')): esc(t('hindsight_reflect'))}</button>
       </form>
       ${reflectError}${reflectLoading}${reflectHtml}
     </section>
     <section class="notes-source-card">
-      <div class="notes-source-card-head"><strong>${li('clock',14)} Recent memories</strong><button class="btn-secondary" style="padding:2px 8px;font-size:11px" onclick="loadHindsightMemories(true)">${li('refresh-cw',10)} refresh</button></div>
+      <div class="notes-source-card-head"><strong>${li('clock',14)} ${esc(t('hindsight_recent'))}</strong><button class="btn-secondary" style="padding:2px 8px;font-size:11px" onclick="loadHindsightMemories(true)">${li('refresh-cw',10)} ${esc(t('hindsight_refresh'))}</button></div>
       ${memList}
     </section>
     <section class="notes-source-card">
-      <div class="notes-source-card-head"><strong>${li('save',14)} Retain</strong><span class="detail-badge">store</span></div>
+      <div class="notes-source-card-head"><strong>${li('save',14)} ${esc(t('hindsight_retain'))}</strong><span class="detail-badge">${esc(t('hindsight_store'))}</span></div>
       <div class="detail-form-row" style="margin:0">
-        <textarea id="hindsightRetainContent" aria-label="Memory content" rows="3" maxlength="20000" placeholder="New memory — e.g. Keith prefers concise diffs, or the .11 host holds..." style="width:100%"></textarea>
+        <textarea id="hindsightRetainContent" aria-label="${esc(t('hindsight_content_aria'))}" rows="3" maxlength="20000" placeholder="New memory — e.g. Keith prefers concise diffs, or the .11 host holds..." style="width:100%"></textarea>
       </div>
       <div class="detail-form-row" style="margin-top:8px">
-        <input id="hindsightRetainContext" aria-label="Memory context (optional)" type="text" maxlength="4000" placeholder="Context (optional) — e.g. user preference" style="width:100%" />
+        <input id="hindsightRetainContext" aria-label="${esc(t('hindsight_context_aria'))}" type="text" maxlength="4000" placeholder="Context (optional) — e.g. user preference" style="width:100%" />
       </div>
       <div id="hindsightRetainError" class="detail-form-error" style="display:none"></div>
-      <div style="margin-top:8px;display:flex;justify-content:flex-end"><button id="hindsightRetainBtn" class="btn-secondary" onclick="retainHindsight()">${li('plus',12)} Save to Hindsight</button></div>
+      <div style="margin-top:8px;display:flex;justify-content:flex-end"><button id="hindsightRetainBtn" class="btn-secondary" onclick="retainHindsight()">${li('plus',12)} ${esc(t('hindsight_retain'))}</button></div>
     </section>
   </div>`;
   const restoredContent = $('hindsightRetainContent');
