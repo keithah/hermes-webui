@@ -371,3 +371,75 @@ console.log(JSON.stringify({
     assert rendered == {"singular": "Source", "plural": "Sources (5)", "remove": "Remove Slack"}
     assert "[object Object]" not in json.dumps(rendered)
     assert "NaN" not in json.dumps(rendered)
+
+
+def test_effective_sidebar_origin_resolves_missing_ancestor_via_fallback_lookup(monkeypatch):
+    """#6985 review round 2, item 3: the missing-ancestor branch in
+    `_effective_sidebar_origin` was comment-only (documented a state.db
+    fallback lookup, then `break`d immediately without calling it) — a
+    child whose external parent fell outside this request's loaded scope
+    (paged out, archived-and-excluded, etc.) always fell back to its own
+    (webui) classification instead of inheriting the real external origin.
+
+    This exercises the actual composed endpoint (`_build_session_list_cache_payload`),
+    not just the helper in isolation: the child's parent is deliberately
+    absent from every list the payload builder sees, forcing the
+    `Session.load_metadata_only` fallback path, and asserts the sidebar
+    source filter correctly reveals/hides the child based on the
+    looked-up ancestor's origin rather than the child's own.
+    """
+    import types
+    import api.routes as routes
+
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda **_kwargs: [])
+
+    child_row = {
+        "session_id": "child-of-ghost",
+        "parent_session_id": "ghost-parent-outside-scope",
+        "message_count": 1,
+        "project_id": None,
+        "profile": "default",
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [child_row])
+
+    ghost_parent = types.SimpleNamespace(
+        session_origin=None,
+        source_tag="matrix",
+        raw_source=None,
+        source=None,
+        platform=None,
+        source_label=None,
+        session_source=None,
+        is_cli_session=False,
+        parent_session_id=None,
+    )
+
+    def _fake_load_metadata_only(pid):
+        assert pid == "ghost-parent-outside-scope"
+        return ghost_parent
+
+    monkeypatch.setattr(routes.Session, "load_metadata_only", staticmethod(_fake_load_metadata_only))
+
+    matrix_payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        show_matrix_sessions=True,
+        sidebar_source="matrix",
+    )
+    assert [s["session_id"] for s in matrix_payload["sessions"]] == ["child-of-ghost"]
+
+    webui_payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        show_matrix_sessions=True,
+        sidebar_source="webui",
+    )
+    assert [s["session_id"] for s in webui_payload["sessions"]] == []
