@@ -7935,9 +7935,23 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
     _sessionSourceFilter='webui';
   }
   const selectedOrigins=new Set(activeSourceFilters);
-  const sourceRowsById=new Map(allMatched.filter(Boolean).map(s=>[s.session_id,s]));
+  // Keyed by (profile, session_id), not a bare id: an all-profiles aggregate
+  // payload mixes rows from every profile, and a session id can collide
+  // across profiles (#6985 round 4 — mirrors api/routes.py's
+  // _effective_session_by_id fix). ' ' can't appear in a profile name
+  // or session id, so it's a safe composite-key separator.
+  const _rowProfileKey=s=>(s&&typeof s.profile==='string'&&s.profile.trim())||'default';
+  const _rowLineageKey=(profile,sid)=>profile+' '+sid;
+  const sourceRowsById=new Map(
+    allMatched.filter(Boolean).map(s=>[_rowLineageKey(_rowProfileKey(s),s.session_id),s])
+  );
   const effectiveOrigin=s=>{
     if(!s) return _sessionOrigin(s);
+    // The row's OWN profile scopes its entire lineage walk — a delegated
+    // subagent's ancestor chain stays within the profile that owns the
+    // child, regardless of which profile is currently active (an
+    // all-profiles view mixes every profile in one render pass).
+    const profile=_rowProfileKey(s);
     let cur=s;
     const visited=new Set();
     for(let i=0;i<16;i++){
@@ -7948,12 +7962,22 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
       // stopping here, same as the 'webui' default.
       if(origin!=='webui'&&origin!=='subagent') return origin;
       const pid=cur&&cur.parent_session_id?String(cur.parent_session_id):'';
-      if(!pid||visited.has(pid)) break;
+      if(!pid||visited.has(pid)){break;}
       visited.add(pid);
-      const parent=sourceRowsById.get(pid);
-      if(!parent) break;
-      if(!_isChildSession(cur)) break;
+      const parent=sourceRowsById.get(_rowLineageKey(profile,pid));
+      if(!parent){break;}
+      if(!_isChildSession(cur)){break;}
       cur=parent;
+      if(i===15){
+        // The loop's own counter is about to end the walk after this hop
+        // without ever classifying the ancestor it just resolved (#6985
+        // round 4: a definitive external origin reached exactly on the
+        // last permitted hop was silently dropped to the 'webui' fallback
+        // below). Give it the one classification check it's owed, same
+        // rule as every other hop, still bounded to exactly 16 total.
+        const finalOrigin=_sessionOrigin(cur);
+        if(finalOrigin!=='webui'&&finalOrigin!=='subagent') return finalOrigin;
+      }
     }
     // Chain exhausted the 16-hop bound, hit a cycle, or the ancestor was
     // unresolvable: every origin seen along the walk was itself a

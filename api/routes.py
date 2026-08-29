@@ -2577,33 +2577,61 @@ def _build_session_list_cache_payload(
     )
     archived_count = archived_webui_count + archived_cli_count
     full_scoped_all_sources = archived_scoped if include_archived else visible_scoped
+
+    def _canonical_row_profile(raw) -> str:
+        """Normalize a row's ``profile`` field to a stable map/cache key.
+
+        Mirrors ``_profiles_match``'s equivalence rules (missing/blank ->
+        'default', any renamed-root alias -> 'default') so two rows that
+        ``_profiles_match`` would treat as the same profile always share one
+        lineage-map/cache key, while two rows from genuinely different
+        profiles never collide on a bare session id (#6985 round 4: an
+        ``all_profiles=True`` payload mixes rows from every profile, and a
+        session id existing in more than one profile's state.db must not let
+        one profile's origin leak into another's child).
+        """
+        name = str(raw or "").strip() or "default"
+        return "default" if _is_root_profile(name) else name
+
     # ── Effective origin: walk parent chain (bounded, cycle-safe) ──────
     # Build profile-scoped map before filtering so children can resolve to
-    # external parents even when the parent row is archived/hidden.
-    _effective_session_by_id: dict[str, dict] = {}
+    # external parents even when the parent row is archived/hidden. Keyed by
+    # (profile, session_id) — see _canonical_row_profile — never bare id.
+    _effective_session_by_id: dict[tuple[str, str], dict] = {}
     for _s in scoped:  # scoped is profile-scoped merged before messaging dedupe
         _sid = str(_s.get("session_id") or "").strip()
         if _sid:
-            _effective_session_by_id[_sid] = _s
+            _effective_session_by_id[(_canonical_row_profile(_s.get("profile")), _sid)] = _s
     for _s in full_scoped_all_sources:
         _sid = str(_s.get("session_id") or "").strip()
-        if _sid and _sid not in _effective_session_by_id:
-            _effective_session_by_id[_sid] = _s
+        _key = (_canonical_row_profile(_s.get("profile")), _sid)
+        if _sid and _key not in _effective_session_by_id:
+            _effective_session_by_id[_key] = _s
     # Also include archived rows in map so grandchild can reach grandparent.
     for _s in archived_scoped:
         _sid = str(_s.get("session_id") or "").strip()
-        if _sid and _sid not in _effective_session_by_id:
-            _effective_session_by_id[_sid] = _s
+        _key = (_canonical_row_profile(_s.get("profile")), _sid)
+        if _sid and _key not in _effective_session_by_id:
+            _effective_session_by_id[_key] = _s
 
     # Memoizes _effective_origin_fallback_lookup() results, INCLUDING misses
     # (None), so a sidebar with many children whose ancestor sits outside
     # this request's loaded scope queries that ancestor id at most once,
-    # regardless of how many descendants' walks pass through it.
-    _origin_fallback_cache: dict[str, object | None] = {}
+    # regardless of how many descendants' walks pass through it. Keyed by
+    # (profile, pid) for the same cross-profile-collision reason as above.
+    _origin_fallback_cache: dict[tuple[str, str], object | None] = {}
 
-    def _effective_origin_fallback_lookup(pid: str):
+    def _effective_origin_fallback_lookup(pid: str, profile: str):
         """One bounded, profile-scoped read for a lineage ancestor the
         request's own visible/archived scope didn't include.
+
+        ``profile`` is the OWNING row's own canonical profile (#6985 round
+        4), not the request's active_profile — an all_profiles=True payload
+        mixes rows from every profile, and resolving a profile-B child's
+        missing ancestor against profile A's state.db could silently borrow
+        A's taxonomy (or a same-id ancestor that happens to exist in both
+        profiles with different origins) instead of correctly resolving
+        within B.
 
         Tries the WebUI sidecar first (Session.load_metadata_only() — compact
         metadata prefix only, no messages) since it's the cheaper local read
@@ -2613,24 +2641,45 @@ def _build_session_list_cache_payload(
         as unresolvable and fall back to the child's own webui/subagent
         placeholder, the exact defect #6985 review round 3 flagged. When the
         sidecar misses, falls back to a bounded state.db row read scoped to
-        the SAME profile this payload was built for (never cross-profile).
-        Any failure (missing file/row, unreadable data) fails closed to None.
+        ``profile`` (never a different profile). Any failure (missing
+        file/row, unreadable data) fails closed to None.
         """
-        if pid in _origin_fallback_cache:
-            return _origin_fallback_cache[pid]
+        cache_key = (profile, pid)
+        if cache_key in _origin_fallback_cache:
+            return _origin_fallback_cache[cache_key]
         result = None
         try:
             result = Session.load_metadata_only(pid)
         except Exception:
             result = None
+        if result is not None and _canonical_row_profile(getattr(result, "profile", None)) != profile:
+            # The sidecar exists but belongs to a DIFFERENT profile than the
+            # one this walk is scoped to (a session id can collide across
+            # profiles) — that hit is not authoritative for this lookup,
+            # fall through to the profile-scoped state.db read instead of
+            # letting a foreign profile's sidecar answer for this profile.
+            result = None
         if result is None:
-            result = _state_db_lineage_lookup(pid, active_profile)
-        _origin_fallback_cache[pid] = result
+            # Always pass the row's own canonical profile explicitly, INCLUDING
+            # "default" — _state_db_lineage_lookup resolves a named profile
+            # via _get_profile_home(), which answers for that profile
+            # regardless of which profile happens to be globally active.
+            # Passing None here (rather than the literal "default") would
+            # route through _active_state_db_path() instead and reopen the
+            # exact cross-profile leak the round-3 fix closed, for the one
+            # profile whose canonical name is "default".
+            result = _state_db_lineage_lookup(pid, profile)
+        _origin_fallback_cache[cache_key] = result
         return result
 
     def _effective_sidebar_origin(session: dict) -> str:
         if not isinstance(session, dict):
             return "other"
+        # The row's OWN profile scopes its entire lineage walk (#6985 round
+        # 4) — a delegated subagent's ancestor chain stays within the
+        # profile that owns the child, regardless of which profile is
+        # "active" for this request (all_profiles=True mixes every profile).
+        profile = _canonical_row_profile(session.get("profile"))
         visited: set[str] = set()
         cur: dict | None = session
         for _ in range(16):
@@ -2645,13 +2694,14 @@ def _build_session_list_cache_payload(
             if not pid or pid in visited:
                 break
             visited.add(pid)
-            parent = _effective_session_by_id.get(pid)
+            parent = _effective_session_by_id.get((profile, pid))
             if parent is None:
                 # Parent not in the visible/archived scoped set (e.g. paged
                 # out, or excluded from this request's window) — one bounded
                 # sidecar-or-state.db read for just this id (memoized on
-                # both hit and miss — see _effective_origin_fallback_lookup).
-                parent_obj = _effective_origin_fallback_lookup(pid)
+                # both hit and miss — see _effective_origin_fallback_lookup),
+                # scoped to THIS row's own profile.
+                parent_obj = _effective_origin_fallback_lookup(pid, profile)
                 if parent_obj is None:
                     break
                 parent = {
@@ -2664,9 +2714,22 @@ def _build_session_list_cache_payload(
                     "session_source": getattr(parent_obj, "session_source", None),
                     "is_cli_session": getattr(parent_obj, "is_cli_session", None),
                     "parent_session_id": getattr(parent_obj, "parent_session_id", None),
+                    "profile": profile,
                 }
-                _effective_session_by_id[pid] = parent
+                _effective_session_by_id[(profile, pid)] = parent
             cur = parent
+        else:
+            # The for loop completed all 16 hops without ever breaking or
+            # returning — the ancestor resolved on the very last permitted
+            # hop was assigned to `cur` but never classified (#6985 round 4:
+            # a definitive external origin reached exactly at the bound was
+            # being silently dropped to the webui fallback below). Give it
+            # the one classification check it's owed before giving up, same
+            # rule as every other hop, still bounded to exactly 16 total.
+            if isinstance(cur, dict):
+                origin = _sidebar_session_origin(cur)
+                if origin != "webui":
+                    return origin
         # Chain exhausted the 16-hop bound, hit a cycle, or the ancestor was
         # unresolvable even via the state.db fallback: every origin seen
         # along the walk was itself a placeholder (webui, or an explicit-
