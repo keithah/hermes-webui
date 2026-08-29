@@ -5070,6 +5070,10 @@ _available_models_cache_source_fingerprint: dict | None = None
 _AVAILABLE_MODELS_CACHE_TTL: float = 86400.0  # 24 hours
 _SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = 300.0
 _available_models_cache_lock = threading.RLock()
+# Generation bumped by invalidate_models_cache() so a detached rebuild
+# (models-catalog-rebuild thread) that started before invalidation can
+# detect it and discard its stale publish.
+_available_models_cache_generation: int = 0
 
 # Provider auth-status enumeration cache. ``list_available_providers()``
 # (core) probes EVERY known provider's credential source serially — AWS IMDS
@@ -5081,7 +5085,8 @@ _available_models_cache_lock = threading.RLock()
 # the next rebuild does not keep serving the old snapshot for the rest of
 # the TTL. The caller still re-checks ``get_auth_status`` per authenticated
 # provider below.
-_PROVIDER_ENUM_CACHE: dict[str, tuple[float, list]] = {}
+_PROVIDER_ENUM_CACHE: collections.OrderedDict[str, tuple[float, list]] = collections.OrderedDict()
+_PROVIDER_ENUM_CACHE_MAX_ENTRIES = 64
 _PROVIDER_ENUM_CACHE_INFLIGHT: dict[str, threading.Event] = {}
 _PROVIDER_ENUM_CACHE_TTL_SECONDS = 120.0
 _PROVIDER_ENUM_CACHE_LOCK = threading.Lock()
@@ -5124,6 +5129,11 @@ def _list_available_providers_cached(profile_key: str) -> list:
             now = time.monotonic()
             hit = _PROVIDER_ENUM_CACHE.get(profile_key)
             if hit is not None and now - hit[0] < _PROVIDER_ENUM_CACHE_TTL_SECONDS:
+                # LRU: promote hit to most-recently-used.
+                try:
+                    _PROVIDER_ENUM_CACHE.move_to_end(profile_key)
+                except KeyError:
+                    pass
                 return copy.deepcopy(hit[1])
             wait_for = _PROVIDER_ENUM_CACHE_INFLIGHT.get(profile_key)
             if wait_for is None:
@@ -5136,8 +5146,9 @@ def _list_available_providers_cached(profile_key: str) -> list:
         if not am_owner:
             # A different caller owns this profile's cold refresh.  Do not
             # hold the cache lock while waiting; unrelated profiles remain
-            # independent.
-            wait_for.wait()
+            # independent. Bounded wait (30s) so a hung owner probe cannot
+            # wedge followers forever — on timeout we re-loop to re-contend.
+            wait_for.wait(timeout=30)
             continue
 
         try:
@@ -5161,6 +5172,9 @@ def _list_available_providers_cached(profile_key: str) -> list:
             # drops inflight waiters.  Do not republish the stale probe.
             if epoch == _PROVIDER_ENUM_CACHE_EPOCH:
                 _PROVIDER_ENUM_CACHE[profile_key] = (completed_at, copy.deepcopy(result))
+                _PROVIDER_ENUM_CACHE.move_to_end(profile_key)
+                while len(_PROVIDER_ENUM_CACHE) > _PROVIDER_ENUM_CACHE_MAX_ENTRIES:
+                    _PROVIDER_ENUM_CACHE.popitem(last=False)
             # Identity-owned cleanup: only the caller whose exact event is
             # still installed may pop/signal it.  If an invalidation retired
             # our event and a newer owner installed its own, popping/signaling
@@ -6590,11 +6604,13 @@ def invalidate_models_cache():
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
     global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
+    global _available_models_cache_generation
     with _available_models_cache_lock:
         _available_models_cache = None
         _available_models_cache_ts = 0.0
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
+        _available_models_cache_generation += 1
         _sync_models_cache_provenance()
         _cache_build_in_progress = False
         _cache_build_cv.notify_all()
@@ -6608,10 +6624,15 @@ def invalidate_models_cache():
         # rebuild that lands between the two clears could otherwise reuse the
         # pre-credential-change enumeration and publish a catalog missing the
         # newly authenticated provider. Lock order stays outer→provider,
-        # matching the cold build path (get_available_models holds the outer
-        # lock while calling _list_available_providers_cached). The captured
-        # in-flight events are woken only after BOTH locks are released so
-        # waiters re-check the now-empty cache without nested acquisitions.
+        # matching the legacy synchronous cold build path (get_available_models
+        # holds the outer lock while calling _list_available_providers_cached).
+        # The bounded (default) path uses a detached `models-catalog-rebuild`
+        # thread that does NOT hold the outer RLock, so its publish is also
+        # guarded by _available_models_cache_generation — an invalidation
+        # bumps the generation and the stale publish is discarded.
+        # The captured in-flight events are woken only after BOTH locks are
+        # released so waiters re-check the now-empty cache without nested
+        # acquisitions.
         with _PROVIDER_ENUM_CACHE_LOCK:
             pending_provider_enum = _clear_provider_enum_cache_locked()
     for _event in pending_provider_enum:
@@ -8544,6 +8565,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # Cold path: full rebuild — only one thread reaches here at a time
         with _cache_build_cv:
             _cache_build_in_progress = True
+            _build_generation = _available_models_cache_generation
 
         # Capture the active per-request profile (#3957). The live provider
         # probe inside the rebuild resolves credentials from os.environ /
@@ -8588,12 +8610,25 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     _cache_build_cv.notify_all()
                 raise
             with _cache_build_cv:
-                published_at = time.monotonic()
-                _available_models_cache = result
-                _available_models_cache_ts = published_at
-                _available_models_live_rebuild_ts = published_at
-                _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
-                _sync_models_cache_provenance()
+                if _build_generation != _available_models_cache_generation:
+                    # Catalog was invalidated while we built — discard stale
+                    # result so next caller does a fresh rebuild.
+                    _cache_build_in_progress = False
+                    _cache_build_cv.notify_all()
+                else:
+                    published_at = time.monotonic()
+                    _available_models_cache = result
+                    _available_models_cache_ts = published_at
+                    _available_models_live_rebuild_ts = published_at
+                    _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+                    _sync_models_cache_provenance()
+            if _build_generation != _available_models_cache_generation:
+                # Don't write stale catalog to disk either.
+                with _cache_build_cv:
+                    pass  # flag already cleared above
+                # Fall through to fresh-build fallback on next call; return
+                # stale to this caller would re-pollute caches.
+                return copy.deepcopy(result)
             try:
                 _save_models_cache_to_disk(result)
             finally:
@@ -8636,6 +8671,10 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             global _available_models_cache_ts, _available_models_live_rebuild_ts
             global _available_models_cache_source_fingerprint
             with _cache_build_cv:
+                if _build_generation != _available_models_cache_generation:
+                    _cache_build_in_progress = False
+                    _cache_build_cv.notify_all()
+                    return
                 published_at = time.monotonic()
                 _available_models_cache = result
                 _available_models_cache_ts = published_at
