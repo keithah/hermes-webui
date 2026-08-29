@@ -11242,15 +11242,32 @@ def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None
         for key, value in dict(session).items()
         if key in _SIDEBAR_SESSION_RESPONSE_FIELDS
     }
-    if "profile" in item:
-        # Normalize before the wire, not just for the server's own lineage
-        # map — see _canonical_row_profile's docstring (#6985 round 4).
-        item["profile"] = _canonical_row_profile(item.get("profile"))
+    _add_profile_lineage_key(item)
     if isinstance(item.get("title"), str):
         item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
     _redact_sidebar_title_fields(item, redact_enabled)
     item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
     return item
+
+
+def _add_profile_lineage_key(item: dict) -> None:
+    """Add the row's canonical, alias-folded profile as `profile_key`, in place.
+
+    #6985 round 4 needed the client to key cross-row lineage lookups
+    (`(profile, session_id)`) the same way the server does, so a renamed-root
+    profile's sessions still self-consistently resolve to their ancestors.
+    That fix originally OVERWROTE `item["profile"]` with the folded value —
+    which is also the field the detailed all-profiles UI displays as the
+    user's configured profile name/label, so a renamed root profile's rows
+    all showed literal "default" instead of the real name (round 5).
+    `profile` must stay untouched for display; `profile_key` is the
+    lineage-only value every consumer should key/compare on instead. Shared
+    by `_sidebar_session_response_item` (`/api/sessions`) and every
+    `/api/sessions/search` response branch so list and search rows for the
+    same session can never disagree on canonical lineage identity.
+    """
+    if "profile" in item:
+        item["profile_key"] = _canonical_row_profile(item.get("profile"))
 
 
 def _redact_sidebar_title_fields(item: dict, redact_enabled: bool | None = None) -> None:
@@ -18472,6 +18489,7 @@ def _handle_sessions_search(handler, parsed):
         safe_sessions = []
         for s in sessions:
             item = dict(s)
+            _add_profile_lineage_key(item)
             if isinstance(item.get("title"), str):
                 item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
             _redact_sidebar_title_fields(item, _search_redact_enabled)
@@ -18486,6 +18504,7 @@ def _handle_sessions_search(handler, parsed):
         title_match = q in (s.get("title") or "").lower()
         if title_match:
             item = dict(s, match_type="title")
+            _add_profile_lineage_key(item)
             if isinstance(item.get("title"), str):
                 item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
             _redact_sidebar_title_fields(item, _search_redact_enabled)
@@ -18504,6 +18523,7 @@ def _handle_sessions_search(handler, parsed):
                     c = _session_search_message_text(m)
                     if q in str(c).lower():
                         item = dict(s, match_type="content")
+                        _add_profile_lineage_key(item)
                         preview = _session_search_preview(c, q)
                         if preview:
                             item["match_preview"] = _redact_text(preview, _enabled=_search_redact_enabled)

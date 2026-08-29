@@ -7940,7 +7940,12 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   // across profiles (#6985 round 4 — mirrors api/routes.py's
   // _effective_session_by_id fix). ' ' can't appear in a profile name
   // or session id, so it's a safe composite-key separator.
-  const _rowProfileKey=s=>(s&&typeof s.profile==='string'&&s.profile.trim())||'default';
+  // #6985 round 5: read the server-computed canonical `profile_key`, never
+  // the display-only `profile` field — the server folds renamed-root
+  // aliases into `profile_key` alone so `profile` can keep showing the
+  // user's actual configured profile name. Fall back to `.profile` only for
+  // payloads that predate this field (defensive, not the normal path).
+  const _rowProfileKey=s=>(s&&typeof s.profile_key==='string'&&s.profile_key.trim())||(s&&typeof s.profile==='string'&&s.profile.trim())||'default';
   const _rowLineageKey=(profile,sid)=>profile+' '+sid;
   const sourceRowsById=new Map(
     allMatched.filter(Boolean).map(s=>[_rowLineageKey(_rowProfileKey(s),s.session_id),s])

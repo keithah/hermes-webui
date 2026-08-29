@@ -914,18 +914,17 @@ def test_effective_sidebar_origin_classifies_definitive_ancestor_reached_exactly
     ) == ["beyond_1"]
 
 
-def test_sidebar_response_item_normalizes_renamed_root_profile_alias(monkeypatch):
-    """The client's profile-scoped lineage map (static/sessions.js's
-    `_rowProfileKey`) only trims/defaults a row's raw `.profile` field — it
-    has no way to replicate the server's `_is_root_profile()` alias-folding
-    rule itself. If a renamed-root profile's raw alias string reached the
-    wire unnormalized, two rows the server treats as the same profile (one
-    tagged with the literal alias, one tagged 'default') would get different
-    client-side lineage-map keys, silently breaking cross-row ancestor
-    resolution for that profile on the client even though the server-side
-    walk resolves them identically. `_sidebar_session_response_item` must
-    normalize `profile` before it's ever serialized, so the client's naive
-    read is always already-canonical."""
+def test_sidebar_response_item_adds_profile_key_without_touching_display_profile(monkeypatch):
+    """#6985 round 5: round 4's fix needed a canonical, alias-folded key for
+    client-side lineage matching (`static/sessions.js`'s `_rowProfileKey` has
+    no way to replicate the server's `_is_root_profile()` alias-folding
+    itself), but it implemented this by OVERWRITING `item["profile"]` in
+    place — the same field the detailed all-profiles sidebar displays as the
+    user's configured profile name. A renamed-root profile's rows then all
+    showed literal "default" instead of the real name.
+
+    `_sidebar_session_response_item` must add a SEPARATE `profile_key` field
+    for lineage matching and leave `profile` exactly as given, for display."""
     import api.routes as routes
 
     monkeypatch.setattr(routes, "_is_root_profile", lambda name: name == "my-renamed-root")
@@ -941,7 +940,151 @@ def test_sidebar_response_item_normalizes_renamed_root_profile_alias(monkeypatch
         {"session_id": "s4", "profile": "genuinely-other-profile"}
     )
 
-    assert aliased["profile"] == "default"
+    # profile_key: canonical, alias-folded — for lineage matching only.
+    assert aliased["profile_key"] == "default"
+    assert literal_default["profile_key"] == "default"
+    assert blank["profile_key"] == "default"
+    assert other["profile_key"] == "genuinely-other-profile"
+
+    # profile: untouched — the user's actual configured name, for display.
+    assert aliased["profile"] == "my-renamed-root"
     assert literal_default["profile"] == "default"
-    assert blank["profile"] == "default"
+    assert blank["profile"] == ""
     assert other["profile"] == "genuinely-other-profile"
+
+
+def test_sessions_search_branches_emit_profile_key_like_the_list_endpoint():
+    """#6985 round 5: `_sidebar_session_response_item` (used by GET
+    /api/sessions) computes `profile_key`, but every /api/sessions/search
+    response branch built its row with a bare `dict(s)`/`dict(s,
+    match_type=...)` and never called the same normalization — search rows
+    for a renamed-root profile's session kept the raw alias while list rows
+    for the identical session carried the folded key, so a client merging
+    search results back into the sidebar (a content search) could see the
+    same session tagged with two different lineage keys depending on which
+    endpoint last touched it. Real endpoint invocation for both, not source
+    inspection, so this actually exercises the response bodies."""
+    import api.routes as routes
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from urllib.parse import urlparse
+
+    monkeypatch_target = routes  # readability
+    row = {
+        "session_id": "renamed-root-row",
+        "title": "hello world",
+        "profile": "my-renamed-root",
+        "message_count": 1,
+    }
+    captured = {}
+
+    def fake_j(handler, payload, status=200, extra_headers=None):
+        captured["payload"] = payload
+
+    with patch.object(monkeypatch_target, "_is_root_profile", lambda name: name == "my-renamed-root"), \
+         patch.object(monkeypatch_target, "all_sessions", return_value=[row]), \
+         patch.object(monkeypatch_target, "get_session", side_effect=lambda sid: SimpleNamespace(messages=[])), \
+         patch("api.profiles.get_active_profile_name", return_value="my-renamed-root"), \
+         patch.object(monkeypatch_target, "j", side_effect=fake_j):
+        # Empty-query branch (the "safe_sessions" list-like path).
+        routes._handle_sessions_search(SimpleNamespace(), urlparse("/api/sessions/search"))
+        list_item = routes._sidebar_session_response_item(dict(row))
+    search_item = captured["payload"]["sessions"][0]
+
+    assert search_item["profile_key"] == "default"
+    assert list_item["profile_key"] == "default"
+    assert search_item["profile_key"] == list_item["profile_key"]
+    # Neither endpoint clobbers the display value.
+    assert search_item["profile"] == "my-renamed-root"
+    assert list_item["profile"] == "my-renamed-root"
+
+
+def test_renamed_alias_child_still_finds_canonically_keyed_ancestor(
+    origin_fallback_env, monkeypatch,
+):
+    """#6985 round 5, requested control #2: a child row tagged with the RAW
+    renamed-root alias must still find its ancestor, whose on-disk profile
+    home the fallback lookup resolves via the CANONICAL profile key
+    (`_canonical_row_profile`) — never the raw alias string. This predates
+    round 5 (the lineage walk has scoped its fallback by the canonical
+    profile since round 4) but round 5's display-vs-lineage split must not
+    regress it, and the reviewer explicitly asked for this composed as its
+    own control."""
+    import api.routes as routes
+    from api.models import _get_profile_home
+
+    monkeypatch.setattr(routes, "_is_root_profile", lambda name: name == "my-renamed-root")
+
+    # The lineage walk scopes the fallback lookup by the CANONICAL profile
+    # (_canonical_row_profile), so the on-disk home it resolves is keyed by
+    # "default" regardless of which raw alias a row happens to carry — this
+    # is the mechanism under test: a parent whose home is only reachable via
+    # the canonical key must still be found for a child tagged with either
+    # spelling of the same profile.
+    _make_state_db_rows(
+        _get_profile_home("default") / "state.db",
+        [("external-parent", "matrix", None)],
+    )
+
+    child_row = {
+        "session_id": "child-tagged-with-alias",
+        "parent_session_id": "external-parent",
+        "message_count": 1,
+        "project_id": None,
+        # Child tagged with the RAW alias string — the reviewer's "one
+        # aliased, one literal" scenario: the parent's home is keyed by the
+        # canonical form ("default"), the child by the alias, and both must
+        # resolve to the one lineage group.
+        "profile": "my-renamed-root",
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [child_row])
+
+    # If the child's alias tag and the parent's canonically-keyed state.db
+    # home were treated as different profiles, this fallback lookup would
+    # never find the parent and the child would stay misclassified as webui.
+    assert _run_payload(
+        routes, child_row, active_profile="my-renamed-root", sidebar_source="matrix"
+    ) == ["child-tagged-with-alias"]
+
+
+def test_all_profiles_sidebar_displays_configured_name_not_default(monkeypatch):
+    """#6985 round 5, requested control #3: the detailed all-profiles
+    sidebar must keep showing the user's actual configured profile name for
+    a renamed-root profile's rows, not the literal string 'default' — the
+    exact visible-label regression round 4's follow-up commit introduced."""
+    import api.routes as routes
+
+    monkeypatch.setattr(routes, "_is_root_profile", lambda name: name == "my-company-workspace")
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda **_kwargs: [])
+
+    row = {
+        "session_id": "renamed-root-session",
+        "title": "hi",
+        "profile": "my-company-workspace",
+        "message_count": 1,
+        "project_id": None,
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [row])
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile="my-company-workspace",
+        all_profiles=True,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        show_matrix_sessions=True,
+    )
+    # _build_session_list_cache_payload returns the internal (pre-wire) row
+    # set; _session_list_payload_to_response is the actual serialization
+    # step (calls _sidebar_session_response_item per row) that produces what
+    # /api/sessions really sends — the detailed sidebar's `s.profile` read
+    # happens against THIS shape, not the internal one.
+    response = routes._session_list_payload_to_response(payload)
+    served = next(s for s in response["sessions"] if s["session_id"] == "renamed-root-session")
+
+    # The wire-level display field is untouched; only profile_key is folded.
+    assert served["profile"] == "my-company-workspace"
+    assert served["profile_key"] == "default"
