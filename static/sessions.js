@@ -7955,14 +7955,14 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
       if(!_isChildSession(cur)) break;
       cur=parent;
     }
-    // Fall back to the last resolved position, not the original argument:
-    // once the walk has moved past a subagent/webui hop, the original `s`
-    // no longer reflects the ancestor chain's own placeholder classification
-    // (e.g. s='subagent' but cur ended up 'webui' after walking to a plain
-    // parent) — returning _sessionOrigin(s) here would silently discard the
-    // walk and reintroduce the exact misclassification this function exists
-    // to resolve.
-    return _sessionOrigin(cur);
+    // Chain exhausted the 16-hop bound, hit a cycle, or the ancestor was
+    // unresolvable: every origin seen along the walk was itself a
+    // placeholder (webui/subagent). Return the single deterministic 'webui'
+    // sentinel rather than re-deriving from `cur` or `s` — either could, in
+    // an edge case, echo a non-standard explicit marker back out raw
+    // instead of the intended give-up value (mirrors the server-side
+    // fallback in api/routes.py's _effective_sidebar_origin, #6985 round 3).
+    return 'webui';
   };
   const selectedProfileFiltered=webuiProfileFiltered.concat(cliProfileFiltered).filter(s=>selectedOrigins.has(effectiveOrigin(s)));
   const selectedSessionsRaw=webuiSessionsRaw.concat(cliSessionsRaw).filter(s=>selectedOrigins.has(effectiveOrigin(s)));

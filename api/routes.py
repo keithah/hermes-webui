@@ -2595,22 +2595,38 @@ def _build_session_list_cache_payload(
         if _sid and _sid not in _effective_session_by_id:
             _effective_session_by_id[_sid] = _s
 
-    def _effective_origin_fallback_lookup(pid: str):
-        """One bounded, profile-scoped metadata-only read for a lineage
-        ancestor the request's own visible/archived scope didn't include.
+    # Memoizes _effective_origin_fallback_lookup() results, INCLUDING misses
+    # (None), so a sidebar with many children whose ancestor sits outside
+    # this request's loaded scope queries that ancestor id at most once,
+    # regardless of how many descendants' walks pass through it.
+    _origin_fallback_cache: dict[str, object | None] = {}
 
-        Session.load_metadata_only() reads only the compact metadata prefix
-        of that one sidecar file (no messages, no full session load) and is
-        already scoped to the active profile's SESSION_DIR — the same
-        primitive used for single-session lookups elsewhere in this module.
-        Any failure (missing file, unreadable sidecar) fails closed to None
-        so the caller falls back to the child's own origin, unchanged from
-        before this fallback existed.
+    def _effective_origin_fallback_lookup(pid: str):
+        """One bounded, profile-scoped read for a lineage ancestor the
+        request's own visible/archived scope didn't include.
+
+        Tries the WebUI sidecar first (Session.load_metadata_only() — compact
+        metadata prefix only, no messages) since it's the cheaper local read
+        when present. Delegated subagent ancestors (#5307) frequently have NO
+        sidecar at all — they ran server-side and only exist in the active
+        profile's state.db — so a sidecar-only lookup would misclassify them
+        as unresolvable and fall back to the child's own webui/subagent
+        placeholder, the exact defect #6985 review round 3 flagged. When the
+        sidecar misses, falls back to a bounded state.db row read scoped to
+        the SAME profile this payload was built for (never cross-profile).
+        Any failure (missing file/row, unreadable data) fails closed to None.
         """
+        if pid in _origin_fallback_cache:
+            return _origin_fallback_cache[pid]
+        result = None
         try:
-            return Session.load_metadata_only(pid)
+            result = Session.load_metadata_only(pid)
         except Exception:
-            return None
+            result = None
+        if result is None:
+            result = _state_db_lineage_lookup(pid, active_profile)
+        _origin_fallback_cache[pid] = result
+        return result
 
     def _effective_sidebar_origin(session: dict) -> str:
         if not isinstance(session, dict):
@@ -2622,7 +2638,6 @@ def _build_session_list_cache_payload(
                 break
             origin = _sidebar_session_origin(cur)
             # A non-webui origin is definitive; subagent/all-webui continues.
-            # _sidebar_session_origin never returns "subagent", so sentinel is webui.
             if origin != "webui":
                 return origin
             # origin is webui — if markers were all subagent, try parent.
@@ -2634,11 +2649,8 @@ def _build_session_list_cache_payload(
             if parent is None:
                 # Parent not in the visible/archived scoped set (e.g. paged
                 # out, or excluded from this request's window) — one bounded
-                # metadata-only sidecar read for just this id, same as the
-                # single-session lookups elsewhere in this module. Cache the
-                # result so a sidebar with many orphaned-from-scope children
-                # doesn't re-read the same ancestor's sidecar file on every
-                # row's walk.
+                # sidecar-or-state.db read for just this id (memoized on
+                # both hit and miss — see _effective_origin_fallback_lookup).
                 parent_obj = _effective_origin_fallback_lookup(pid)
                 if parent_obj is None:
                     break
@@ -2655,7 +2667,14 @@ def _build_session_list_cache_payload(
                 }
                 _effective_session_by_id[pid] = parent
             cur = parent
-        return _sidebar_session_origin(session)
+        # Chain exhausted the 16-hop bound, hit a cycle, or the ancestor was
+        # unresolvable even via the state.db fallback: every origin seen
+        # along the walk was itself a placeholder (webui, or an explicit-
+        # but-nonstandard marker). Return the single deterministic "webui"
+        # sentinel rather than re-deriving from `cur` or `session` — either
+        # could, in an edge case, echo a non-standard explicit marker back
+        # out raw instead of the intended give-up value (#6985 round 3).
+        return "webui"
 
     def _filter_sidebar_source(rows: list[dict]) -> list[dict]:
         if selected_sidebar_source_set:
@@ -8223,6 +8242,53 @@ def _session_deleted_tombstone_marks_was_webui(sid: str) -> bool:
         return sid in _load_webui_deleted_session_tombstone()
     except Exception:
         return False
+
+
+def _state_db_lineage_lookup(pid: str, profile: str | None):
+    """Return a lightweight lineage object for ``pid`` read from the given
+    profile's state.db ``sessions`` table, or ``None`` on any miss/error.
+
+    Used by ``_effective_sidebar_origin``'s missing-ancestor fallback (#6985
+    review round 3): a WebUI-sidecar-only lookup misses every delegated
+    subagent ancestor that ran server-side (#5307), since those have no
+    sidecar at all — state.db is their only record. Scoped to ``profile``
+    (never the globally active profile when the caller is building a payload
+    for a different one) via ``_agent_state_db_path``, so an ancestor id that
+    only exists in a DIFFERENT profile's state.db is correctly treated as
+    absent here, not leaked across profiles. Only the two lineage columns the
+    caller needs (``source``, ``parent_session_id``) are read — no messages,
+    no full row.
+    """
+    if not pid or not is_safe_session_id(pid):
+        return None
+    try:
+        from api.models import _agent_state_db_path
+        db_path = _agent_state_db_path(profile=profile)
+        if not db_path or not Path(db_path).exists():
+            return None
+        with closing(open_state_db_readonly(Path(db_path))) as conn:
+            row = conn.execute(
+                "SELECT source, parent_session_id FROM sessions WHERE id = ?",
+                (pid,),
+            ).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    import types
+    source = str(row[0] or "").strip() or None
+    parent_session_id = str(row[1] or "").strip() or None
+    return types.SimpleNamespace(
+        session_origin=None,
+        source_tag=source,
+        raw_source=None,
+        source=None,
+        platform=None,
+        source_label=None,
+        session_source=None,
+        is_cli_session=None,
+        parent_session_id=parent_session_id,
+    )
 
 
 def _state_db_session_source(sid: str) -> str:

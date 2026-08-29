@@ -332,6 +332,51 @@ console.log(JSON.stringify({{
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_effective_origin_resolves_real_external_ancestor_and_falls_back_deterministically_on_cycle():
+    """#6985 review round 3: the client walk's exhausted-chain fallback must
+    return the single deterministic 'webui' sentinel, not re-derive from
+    `cur`/`s` (which could echo a non-standard explicit marker raw). Covers
+    two cases against the REAL effectiveOrigin closure (not a reimplementation):
+    (1) a genuine external ancestor present in the loaded row set is inherited
+    correctly through a subagent child, and (2) a parent_session_id cycle among
+    loaded rows terminates via the existing visited-set bound and falls back
+    to 'webui' instead of hanging or returning something else raw."""
+    source = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    order_line = next(line for line in source.splitlines() if line.startswith("const _SESSION_ORIGIN_ORDER="))
+    origin_fn = _extract_function(source, "_sessionOrigin")
+    is_child_fn = _extract_function(source, "_isChildSession")
+    is_cli_fn = _extract_function(source, "_isCliSession")
+    is_messaging_fn = _extract_function(source, "_isMessagingSession")
+    source_rows_line = next(
+        line for line in source.splitlines()
+        if line.strip().startswith("const sourceRowsById=")
+    )
+    effective_origin_block = _extract_from_marker(source, "const effectiveOrigin=s=>{")
+    script = f"""
+{order_line}
+const _MESSAGING_RAW_SOURCES = new Set();
+{is_messaging_fn}
+{is_cli_fn}
+{origin_fn}
+{is_child_fn}
+const allMatched = [
+  {{session_id:'external-ancestor', session_origin:'matrix'}},
+  {{session_id:'subagent-child', parent_session_id:'external-ancestor', relationship_type:'child_session', session_origin:'subagent'}},
+  {{session_id:'cycle-a', parent_session_id:'cycle-b', relationship_type:'child_session', session_origin:'subagent'}},
+  {{session_id:'cycle-b', parent_session_id:'cycle-a', relationship_type:'child_session', session_origin:'subagent'}},
+];
+{source_rows_line}
+const effectiveOrigin={effective_origin_block.split("=", 1)[1]}
+console.log(JSON.stringify({{
+  externalAncestor: effectiveOrigin(sourceRowsById.get('subagent-child')),
+  cycle: effectiveOrigin(sourceRowsById.get('cycle-a')),
+}}));
+"""
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == {"externalAncestor": "matrix", "cycle": "webui"}
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_source_chip_labels_pass_scalar_args_not_objects():
     """#6985 review round 2: the localized source-chip controls called
     `t(key, {{count: n}})` / `t(key, {{label: x}})`, but `t()` forwards its
@@ -373,30 +418,138 @@ console.log(JSON.stringify({
     assert "NaN" not in json.dumps(rendered)
 
 
-def test_effective_sidebar_origin_resolves_missing_ancestor_via_fallback_lookup(monkeypatch):
-    """#6985 review round 2, item 3: the missing-ancestor branch in
-    `_effective_sidebar_origin` was comment-only (documented a state.db
-    fallback lookup, then `break`d immediately without calling it) — a
-    child whose external parent fell outside this request's loaded scope
-    (paged out, archived-and-excluded, etc.) always fell back to its own
-    (webui) classification instead of inheriting the real external origin.
+def _make_state_db_rows(path, rows):
+    """Create a minimal state.db at ``path`` with one row per (sid, source,
+    parent_session_id) in ``rows``. Schema mirrors the subset
+    _state_db_lineage_lookup actually reads."""
+    import sqlite3
 
-    This exercises the actual composed endpoint (`_build_session_list_cache_payload`),
-    not just the helper in isolation: the child's parent is deliberately
-    absent from every list the payload builder sees, forcing the
-    `Session.load_metadata_only` fallback path, and asserts the sidebar
-    source filter correctly reveals/hides the child based on the
-    looked-up ancestor's origin rather than the child's own.
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, parent_session_id TEXT)"
+    )
+    for sid, source, parent_session_id in rows:
+        conn.execute(
+            "INSERT INTO sessions (id, source, parent_session_id) VALUES (?, ?, ?)",
+            (sid, source, parent_session_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def origin_fallback_env(tmp_path, monkeypatch):
+    """Isolated environment for the missing-ancestor state.db fallback:
+    an empty WebUI sessions dir (so Session.load_metadata_only() always
+    misses — no sidecar exists for any id used here, matching the real
+    delegated-subagent shape from #5307) plus per-profile state.db files
+    the fallback can be pointed at via _get_profile_home.
     """
-    import types
+    import api.models as models
     import api.routes as routes
+
+    sessions_dir = tmp_path / "webui-sessions"
+    sessions_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", sessions_dir)
+
+    profile_homes = {}
+
+    def _get_profile_home(profile):
+        home = profile_homes.setdefault(str(profile), tmp_path / f"profile-{profile}")
+        home.mkdir(parents=True, exist_ok=True)
+        return home
+
+    monkeypatch.setattr(models, "_get_profile_home", _get_profile_home)
+
+    default_db = tmp_path / "default-state.db"
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: default_db)
 
     monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
     monkeypatch.setattr(routes, "get_cli_sessions", lambda **_kwargs: [])
 
+    return {"sessions_dir": sessions_dir, "profile_homes": profile_homes, "default_db": default_db}
+
+
+def _run_payload(routes, leaf_row, *, active_profile, sidebar_source):
+    import api.routes as _routes  # noqa: F401  (routes param kept for readability)
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile=active_profile,
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+        show_matrix_sessions=True,
+        sidebar_source=sidebar_source,
+    )
+    return [s["session_id"] for s in payload["sessions"]]
+
+
+def test_effective_sidebar_origin_resolves_external_ancestor_with_no_sidecar_via_state_db(
+    origin_fallback_env, monkeypatch,
+):
+    """#6985 review round 3: the missing-ancestor fallback only read the
+    WebUI sidecar (Session.load_metadata_only), which misses every delegated
+    subagent ancestor — those ran server-side and have NO sidecar at all
+    (#5307), only a state.db row. Covers external parent -> subagent child
+    -> grandchild, with BOTH ancestors omitted from the payload builder's
+    loaded rows (only the leaf grandchild is 'in scope'), proving the
+    grandchild inherits the external origin through two state.db-only hops.
+    """
+    import api.routes as routes
+
+    # Use the fixture's _get_profile_home so the path matches exactly what
+    # _agent_state_db_path(profile="default") will resolve.
+    from api.models import _get_profile_home
+    home = _get_profile_home("default")
+    db_path = home / "state.db"
+    _make_state_db_rows(
+        db_path,
+        [
+            ("external-ancestor", "matrix", None),
+            ("subagent-child", "subagent", "external-ancestor"),
+        ],
+    )
+    assert not (origin_fallback_env["sessions_dir"] / "external-ancestor.json").exists()
+    assert not (origin_fallback_env["sessions_dir"] / "subagent-child.json").exists()
+
+    grandchild_row = {
+        "session_id": "grandchild-of-ghost",
+        "parent_session_id": "subagent-child",
+        "message_count": 1,
+        "project_id": None,
+        "profile": "default",
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [grandchild_row])
+
+    assert _run_payload(routes, grandchild_row, active_profile="default", sidebar_source="matrix") == [
+        "grandchild-of-ghost"
+    ]
+    assert _run_payload(routes, grandchild_row, active_profile="default", sidebar_source="webui") == []
+
+
+def test_effective_sidebar_origin_does_not_leak_ancestor_across_profiles(
+    origin_fallback_env, monkeypatch,
+):
+    """The state.db fallback must be profile-scoped: an ancestor that only
+    exists in a DIFFERENT profile's state.db must not be found when
+    resolving a child under the active profile — the sidebar filter must
+    fall back to 'webui', not leak the other profile's classification."""
+    import api.routes as routes
+    from api.models import _get_profile_home
+
+    other_home = _get_profile_home("other-profile")
+    _make_state_db_rows(other_home / "state.db", [("cross-profile-ancestor", "matrix", None)])
+    # The active profile's own (empty) state.db must exist so
+    # _agent_state_db_path doesn't silently fall back to the active/default
+    # db and accidentally find the other profile's row anyway.
+    active_home = _get_profile_home("default")
+    _make_state_db_rows(active_home / "state.db", [])
+
     child_row = {
-        "session_id": "child-of-ghost",
-        "parent_session_id": "ghost-parent-outside-scope",
+        "session_id": "child-of-cross-profile-ghost",
+        "parent_session_id": "cross-profile-ancestor",
         "message_count": 1,
         "project_id": None,
         "profile": "default",
@@ -404,42 +557,104 @@ def test_effective_sidebar_origin_resolves_missing_ancestor_via_fallback_lookup(
     }
     monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [child_row])
 
-    ghost_parent = types.SimpleNamespace(
-        session_origin=None,
-        source_tag="matrix",
-        raw_source=None,
-        source=None,
-        platform=None,
-        source_label=None,
-        session_source=None,
-        is_cli_session=False,
-        parent_session_id=None,
+    assert _run_payload(routes, child_row, active_profile="default", sidebar_source="matrix") == []
+    assert _run_payload(routes, child_row, active_profile="default", sidebar_source="webui") == [
+        "child-of-cross-profile-ghost"
+    ]
+
+
+def test_effective_sidebar_origin_missing_ancestor_row_falls_back_to_webui(
+    origin_fallback_env, monkeypatch,
+):
+    """A parent_session_id that exists in NEITHER a sidecar NOR any state.db
+    row (already deleted, or never existed) must fall back to the
+    deterministic 'webui' sentinel, not raise or misclassify."""
+    import api.routes as routes
+    from api.models import _get_profile_home
+
+    _make_state_db_rows(_get_profile_home("default") / "state.db", [])
+
+    child_row = {
+        "session_id": "child-of-nothing",
+        "parent_session_id": "truly-gone",
+        "message_count": 1,
+        "project_id": None,
+        "profile": "default",
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [child_row])
+
+    assert _run_payload(routes, child_row, active_profile="default", sidebar_source="webui") == [
+        "child-of-nothing"
+    ]
+    assert _run_payload(routes, child_row, active_profile="default", sidebar_source="matrix") == []
+
+
+def test_effective_sidebar_origin_cycle_falls_back_to_webui_without_hanging(
+    origin_fallback_env, monkeypatch,
+):
+    """A parent_session_id cycle resolved entirely through the state.db
+    fallback (A -> B -> A) must terminate via the existing visited-set bound
+    and fall back to 'webui', not loop forever."""
+    import api.routes as routes
+    from api.models import _get_profile_home
+
+    _make_state_db_rows(
+        _get_profile_home("default") / "state.db",
+        [("cycle-a", None, "cycle-b"), ("cycle-b", None, "cycle-a")],
     )
 
-    def _fake_load_metadata_only(pid):
-        assert pid == "ghost-parent-outside-scope"
-        return ghost_parent
+    child_row = {
+        "session_id": "child-of-cycle",
+        "parent_session_id": "cycle-a",
+        "message_count": 1,
+        "project_id": None,
+        "profile": "default",
+        "updated_at": 5,
+    }
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [child_row])
 
-    monkeypatch.setattr(routes.Session, "load_metadata_only", staticmethod(_fake_load_metadata_only))
+    assert _run_payload(routes, child_row, active_profile="default", sidebar_source="webui") == [
+        "child-of-cycle"
+    ]
 
-    matrix_payload = routes._build_session_list_cache_payload(
-        active_profile="default",
-        all_profiles=False,
-        show_cli_sessions=True,
-        show_previous_messaging_sessions=False,
-        show_cron_sessions=False,
-        show_matrix_sessions=True,
-        sidebar_source="matrix",
-    )
-    assert [s["session_id"] for s in matrix_payload["sessions"]] == ["child-of-ghost"]
 
-    webui_payload = routes._build_session_list_cache_payload(
-        active_profile="default",
-        all_profiles=False,
-        show_cli_sessions=True,
-        show_previous_messaging_sessions=False,
-        show_cron_sessions=False,
-        show_matrix_sessions=True,
-        sidebar_source="webui",
-    )
-    assert [s["session_id"] for s in webui_payload["sessions"]] == []
+def test_effective_origin_fallback_lookup_queries_state_db_at_most_once_per_ancestor(
+    origin_fallback_env, monkeypatch,
+):
+    """Repeated-miss/query-bound: many children sharing the same
+    out-of-scope ancestor must trigger at most one underlying state.db
+    query for that ancestor id — the fallback's memoization (which also
+    covers misses, per _effective_origin_fallback_lookup's own docstring)
+    must not re-query per descendant."""
+    import api.routes as routes
+    from api.models import _get_profile_home
+
+    home = _get_profile_home("default")
+    _make_state_db_rows(home / "state.db", [("shared-ancestor", "matrix", None)])
+
+    call_count = {"n": 0}
+    real_lookup = routes._state_db_lineage_lookup
+
+    def _counting_lookup(pid, profile):
+        call_count["n"] += 1
+        return real_lookup(pid, profile)
+
+    monkeypatch.setattr(routes, "_state_db_lineage_lookup", _counting_lookup)
+
+    rows = [
+        {
+            "session_id": f"child-{i}",
+            "parent_session_id": "shared-ancestor",
+            "message_count": 1,
+            "project_id": None,
+            "profile": "default",
+            "updated_at": i,
+        }
+        for i in range(5)
+    ]
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: rows)
+
+    result = _run_payload(routes, rows[0], active_profile="default", sidebar_source="matrix")
+    assert sorted(result) == [f"child-{i}" for i in range(5)]
+    assert call_count["n"] == 1, f"expected exactly one state.db query for the shared ancestor, got {call_count['n']}"
