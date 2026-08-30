@@ -58,10 +58,18 @@ def test_thinking_card_toggle_and_body_use_animation_friendly_state():
 def test_tool_card_toggle_uses_same_chevron_icon_markup_as_thinking_card():
     assert "<span class=\"thinking-card-toggle\">${li('chevron-right',12)}</span>" in UI_JS
     assert "<span class=\"tool-card-toggle\">${li('chevron-right',12)}</span>" in UI_JS
-    assert '<div class="${classes}"' in UI_JS
-    assert "thinking-card-header" in UI_JS
-    assert "this.parentElement.classList.toggle" in UI_JS
-    assert "thinking-card-icon" in UI_JS
+    # ONE contiguous structural assertion, not four free-floating tokens.
+    # Those tokens occur 1/7/2/2 times across ui.js, unrelated to each other,
+    # so the split version asserted nothing about structure -- which is this
+    # test's entire subject. Verified: moving the onclick off the header onto
+    # the outer div and deleting the icon span (structurally breaking the very
+    # toggle this test is named for) still left the split version passing.
+    assert (
+        '<div class="${classes}" data-thinking-card="1">'
+        '<div class="thinking-card-header" '
+        "onclick=\"this.parentElement.classList.toggle('open')\">"
+        '<span class="thinking-card-icon">'
+    ) in UI_JS
 
 
 def test_thinking_card_header_includes_copy_button_that_does_not_toggle_card():
