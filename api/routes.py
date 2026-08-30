@@ -11148,13 +11148,15 @@ def _canonical_row_profile(raw) -> str:
     profile's origin leak into another's child).
 
     Module-level (not a closure inside ``_build_session_list_cache_payload``)
-    so ``_sidebar_session_response_item`` can apply the SAME normalization to
-    the ``profile`` field before it's serialized to the client — the client's
-    `_rowProfileKey()` (static/sessions.js) only trims/defaults and has no way
-    to replicate this server-side alias-folding rule itself, so without this
-    a renamed-root profile's raw alias string reaching the wire unnormalized
-    could make the client's own profile-scoped lineage map fail to match rows
-    the server would correctly treat as the same profile.
+    so the shared row serializer can derive the SAME canonical value for the
+    wire. It is emitted as the separate ``profile_key`` field and the row's
+    own ``profile`` is left untouched for display (#6985 round 5 — overwriting
+    ``profile`` itself made a renamed root profile render as literal
+    "default"). The client's ``_rowProfileKey()`` (static/sessions.js) only
+    trims/defaults and has no way to replicate this server-side alias-folding
+    rule itself, so without a server-derived key a renamed-root profile's raw
+    alias could make the client's profile-scoped lineage map fail to match
+    rows the server would correctly treat as the same profile.
     """
     name = str(raw or "").strip() or "default"
     return "default" if _is_root_profile(name) else name
@@ -11214,8 +11216,11 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "_parent_lineage_root_id",
     "_parent_lineage_tip_id",
     "_cross_surface_child_session",
-    "match_type",
-    "match_preview",
+    # NOTE: `match_type` / `match_preview` are deliberately NOT allowlisted.
+    # They are search-only metadata the search branch supplies as trusted
+    # arguments to `_sidebar_session_response_item`; forwarding them from a
+    # raw session dict would let persisted/forged row state masquerade as a
+    # server-computed search match on either endpoint (#6985 round 6).
     # Preserved so the sidebar can suppress rename / action-menu / swipe on
     # read-only (imported CLI + Claude Code) sessions, and render the detailed
     # gateway model label. Dropping these silently regressed both surfaces.
@@ -11228,14 +11233,32 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
 }
 
 
-def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None = None) -> dict:
-    """Return the bounded /api/sessions row shape used by the sidebar.
+def _sidebar_session_response_item(
+    session: dict,
+    *,
+    redact_enabled: bool | None = None,
+    match_type: str | None = None,
+    match_preview: str | None = None,
+) -> dict:
+    """Return the bounded sidebar row shape used by list AND search.
 
     Full session/detail fields such as messages, tool calls, compression
     summaries, context-engine state, gateway routing history, drafts, and
     pending user text are intentionally excluded from the list endpoint. Large
     installs should not ship tens of KB of per-row detail just to render a
     conversation title.
+
+    #6985 round 6: this is the SINGLE bounded row serializer. `/api/sessions`
+    and every `/api/sessions/search` branch go through it, so one row can never
+    be serialized under two different wire contracts depending on which
+    endpoint produced it (search previously started from a bare ``dict(s)``,
+    forwarding internal out-of-contract fields the list endpoint strips).
+
+    ``match_type``/``match_preview`` are supplied by the search branch as
+    TRUSTED arguments and applied after allowlist filtering, so a raw session
+    dict carrying those keys can never forge a search match. ``profile_key``
+    is likewise always derived here from the row's own ``profile`` and never
+    accepted from the incoming dict.
     """
     item = {
         key: value
@@ -11247,6 +11270,10 @@ def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None
         item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
     _redact_sidebar_title_fields(item, redact_enabled)
     item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
+    if match_type is not None:
+        item["match_type"] = match_type
+    if match_preview is not None:
+        item["match_preview"] = _redact_text(match_preview, _enabled=redact_enabled)
     return item
 
 
@@ -18486,14 +18513,10 @@ def _handle_sessions_search(handler, parsed):
     except Exception:
         _search_redact_enabled = True  # fail safe: redact when settings unreadable
     if not q:
-        safe_sessions = []
-        for s in sessions:
-            item = dict(s)
-            _add_profile_lineage_key(item)
-            if isinstance(item.get("title"), str):
-                item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
-            _redact_sidebar_title_fields(item, _search_redact_enabled)
-            safe_sessions.append(item)
+        safe_sessions = [
+            _sidebar_session_response_item(s, redact_enabled=_search_redact_enabled)
+            for s in sessions
+        ]
         return j(handler, {
             "sessions": safe_sessions,
             "all_profiles": all_profiles,
@@ -18503,12 +18526,9 @@ def _handle_sessions_search(handler, parsed):
     for s in sessions:
         title_match = q in (s.get("title") or "").lower()
         if title_match:
-            item = dict(s, match_type="title")
-            _add_profile_lineage_key(item)
-            if isinstance(item.get("title"), str):
-                item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
-            _redact_sidebar_title_fields(item, _search_redact_enabled)
-            results.append(item)
+            results.append(_sidebar_session_response_item(
+                s, redact_enabled=_search_redact_enabled, match_type="title",
+            ))
             continue
         if content_search:
             try:
@@ -18522,15 +18542,12 @@ def _handle_sessions_search(handler, parsed):
                 for m in msgs:
                     c = _session_search_message_text(m)
                     if q in str(c).lower():
-                        item = dict(s, match_type="content")
-                        _add_profile_lineage_key(item)
-                        preview = _session_search_preview(c, q)
-                        if preview:
-                            item["match_preview"] = _redact_text(preview, _enabled=_search_redact_enabled)
-                        if isinstance(item.get("title"), str):
-                            item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
-                        _redact_sidebar_title_fields(item, _search_redact_enabled)
-                        results.append(item)
+                        results.append(_sidebar_session_response_item(
+                            s,
+                            redact_enabled=_search_redact_enabled,
+                            match_type="content",
+                            match_preview=_session_search_preview(c, q) or None,
+                        ))
                         break
             except (KeyError, Exception):
                 pass
