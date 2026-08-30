@@ -297,6 +297,11 @@ def test_is_loadable_disk_cache_rejects_stale_generation(with_runtime_version):
         "_schema_version": config._MODELS_CACHE_SCHEMA_VERSION,
         "_webui_version": "v0.50.293",
         "_source_fingerprint": config._models_cache_source_fingerprint(),
+        # Written by THIS run: the generation counter is only comparable
+        # within the process that produced it, so a file claiming an older
+        # generation is only provably stale when it carries this run's id.
+        # `_save_models_cache_to_disk` always stamps both.
+        "_run_id": config._PROCESS_RUN_ID,
         "_generation": config._available_models_cache_generation - 1,
         **_shape_cache(),
     }
