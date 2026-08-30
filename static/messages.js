@@ -5436,10 +5436,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return `${name}|${Number.isFinite(bid)?bid:0}|${Number.isFinite(seq)?seq:0}|${_stableStringify(args)}`;
   }
 
-  function _liveToolTid(d, activityBurstId, activitySegmentSeq){
+  function _liveToolTid(d, activityBurstId, activitySegmentSeq, occurrence){
     const explicit=String(d&&(d.tid||d.id||d.tool_call_id||d.tool_use_id||d.call_id)||'').trim();
     if(explicit) return explicit;
-    return `live-${activeSid}-${_hashString(_toolCallSignature(d,activityBurstId,activitySegmentSeq))}`;
+    // The signature alone is NOT unique: two ID-less calls with the same name
+    // and equal args in one burst/segment produce an identical signature and
+    // therefore an identical tid, aliasing two distinct occurrences onto one
+    // disclosure identity. The occurrence coordinate is minted once at
+    // ingestion and disambiguates them permanently.
+    const occPart=(occurrence===undefined||occurrence===null||occurrence==='')?'':`-o${occurrence}`;
+    return `live-${activeSid}-${_hashString(_toolCallSignature(d,activityBurstId,activitySegmentSeq))}${occPart}`;
   }
 
   function _coerceLiveToolCallSignature(tc, activityBurstId, activitySegmentSeq){
@@ -5569,13 +5575,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
 
     if(!tc){
+      // TRUE ingestion for the live channel: this is the one place a live tool
+      // call first enters the client model. Mint the immutable occurrence
+      // coordinate here, once, and carry it — never recompute it from the
+      // current array order at render or recovery time.
+      const occurrence=inflight.toolCalls.length;
       tc={
         name,
         preview:String(d.preview||''),
         args:d.args||{},
         snippet:'',
         done:isComplete,
-        tid:explicitTid||_liveToolTid(d,current.burstId,current.segmentSeq),
+        _occurrence:occurrence,
+        _disclosureOrdinal:occurrence,
+        tid:explicitTid||_liveToolTid(d,current.burstId,current.segmentSeq,occurrence),
         activityBurstId:current.burstId,
         activitySegmentSeq:_coerceLiveToolCallSeq(current.segmentSeq),
       };
@@ -5630,7 +5643,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(typeof d.is_error==='boolean') tc.is_error=d.is_error;
       if(d.duration!==undefined) tc.duration=d.duration;
       if(tc.started_at===undefined||tc.started_at===null) tc.started_at=Date.now()/1000;
-      if(!tc.tid) tc.tid=explicitTid||_liveToolTid(d,tc.activityBurstId,tc.activitySegmentSeq);
+      if(!tc.tid) tc.tid=explicitTid||_liveToolTid(d,tc.activityBurstId,tc.activitySegmentSeq,tc._occurrence);
     } else {
       tc.done=false;
       tc.started_at=tc.started_at||Date.now()/1000;

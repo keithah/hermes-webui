@@ -6,6 +6,32 @@
 // against old servers (Phase 1 may not yet be deployed everywhere).
 // See api/todo_state.py for the wire contract.
 const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',activeProfileIsDefault:true,showHiddenWorkspaceFiles:false,todos:[],todoStateMeta:null,_pendingSessionToolsets:null};
+// ── Tool-call disclosure identity: the settled-channel ingestion seam ────────
+// Mint the ID-less disclosure ordinal the moment a transcript ENTERS the
+// client model, not when it is rendered or recovered. Every server-delivered
+// transcript arrives through an assignment to S.messages, from 25+ call sites
+// across boot/commands/messages/outline/panels/sessions/ui; stamping at each
+// one is the incomplete sweep that earlier rounds kept re-introducing, so the
+// accessor below is the single choke point that cannot be bypassed.
+//
+// In-place S.messages.push() sites (local /command echoes and optimistic user
+// rows) do not pass through here, which is correct: those construct plain
+// text messages and never carry tool calls.
+(function _installMessagesIngestionSeam(){
+  let _messagesBacking=S.messages;
+  Object.defineProperty(S,'messages',{
+    get(){ return _messagesBacking; },
+    set(next){
+      _messagesBacking=next;
+      // Never let a stamping fault break transcript assignment.
+      try{
+        if(typeof _stampToolCallOrdinals==='function') _stampToolCallOrdinals(next);
+      }catch(_){}
+    },
+    enumerable:true,
+    configurable:true,
+  });
+})();
 
 function assistantDisplayName(){
   if(S.activeProfile&&S.activeProfile!=='default') return S.activeProfile.charAt(0).toUpperCase()+S.activeProfile.slice(1);
@@ -13714,6 +13740,24 @@ function _anchorSceneToolCallFromRow(row, opts){
     ),
     tid:id,
     id,
+    // Carry the minted occurrence coordinate into the Anchor representation.
+    // Without it an ID-less call keyed as `o:?` here while its settled twin
+    // keyed as `o:N`, so one occurrence had two identities and Show-more
+    // recovery could bind to the wrong same-name call.
+    // Inlined deliberately: this function is extracted and evaluated in
+    // isolation by several node test harnesses, so it must not depend on a
+    // sibling helper. Read-only -- returns an ALREADY-MINTED coordinate and
+    // never invents one.
+    _disclosureOrdinal:(function(){
+      for(const src of [tool,payload]){
+        if(!src||typeof src!=='object') continue;
+        for(const key of ['_disclosureOrdinal','_occurrence','_ordinal','ordinal']){
+          const v=src[key];
+          if(v!==undefined&&v!==null&&v!=='') return v;
+        }
+      }
+      return undefined;
+    })(),
   };
 }
 function _anchorSceneRowTimestampSeconds(row){
@@ -17246,7 +17290,7 @@ function _processWakeupCardHtml(info, rawText, extras){
 
 function renderMessages(options){
   _lastMessageRenderAt=performance.now();
-  if(typeof _stampToolCallOrdinals==='function') _stampToolCallOrdinals(S.messages);
+  // Disclosure identity is minted at ingestion; render only reads it.
   const preserveScroll=!!(options&&options.preserveScroll);
   const virtualFallback=!!(options&&options._virtualFallback);
   // Capture the pre-wipe scroll position when preserving OR when the reader has
@@ -17922,8 +17966,8 @@ function renderMessages(options){
         // orderedTransparentParts) returns null for the WHOLE message if any
         // tool_use part lacks a real id, so every part reaching here always
         // has one -- toolCall.tid can never be empty. No ordinal fallback
-        // needed or reachable; identity always comes from _stampToolCallOrdinals()
-        // via buildToolCard's own read, same as every other render path.
+        // needed or reachable; identity is minted at ingestion and only READ
+        // here, same as every other render path.
         const toolCall=_transparentOrderedToolCall(part, rawIdx, transparentOrderedToolCallsByTid, transparentToolResultsByTid, transparentPersistedSnippetByTid);
           const toolRow=_decorateTransparentEventRow(buildToolCard(toolCall),{
             type:'tool',
@@ -18306,8 +18350,8 @@ function renderMessages(options){
       // ID-less derived entries already carry their ordinal: every source
       // this loop reads from (fallbackToolSources' m.tool_calls/
       // _partial_tool_calls/content) is an element of the SAME S.messages
-      // array _stampToolCallOrdinals(S.messages) stamps at the top of
-      // renderMessages(), before this builder ever runs -- and each push
+      // array stamped by the S.messages ingestion seam when the transcript
+      // entered the model, long before this builder runs -- and each push
       // above copies _disclosureOrdinal straight through from that raw
       // source object. No fallback assignment needed or reachable.
       S.toolCalls=derived;
@@ -19608,11 +19652,11 @@ function _toggleToolDiff(btn){
 }
 function _toolCallByDisclosureKey(key){
   if(!key) return null;
-  // Idempotent safety net: normally already stamped by renderMessages()'s
-  // _stampToolCallOrdinals() call before any recovery lookup can happen.
-  try{
-    if(typeof _stampToolCallOrdinals==='function'&&typeof S!=='undefined'&&S) _stampToolCallOrdinals(S.messages);
-  }catch(_){}
+  // Recovery MUST NOT mint or recount. It compares the carried coordinate
+  // only. Stamping here meant a candidate array that had been reordered or
+  // duplicated since render could be assigned different ordinals than the
+  // ones the rendered rows were keyed with, so a restored card could bind to
+  // a different same-name call.
   const candidates=[];
   if(typeof S!=='undefined'&&S&&Array.isArray(S.toolCalls)) candidates.push(...S.toolCalls);
   if(typeof S!=='undefined'&&S&&Array.isArray(S.messages)){
