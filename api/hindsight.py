@@ -283,6 +283,18 @@ def _coerce_upstream_text(value: Any) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _coerce_upstream_count(value: Any) -> int | None:
+    """Coerce an upstream count field to a plain non-negative int, else None.
+
+    Companion to _coerce_upstream_text for numeric fields: bool is excluded
+    (it is an int subclass and would render as True/False), and anything that
+    is not a clean non-negative integer is dropped rather than forwarded.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
 def _redact_success_value(value: Any) -> Any:
     """Redact strings recursively before returning upstream memory to the browser."""
     try:
@@ -562,7 +574,14 @@ def handle_status(handler: Any):
         elif status >= 500:
             result["hint"] = "Hindsight upstream is unavailable"
         if isinstance(data, dict) and "total" in data:
-            result["total_memories"] = data["total"]
+            # Upstream is a trust boundary. Every other handler routes upstream
+            # values through _redact_success_value/_coerce_upstream_text before
+            # they reach the browser; this one field was passed through raw, so
+            # a malformed or compromised upstream could hand the panel an
+            # arbitrary-shaped value for a field the UI renders as a count.
+            total = _coerce_upstream_count(data["total"])
+            if total is not None:
+                result["total_memories"] = total
     with _STATUS_LOCK:
         _STATUS_CACHE[cache_key] = (now, result)
         # Evict oldest entries if unbounded growth (per-profile cache)

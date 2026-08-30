@@ -5298,6 +5298,7 @@ let _hindsightLastQuery = '';
 let _hindsightLastElapsed = 0;
 let _hindsightStatusProfile = '';
 let _hindsightMemoriesProfile = '';
+let _hindsightStatusSeq = 0;
 let _hindsightRecallSeq = 0;
 let _hindsightReflectSeq = 0;
 let _hindsightMemoriesSeq = 0;
@@ -5308,6 +5309,7 @@ let _memoryMode = 'empty'; // 'empty' | 'read' | 'edit'
 
 function _hindsightProfileName() { return (S && S.activeProfile) || 'default'; }
 function _resetHindsightState() {
+  ++_hindsightStatusSeq;
   ++_hindsightRecallSeq;
   ++_hindsightReflectSeq;
   ++_hindsightMemoriesSeq;
@@ -5403,13 +5405,19 @@ function _setMemoryHeaderButtons(mode) {
 async function loadHindsightStatus(force) {
   const profile = _hindsightProfileName();
   if (_hindsightStatus && !force && _hindsightStatusProfile === profile) return _hindsightStatus;
+  // Sequence guard, not just a profile guard: two overlapping status loads in
+  // the SAME profile (e.g. a double-clicked "Re-check") can resolve out of
+  // order, and a slow earlier failure would otherwise land after a newer
+  // success and repaint the panel as unreachable. Same contract the recall/
+  // reflect/retain/memories loaders already hold.
+  const seq = ++_hindsightStatusSeq;
   try {
     const status = await api('/api/hindsight/status');
-    if (profile !== _hindsightProfileName()) return null;
+    if (seq !== _hindsightStatusSeq || profile !== _hindsightProfileName()) return null;
     _hindsightStatus = status;
     _hindsightStatusProfile = profile;
   } catch (e) {
-    if (profile !== _hindsightProfileName()) return null;
+    if (seq !== _hindsightStatusSeq || profile !== _hindsightProfileName()) return null;
     _hindsightStatus = { enabled: !!(_memoryData && _memoryData.hindsight_enabled), error: e && e.message ? e.message : String(e), reachable: false };
     _hindsightStatusProfile = profile;
   }

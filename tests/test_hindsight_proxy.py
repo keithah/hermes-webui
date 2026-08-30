@@ -150,3 +150,40 @@ def test_recall_input_limits_before_proxy(monkeypatch):
     result = hindsight.handle_recall(_handler(), {"query": "x" * (hindsight.MAX_QUERY_CHARS + 1)})
     assert result["status"] == 400
     assert called is False
+
+
+@pytest.mark.parametrize(
+    "upstream_total, expected",
+    [
+        (7, 7),
+        ({"$gt": 0}, None),          # non-scalar shape
+        ("12 DROP TABLE", None),     # string that would render as a count
+        (True, None),                # bool is an int subclass, renders as "True"
+        (-1, None),                  # nonsensical count
+    ],
+)
+def test_status_does_not_forward_unvalidated_upstream_total(monkeypatch, upstream_total, expected):
+    """handle_status must not pass an upstream field straight to the browser.
+
+    Every other handler routes upstream values through _redact_success_value /
+    _coerce_upstream_text before they reach the client; handle_status forwarded
+    data['total'] raw, so a malformed or compromised upstream controlled the
+    shape of a field the Memory panel renders as a count.
+    """
+    monkeypatch.setattr(
+        hindsight,
+        "_hindsight_config",
+        lambda: {
+            "enabled": True, "provider": "hindsight", "api_url": "https://memory.example",
+            "bank_id": "bank", "mode": "local_external", "memory_mode": "hybrid",
+            "recall_budget": "mid", "api_key_present": True, "_api_key": "key",
+        },
+    )
+    monkeypatch.setattr(hindsight, "_proxy", lambda *_a, **_k: (200, {"total": upstream_total}))
+    monkeypatch.setattr("api.helpers.j", lambda _handler, payload, **_kwargs: payload)
+    hindsight._STATUS_CACHE.clear()
+    payload = hindsight.handle_status(_handler())
+    if expected is None:
+        assert "total_memories" not in payload, payload
+    else:
+        assert payload["total_memories"] == expected
