@@ -851,6 +851,57 @@ def test_effective_sidebar_origin_same_ancestor_id_in_two_profiles_never_borrows
     ) == ["child-of-profile-b-2"]
 
 
+def test_effective_sidebar_origin_in_memory_map_never_borrows_a_same_id_row_from_another_profile(
+    origin_fallback_env, monkeypatch,
+):
+    """#6985 round 4 named TWO profile-scoping bugs: the state.db fallback
+    AND "the in-memory lineage map and fallback cache are also keyed only by
+    session id". Both were fixed, but every existing cross-profile regression
+    puts the ancestor ONLY in state.db (absent from the loaded row set), so
+    they all exercise `_effective_origin_fallback_lookup` and none exercise
+    `_effective_session_by_id` — reverting that map to a bare-session-id
+    lookup passed the entire suite.
+
+    Here BOTH same-id ancestors are present in the loaded rows, so the walk
+    resolves them from the in-memory map and never reaches the fallback. A
+    profile-B child must bind to B's telegram ancestor, never A's matrix one.
+    """
+    import api.routes as routes
+
+    # No state.db anywhere: if the in-memory map misses, the fallback finds
+    # nothing and the child fails closed to webui — so a wrong-profile hit
+    # here can only come from the in-memory map itself.
+    parent_a = {
+        "session_id": "shared-parent-id", "profile": "profile-a",
+        "session_origin": "matrix", "message_count": 1,
+        "project_id": None, "updated_at": 9,
+    }
+    parent_b = {
+        "session_id": "shared-parent-id", "profile": "profile-b",
+        "session_origin": "telegram", "message_count": 1,
+        "project_id": None, "updated_at": 9,
+    }
+    child_b = {
+        "session_id": "child-in-b", "profile": "profile-b",
+        "parent_session_id": "shared-parent-id",
+        "relationship_type": "child_session",
+        "message_count": 1, "project_id": None, "updated_at": 5,
+    }
+    rows = [parent_a, parent_b, child_b]
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: [dict(r) for r in rows])
+
+    matrix_ids = _run_payload_all_profiles(
+        routes, rows, active_profile="profile-a", sidebar_source="matrix"
+    )
+    telegram_ids = _run_payload_all_profiles(
+        routes, rows, active_profile="profile-a", sidebar_source="telegram"
+    )
+    # The child must never appear under profile A's ancestor's origin...
+    assert "child-in-b" not in matrix_ids
+    # ...and must appear under its OWN profile's ancestor's origin.
+    assert "child-in-b" in telegram_ids
+
+
 def test_effective_sidebar_origin_classifies_definitive_ancestor_reached_exactly_at_hop_limit(
     origin_fallback_env, monkeypatch,
 ):
@@ -953,50 +1004,152 @@ def test_sidebar_response_item_adds_profile_key_without_touching_display_profile
     assert other["profile"] == "genuinely-other-profile"
 
 
-def test_sessions_search_branches_emit_profile_key_like_the_list_endpoint():
-    """#6985 round 5: `_sidebar_session_response_item` (used by GET
-    /api/sessions) computes `profile_key`, but every /api/sessions/search
-    response branch built its row with a bare `dict(s)`/`dict(s,
-    match_type=...)` and never called the same normalization — search rows
-    for a renamed-root profile's session kept the raw alias while list rows
-    for the identical session carried the folded key, so a client merging
-    search results back into the sidebar (a content search) could see the
-    same session tagged with two different lineage keys depending on which
-    endpoint last touched it. Real endpoint invocation for both, not source
-    inspection, so this actually exercises the response bodies."""
+def _search_payload(url, sessions, *, scan_messages=None):
+    """Invoke the REAL `_handle_sessions_search` endpoint and return its body.
+
+    `scan_messages` (a list of message dicts) backs `get_session_for_scan`, so
+    the content-search branch can actually be exercised rather than skipped.
+    """
     import api.routes as routes
     from types import SimpleNamespace
     from unittest.mock import patch
     from urllib.parse import urlparse
 
-    monkeypatch_target = routes  # readability
-    row = {
-        "session_id": "renamed-root-row",
-        "title": "hello world",
-        "profile": "my-renamed-root",
-        "message_count": 1,
-    }
     captured = {}
 
     def fake_j(handler, payload, status=200, extra_headers=None):
         captured["payload"] = payload
 
-    with patch.object(monkeypatch_target, "_is_root_profile", lambda name: name == "my-renamed-root"), \
-         patch.object(monkeypatch_target, "all_sessions", return_value=[row]), \
-         patch.object(monkeypatch_target, "get_session", side_effect=lambda sid: SimpleNamespace(messages=[])), \
+    with patch.object(routes, "_is_root_profile", lambda name: name == "my-renamed-root"), \
+         patch.object(routes, "all_sessions", return_value=[dict(s) for s in sessions]), \
+         patch.object(
+             routes, "get_session_for_scan",
+             side_effect=lambda sid: SimpleNamespace(messages=list(scan_messages or [])),
+         ), \
          patch("api.profiles.get_active_profile_name", return_value="my-renamed-root"), \
-         patch.object(monkeypatch_target, "j", side_effect=fake_j):
-        # Empty-query branch (the "safe_sessions" list-like path).
-        routes._handle_sessions_search(SimpleNamespace(), urlparse("/api/sessions/search"))
-        list_item = routes._sidebar_session_response_item(dict(row))
-    search_item = captured["payload"]["sessions"][0]
+         patch.object(routes, "j", side_effect=fake_j):
+        routes._handle_sessions_search(SimpleNamespace(), urlparse(url))
+    return captured["payload"]
 
-    assert search_item["profile_key"] == "default"
-    assert list_item["profile_key"] == "default"
-    assert search_item["profile_key"] == list_item["profile_key"]
-    # Neither endpoint clobbers the display value.
-    assert search_item["profile"] == "my-renamed-root"
-    assert list_item["profile"] == "my-renamed-root"
+
+def _list_payload_row(row):
+    """Run a row through the REAL `/api/sessions` response pipeline."""
+    import api.routes as routes
+    from unittest.mock import patch
+
+    with patch.object(routes, "_is_root_profile", lambda name: name == "my-renamed-root"):
+        response = routes._session_list_payload_to_response({"sessions": [dict(row)]})
+    return response["sessions"][0]
+
+
+# A raw session row carrying three things the wire contract must NOT trust:
+# an out-of-contract internal field, a forged canonical lineage key, and forged
+# search-match metadata.
+_SENTINEL_ROW = {
+    "session_id": "shared-contract-row",
+    "title": "a needle title",
+    "profile": "my-renamed-root",
+    "message_count": 1,
+    "_out_of_contract_sentinel": "LEAKED",
+    "messages": [{"role": "user", "content": "unbounded transcript payload"}],
+    "profile_key": "FORGED-PROFILE-KEY",
+    "match_type": "FORGED-MATCH",
+    "match_preview": "FORGED-PREVIEW",
+}
+
+
+def test_list_and_all_search_branches_share_one_bounded_row_contract():
+    """#6985 round 6: `/api/sessions` bounded every row through
+    `_SIDEBAR_SESSION_RESPONSE_FIELDS`, but all three `/api/sessions/search`
+    branches started from a bare `dict(s)`. The identical row was therefore
+    serialized under two different wire contracts depending on which endpoint
+    produced it — search forwarded internal out-of-contract fields (and a
+    forged `profile_key`/`match_type` riding on the raw session dict) that the
+    list endpoint strips, while a content search merges those rows straight
+    back into the sidebar result set.
+
+    This exercises the REAL list response pipeline plus the empty-query, title,
+    and content search branches (the previous version of this test invoked only
+    the empty-query branch and compared it against a direct helper call, so it
+    could not observe the title/content branches or the list pipeline at all).
+    """
+    list_row = _list_payload_row(_SENTINEL_ROW)
+    empty_row = _search_payload("/api/sessions/search", [_SENTINEL_ROW])["sessions"][0]
+    title_row = _search_payload("/api/sessions/search?q=needle", [_SENTINEL_ROW])["sessions"][0]
+    content_row = _search_payload(
+        "/api/sessions/search?q=haystack",
+        [dict(_SENTINEL_ROW, title="no title match here")],
+        scan_messages=[{"role": "user", "content": "a haystack lives in the body"}],
+    )["sessions"][0]
+
+    for label, row in (
+        ("list", list_row), ("empty", empty_row),
+        ("title", title_row), ("content", content_row),
+    ):
+        # 1. Out-of-contract internal fields are stripped everywhere.
+        assert "_out_of_contract_sentinel" not in row, label
+        assert "messages" not in row, label
+        # 2. The canonical lineage key is DERIVED, never accepted from the row.
+        assert row["profile_key"] == "default", label
+        # 3. The display value is preserved, never folded to "default".
+        assert row["profile"] == "my-renamed-root", label
+
+    # 4. Trusted match metadata: forged values never survive; only the
+    #    server-computed value for the branch that actually matched appears.
+    assert "match_type" not in list_row
+    assert "match_type" not in empty_row
+    assert "match_preview" not in list_row
+    assert "match_preview" not in empty_row
+    assert title_row["match_type"] == "title"
+    assert "match_preview" not in title_row
+    assert content_row["match_type"] == "content"
+    assert "haystack" in content_row["match_preview"]
+    assert content_row["match_preview"] != "FORGED-PREVIEW"
+
+    # 5. List and search agree on the shared bounded contract. The list path
+    #    additionally overlays LIVE RUNTIME state (`_session_list_cache_overlay_runtime_rows`
+    #    fills `is_streaming`/`cron_running` from in-process state before
+    #    serialization); search does not run that overlay. That is a runtime-state
+    #    difference, not a second wire contract — search must never carry a field
+    #    the bounded serializer would not also emit for the list.
+    _RUNTIME_OVERLAY_FIELDS = {"is_streaming", "cron_running"}
+    assert set(empty_row) <= set(list_row)
+    assert set(list_row) - set(empty_row) <= _RUNTIME_OVERLAY_FIELDS
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_serialized_alias_child_joins_default_keyed_parent_through_real_client_closure():
+    """#6985 round 6 item 3 (first requested in round 5): the composed client
+    control. A child row serialized with the renamed-root DISPLAY alias in
+    `profile` and a parent row serialized with the literal `default` display
+    value must still join, because both carry the same server-derived canonical
+    `profile_key`. This runs the REAL `sourceRowsById`/`_rowProfileKey`/
+    `_rowLineageKey`/`effectiveOrigin` closures out of sessions.js against rows
+    shaped exactly as the wire now emits them — proving the display/lineage
+    split actually holds end to end, which no server-side test can show.
+    """
+    script = _client_effective_origin_script(
+        """[
+  {session_id:'ext-parent', profile:'default', profile_key:'default', session_origin:'matrix'},
+  {session_id:'alias-child', profile:'my-renamed-root', profile_key:'default',
+   parent_session_id:'ext-parent', relationship_type:'child_session', session_origin:'subagent'},
+  {session_id:'other-profile-child', profile:'genuinely-other', profile_key:'genuinely-other',
+   parent_session_id:'ext-parent', relationship_type:'child_session', session_origin:'subagent'},
+]""",
+        """{
+  aliasChild: effectiveOrigin(bySid.get('alias-child')),
+  otherProfileChild: effectiveOrigin(bySid.get('other-profile-child')),
+}""",
+    )
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
+    assert json.loads(result.stdout) == {
+        # Different display labels, same canonical key -> the join succeeds and
+        # the child inherits the external parent's origin.
+        "aliasChild": "matrix",
+        # A genuinely different profile must NOT borrow the parent's taxonomy,
+        # even though the bare session id matches.
+        "otherProfileChild": "webui",
+    }
 
 
 def test_renamed_alias_child_still_finds_canonically_keyed_ancestor(
