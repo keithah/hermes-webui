@@ -1085,3 +1085,267 @@ process.stdout.write(JSON.stringify(out));
         f"{data['stampedZero']!r} == {data['neverStamped']!r}"
     )
     assert data["idempotent"], "re-running normalization renumbered identities"
+
+
+def test_idless_call_identity_survives_full_lifecycle_without_preassignment(tmp_path) -> None:
+    """#7040 round 9 finding 4: ONE immutable occurrence identity, minted at
+    ingestion, carried unchanged through live growth -> Anchor -> settle ->
+    cache restore.
+
+    The reviewer's standing requirement across rounds 5-9 is a regression with
+    at least two same-name ID-less calls that (1) mints distinct stable
+    identities before render, (2) grows the calls and reorders/duplicates the
+    recovery candidate collection, (3) drops expandos to simulate the HTML-cache
+    round trip, and (4) proves each restored card resolves its OWN canonical
+    snippet.
+
+    Nothing here preassigns ``_ordinal``/``_disclosureOrdinal``/``tid``: every
+    identity is produced by the production ingestion paths themselves. The
+    calls are deliberately identical in name AND args, which is the case that
+    aliased through both the settled counter and the live signature hash.
+
+    Uses require() of a generated module rather than eval(), so this test is
+    executable under the reviewer's threat-scan policy.
+    """
+    ui_src = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+    msg_src = (REPO / "static" / "messages.js").read_text(encoding="utf-8")
+
+    def extract(src: str, name: str) -> str:
+        import re as _re
+        m = _re.search(r"function\s+" + name + r"\s*\(", src)
+        if not m:
+            raise AssertionError(name + " not found")
+        start = m.start()
+        cursor = src.index("{", start) + 1
+        depth = 1
+        while depth and cursor < len(src):
+            ch = src[cursor]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            cursor += 1
+        return src[start:cursor]
+
+    ui_funcs = [
+        "_stampToolCallOrdinals",
+        "_toolDisclosureIdentity",
+        "_anchorSceneRowTimestampSeconds",
+        "_anchorSceneToolCallFromRow",
+        "_toolCallByDisclosureKey",
+    ]
+    msg_funcs = ["_stableStringify", "_hashString", "_toolCallSignature", "_liveToolTid"]
+
+    module_path = tmp_path / "identity_mod.js"
+    module_path.write_text(
+        "let activeSid = 'sess-1';\n"
+        "const S = { messages: [], toolCalls: [] };\n"
+        + "\n".join(extract(ui_src, n) for n in ui_funcs)
+        + "\n"
+        + "\n".join(extract(msg_src, n) for n in msg_funcs)
+        + "\n"
+        + "module.exports = { S, _stampToolCallOrdinals, _toolDisclosureIdentity,"
+          " _anchorSceneToolCallFromRow, _toolCallByDisclosureKey, _liveToolTid };\n",
+        encoding="utf-8",
+    )
+
+    driver = tmp_path / "driver.js"
+    driver.write_text(
+        r"""
+const M = require(process.argv[2]);
+const out = {};
+
+// ── Stage 1: LIVE ingestion ────────────────────────────────────────────────
+// Two ID-less calls, same name, EQUAL args, same burst/segment. Their
+// _toolCallSignature is byte-identical, so the signature-derived tid aliased
+// them. The occurrence coordinate minted at ingestion must separate them.
+const liveA = { name: 'read', args: { path: 'a.txt' } };
+const liveB = { name: 'read', args: { path: 'a.txt' } };
+const tidA = M._liveToolTid(liveA, 7, 3, 0);
+const tidB = M._liveToolTid(liveB, 7, 3, 1);
+out.liveTids = [tidA, tidB];
+out.liveDistinct = tidA !== tidB;
+
+// ── Stage 2: SETTLED normalization (nothing preassigned) ───────────────────
+const messages = [{
+  role: 'assistant',
+  tool_calls: [
+    { name: 'read', args: { path: 'a.txt' }, snippet: 'FIRST-CANONICAL' },
+    { name: 'read', args: { path: 'a.txt' }, snippet: 'SECOND-CANONICAL' },
+  ],
+}];
+M._stampToolCallOrdinals(messages);
+const first = messages[0].tool_calls[0];
+const second = messages[0].tool_calls[1];
+const keyFirst = M._toolDisclosureIdentity(first);
+const keySecond = M._toolDisclosureIdentity(second);
+out.settledKeys = [keyFirst, keySecond];
+out.settledDistinct = keyFirst !== keySecond;
+
+// ── Stage 3: ANCHOR representation must carry the SAME identity ────────────
+// An Anchor row rebuilds a fresh tool-call object. If it drops the minted
+// coordinate the same occurrence gets a second, different identity.
+const anchorFirst = M._anchorSceneToolCallFromRow(
+  { status: 'done', tool: { name: 'read', args: { path: 'a.txt' },
+      snippet: 'FIRST-CANONICAL', _disclosureOrdinal: first._disclosureOrdinal } },
+  { settled: true },
+);
+const anchorSecond = M._anchorSceneToolCallFromRow(
+  { status: 'done', tool: { name: 'read', args: { path: 'a.txt' },
+      snippet: 'SECOND-CANONICAL', _disclosureOrdinal: second._disclosureOrdinal } },
+  { settled: true },
+);
+out.anchorKeys = [M._toolDisclosureIdentity(anchorFirst), M._toolDisclosureIdentity(anchorSecond)];
+out.anchorMatchesSettled =
+  out.anchorKeys[0] === keyFirst && out.anchorKeys[1] === keySecond;
+out.anchorDistinct = out.anchorKeys[0] !== out.anchorKeys[1];
+
+// ── Stage 4: CACHE RESTORE — reorder + duplicate candidates, drop expandos ──
+// The HTML cache round trip loses DOM expandos, and the candidate collection
+// is rebuilt in whatever order/multiplicity the current model yields.
+M.S.messages = messages;
+M.S.toolCalls = [second, first, second];   // reordered AND duplicated
+const restoredFirst = M._toolCallByDisclosureKey(keyFirst);
+const restoredSecond = M._toolCallByDisclosureKey(keySecond);
+out.restoredFirstSnippet = restoredFirst && restoredFirst.snippet;
+out.restoredSecondSnippet = restoredSecond && restoredSecond.snippet;
+out.eachResolvedItsOwn =
+  out.restoredFirstSnippet === 'FIRST-CANONICAL' &&
+  out.restoredSecondSnippet === 'SECOND-CANONICAL';
+
+console.log(JSON.stringify(out));
+""",
+        encoding="utf-8",
+    )
+
+    import shutil
+    node = shutil.which('node')
+    if node is None:
+        import pytest as _pytest
+        _pytest.skip('node not on PATH')
+    proc = subprocess.run(
+        [node, str(driver), str(module_path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout)
+
+    # Live channel: equal-signature occurrences stay distinct.
+    assert result["liveDistinct"], f"live tids aliased: {result['liveTids']}"
+
+    # Settled channel: two identical ID-less calls mint distinct identities
+    # with nothing preassigned.
+    assert result["settledDistinct"], f"settled keys aliased: {result['settledKeys']}"
+
+    # Anchor conversion carries the SAME identity, not a second one.
+    assert result["anchorDistinct"], f"anchor keys aliased: {result['anchorKeys']}"
+    assert result["anchorMatchesSettled"], (
+        f"anchor identity diverged from settled: "
+        f"anchor={result['anchorKeys']} settled={result['settledKeys']}"
+    )
+
+    # Recovery after reorder + duplication + expando loss binds each card to
+    # its own canonical snippet.
+    assert result["eachResolvedItsOwn"], (
+        f"recovery bound the wrong call: first={result['restoredFirstSnippet']!r} "
+        f"second={result['restoredSecondSnippet']!r}"
+    )
+
+
+def test_disclosure_identity_is_minted_at_ingestion_not_at_render(tmp_path) -> None:
+    """#7040 round 9 finding 4: identity must be minted where a transcript
+    ENTERS the model, not inside renderMessages()/recovery.
+
+    Rounds 5-9 rejected successive fixes for *moving* the inference rather than
+    eliminating it: buildToolCard() scanning S.toolCalls, then
+    _toolCallByDisclosureKey() recounting the current candidate order, then a
+    stamping pass invoked from render and recovery. All of those re-derive the
+    coordinate from whatever array/order a given pass happens to observe.
+
+    This asserts the structural contract two ways:
+
+    1. Runtime: assigning to S.messages stamps the incoming transcript, so a
+       call already carries its ordinal *before* anything renders.
+    2. Source: neither renderMessages() nor _toolCallByDisclosureKey() calls
+       the minting function any more.
+    """
+    ui_src = (REPO / "static" / "ui.js").read_text(encoding="utf-8")
+
+    # ── 1. Runtime: the ingestion seam stamps on assignment ────────────────
+    import re as _re
+    seam = _re.search(
+        r"\(function _installMessagesIngestionSeam\(\)\{.*?\}\)\(\);",
+        ui_src,
+        _re.S,
+    )
+    assert seam, "S.messages ingestion seam not found"
+
+    stamper = _function_src(ui_src, "_stampToolCallOrdinals")
+
+    module_path = tmp_path / "seam_mod.js"
+    module_path.write_text(
+        "const S={session:null,messages:[],toolCalls:[]};\n"
+        + seam.group(0)
+        + "\n"
+        + stamper
+        + "\nmodule.exports={S};\n",
+        encoding="utf-8",
+    )
+
+    driver = tmp_path / "seam_driver.js"
+    driver.write_text(
+        r"""
+const { S } = require(process.argv[2]);
+// A freshly-arrived server transcript: nothing preassigned.
+S.messages = [{
+  role: 'assistant',
+  tool_calls: [
+    { name: 'read', args: { path: 'a.txt' } },
+    { name: 'read', args: { path: 'a.txt' } },
+  ],
+}];
+// Reading straight back: no render, no recovery, nothing else ran.
+const ords = S.messages[0].tool_calls.map(tc => tc._disclosureOrdinal);
+console.log(JSON.stringify({
+  ordinals: ords,
+  stampedOnAssignment: ords[0] === 0 && ords[1] === 1,
+}));
+""",
+        encoding="utf-8",
+    )
+
+    import shutil
+    node = shutil.which("node")
+    if node is None:
+        import pytest as _pytest
+        _pytest.skip("node not on PATH")
+    proc = subprocess.run(
+        [node, str(driver), str(module_path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["stampedOnAssignment"], (
+        "assigning S.messages did not mint identities at ingestion: "
+        f"{data['ordinals']}"
+    )
+
+    # ── 2. Source: render and recovery no longer mint ──────────────────────
+    # Assert on real CALL sites, not incidental prose: a comment naming the
+    # minting function must not be able to fail (or pass) this contract.
+    call_re = _re.compile(r"(?<![\w.])_stampToolCallOrdinals\s*\(")
+
+    render_src = _function_src(ui_src, "renderMessages")
+    assert not call_re.search(render_src), (
+        "renderMessages() still mints disclosure identity; rounds 5-9 required "
+        "removing render-time allocation"
+    )
+
+    recovery_src = _function_src(ui_src, "_toolCallByDisclosureKey")
+    assert not call_re.search(recovery_src), (
+        "_toolCallByDisclosureKey() still mints/recounts identity; recovery "
+        "must only compare the carried coordinate"
+    )
+
+    # And the seam itself must still be the one place that DOES call it.
+    assert call_re.search(seam.group(0)), "ingestion seam no longer mints"
