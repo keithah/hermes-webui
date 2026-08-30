@@ -5987,6 +5987,28 @@ def _message_identity(msg):
                 '',  # no tool_call_id
                 '__partial__' + reasoning_key,
             )
+        # The identical exponential-accumulation hazard exists for empty rows
+        # that do NOT carry the _partial flag. An interrupted/incomplete turn
+        # persists reasoning-only assistant rows (empty content, no tool calls,
+        # finish_reason="incomplete"). Returning None left them untrackable by
+        # the `seen` dedup in _merge_display_messages_after_agent_result, and
+        # the assistant/tool-only recovery branch there does not apply
+        # _strip_replayed_prefix -- so every such writeback re-appended the rows
+        # already present and the count DOUBLED per turn (observed in the wild:
+        # multiplicities of exactly 2^0..2^21 in one sidecar, 6.4 GB).
+        # Key them on their full normalized reasoning payload: full text (not a
+        # truncated prefix) so two genuinely different reasoning rows can never
+        # collide into one identity and be wrongly collapsed.
+        reasoning_text = " ".join(
+            str(msg.get('reasoning') or msg.get('reasoning_content') or '').split()
+        )
+        if reasoning_text:
+            return (
+                role,
+                '',  # empty text
+                '',  # no tool_call_id
+                '__reasoning__' + reasoning_text,
+            )
         return None
     return (
         role,
@@ -7086,6 +7108,24 @@ def _merge_display_messages_after_agent_result(
             continue
         if (
             key is not None
+            and key in seen
+            and isinstance(msg, dict)
+            and msg.get('role') == 'assistant'
+            and not _message_text(msg.get('content', ''))
+            and not msg.get('tool_call_id')
+            and not msg.get('tool_calls')
+        ):
+            # Reasoning-only rows (empty content, no tool calls) carry no
+            # visible transcript content, so the "identical answers in separate
+            # user turns must stay visible" rationale below does not apply to
+            # them -- there is nothing visible to preserve. Dedup them against
+            # the whole transcript rather than only the adjacent row. Without
+            # this, a repeatedly replayed recovery history still accumulates one
+            # copy per writeback (linear bloat, on top of the exponential case
+            # fixed in _message_identity).
+            continue
+        if (
+            key is not None
             and isinstance(msg, dict)
             and msg.get('role') == 'assistant'
             and merged
@@ -7110,6 +7150,21 @@ def _merge_display_messages_after_agent_result(
         merged.append(copy.deepcopy(display_msg))
         if key is not None:
             seen.add(key)
+    # Defensive runaway detector. A merge that is working correctly can only
+    # append the current turn's delta, so the result cannot be a large multiple
+    # of its inputs. Deliberately observe-only: a hard cap here would silently
+    # discard transcript rows, which is worse than the bloat it prevents. This
+    # exists so a future dedup regression is loud in the logs immediately
+    # instead of growing a sidecar to gigabytes unnoticed.
+    _merge_input_max = max(len(previous_display), len(result_messages), 1)
+    if len(merged) > (_merge_input_max * 4) + 32:
+        logger.error(
+            "Display merge produced an implausible transcript: %d rows from "
+            "inputs of %d display / %d result rows. This is the signature of a "
+            "message-identity dedup failure (see _message_identity); the "
+            "sidecar may be accumulating duplicates.",
+            len(merged), len(previous_display), len(result_messages),
+        )
     return merged
 
 
