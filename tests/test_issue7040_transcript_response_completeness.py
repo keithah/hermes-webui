@@ -100,7 +100,10 @@ def test_redaction_stays_semantically_complete_in_a_huge_message():
     """
     secret = "ghp_" + ("a" * 36)
     half = _benign_blob(_HUGE // 2)
-    blob = half + secret + half
+    # Space-delimit the secret: the redactor's patterns are word-boundary
+    # anchored, so a blob whose split happens to land mid-word would leave it
+    # unmasked for reasons unrelated to this test's subject.
+    blob = half + " " + secret + " " + half
     out = redact_session_data(
         {"session_id": "s1", "messages": [{"role": "assistant", "content": blob}]}
     )
@@ -110,3 +113,4 @@ def test_redaction_stays_semantically_complete_in_a_huge_message():
     # Everything except the credential is preserved.
     assert got.startswith(half)
     assert got.endswith(half)
+    assert len(got) >= len(half) * 2
