@@ -27,6 +27,8 @@ import threading
 import time
 from pathlib import Path
 
+from tests.test_provider_enum_cache import _clear_cache, _install_fake_models
+
 
 def _catalog(label: str) -> dict:
     return {
@@ -117,7 +119,19 @@ def test_late_failed_worker_does_not_clear_newer_owners_flag(tmp_path, monkeypat
     """Finding 2: G0's worker remains live (blocked), an invalidation
     retires G0 and a fresh G1 build claims ownership, and only THEN does
     G0's stale worker finally raise. G0's failure cleanup must be a no-op —
-    it must NOT clear G1's in-progress flag out from under it."""
+    it must NOT clear G1's in-progress flag out from under it.
+
+    The interleaving is asserted explicitly, not assumed (#7007 round 6
+    audit): an earlier version of this test waited on a single shared
+    "a release happened" Event and gave G0's probe a 5s timeout. G0's probe
+    therefore timed out and released its ownership on its own, *before* the
+    invalidation and before G1 existed — a release by the still-legitimate
+    owner, which the guard correctly permits. The shared Event was already
+    set by that early call, so the final assertion ran against a flag nobody
+    had contended for, and the test passed even with the ownership guard
+    deleted. It now tracks releases per owner tuple and asserts that G0's
+    cleanup really did run while G1 was the live owner.
+    """
     import api.config as cfg
 
     _reset_models_memory_cache(monkeypatch)
@@ -133,22 +147,28 @@ def test_late_failed_worker_does_not_clear_newer_owners_flag(tmp_path, monkeypat
     def _invoke(_builder):
         call_count[0] += 1
         if call_count[0] == 1:
-            assert g0_release.wait(timeout=5), "test setup failed to release G0"
+            # Generous timeout: this must NEVER expire on its own, or G0
+            # would retire itself while still the legitimate owner and the
+            # race under test would silently not happen.
+            assert g0_release.wait(timeout=30), "test setup failed to release G0"
             raise RuntimeError("G0 probe failed (arrives late, after G1 started)")
-        # G1 must still be "in progress" when we check below, not finished
-        # and already published — block it on its own release too.
         g1_probing.set()
-        assert g1_release.wait(timeout=5), "test setup failed to release G1"
+        assert g1_release.wait(timeout=30), "test setup failed to release G1"
         return _catalog("g1-result")
 
     monkeypatch.setattr(cfg, "_invoke_models_rebuild", _invoke)
 
-    cleanup_attempted = threading.Event()
+    owners: dict = {}
+    release_attempts: list = []
+    g0_cleanup_ran = threading.Event()
     real_release = cfg._release_build_owner_if_current
 
     def _tracking_release(owner):
+        live_owner_at_call = cfg._active_build_owner
         real_release(owner)
-        cleanup_attempted.set()
+        release_attempts.append((owner, live_owner_at_call))
+        if owner == owners.get("g0"):
+            g0_cleanup_ran.set()
 
     monkeypatch.setattr(cfg, "_release_build_owner_if_current", _tracking_release)
 
@@ -157,27 +177,44 @@ def test_late_failed_worker_does_not_clear_newer_owners_flag(tmp_path, monkeypat
     # blocked on g0_release.
     cfg.get_available_models(force_refresh=True)
     assert cfg._cache_build_in_progress is True, "G0's worker should still own the build"
+    owners["g0"] = cfg._active_build_owner
+    assert owners["g0"] is not None
 
     # An invalidation retires G0 (e.g. a credential edit landed).
     cfg.invalidate_models_cache()
     assert cfg._cache_build_in_progress is False
+    assert not g0_cleanup_ran.is_set(), (
+        "G0's cleanup must not have run yet — it has to arrive AFTER G1 "
+        "takes over for this test to exercise anything"
+    )
 
     # G1 starts a fresh build and claims ownership. Same tiny budget, so
     # this also returns immediately via the budget-exceeded fallback while
     # G1's own worker (call #2, blocked on g1_release) keeps running.
     cfg.get_available_models(force_refresh=True)
-    assert g1_probing.wait(timeout=5), "G1 never reached its probe"
+    assert g1_probing.wait(timeout=10), "G1 never reached its probe"
     assert cfg._cache_build_in_progress is True, "G1 should now own the build"
+    owners["g1"] = cfg._active_build_owner
+    assert owners["g1"] != owners["g0"]
 
     # NOW let G0's stale worker finally fail.
     g0_release.set()
-    assert cleanup_attempted.wait(timeout=5), "G0's late failure cleanup never ran"
+    assert g0_cleanup_ran.wait(timeout=10), "G0's late failure cleanup never ran"
+
+    # The interleaving actually happened: G0's cleanup ran while G1 owned.
+    g0_attempts = [a for a in release_attempts if a[0] == owners["g0"]]
+    assert g0_attempts, "no release was attempted for G0's owner tuple"
+    assert g0_attempts[-1][1] == owners["g1"], (
+        "the race under test never happened — G0's cleanup must run while "
+        f"G1 is the live owner, saw live owner {g0_attempts[-1][1]!r}"
+    )
 
     # G1's flag must have survived G0's late (now-stale) failure untouched.
     assert cfg._cache_build_in_progress is True, (
         "a late-failing stale owner (G0) must not be able to clear a "
         "newer owner's (G1) in-progress flag"
     )
+    assert cfg._active_build_owner == owners["g1"]
 
     g1_release.set()
 
@@ -292,3 +329,66 @@ def test_disk_read_before_lock_cannot_resurrect_a_generation_the_writer_lost(tmp
     # Sanity: the same file, re-stamped with the CURRENT generation, loads fine.
     cfg._save_models_cache_to_disk(_catalog("fresh-build"), generation=stale_generation + 1)
     assert cfg._load_models_cache_from_disk() is not None
+
+
+def test_stale_disk_preload_is_not_published_after_a_concurrent_invalidation(tmp_path, monkeypatch):
+    """#7007 round 6: the reader-side twin of the disk-resurrection race.
+
+    `_load_models_cache_from_disk()` is called BEFORE
+    `_available_models_cache_lock` is acquired (perf: "lets concurrent
+    requests skip entirely"). The round-5/6 fix stamps every write with its
+    build-start generation and rejects a mismatch at READ time, which closes
+    the case where the file itself was already stale when it was read.
+
+    It does NOT close this case: the file is perfectly *current* at read
+    time (its stamp matches the live generation, so the read legitimately
+    succeeds), and only THEN does an invalidation land — bumping the
+    generation and deleting the file — while this caller is still between
+    its pre-lock read and its in-lock publish. The read-time check cannot
+    help here; it already passed, correctly. Without a re-check at
+    publication the caller writes that now-superseded snapshot straight into
+    `_available_models_cache` with a fresh timestamp, so every subsequent
+    reader is served the pre-invalidation catalog (e.g. missing a
+    just-authenticated provider) for the full TTL.
+
+    This is the "stale disk preload followed by invalidate before
+    publication" interleaving the round-4 re-gate asked for by name.
+    Deterministic: the invalidation is fired from inside the stubbed disk
+    read, which is exactly the gap under test — no sleeps.
+    """
+    import api.config as cfg
+
+    _reset_models_memory_cache(monkeypatch)
+    _isolate_disk_and_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0, raising=False)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cfg, "_invoke_models_rebuild", lambda _builder: _catalog("fresh-rebuild")
+    )
+
+    invalidated = []
+
+    def _disk_read_then_invalidate():
+        # The read itself is legitimate: at this instant the file's stamped
+        # generation matches the live one. The invalidation lands right
+        # after it returns and before this caller takes the lock.
+        if not invalidated:
+            invalidated.append(True)
+            cfg.invalidate_models_cache()
+        return _catalog("stale-preload")
+
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", _disk_read_then_invalidate)
+
+    result = cfg.get_available_models()
+
+    assert invalidated, "the interleaving under test never happened"
+    assert result["default_model"] != "stale-preload", (
+        "a disk snapshot read before the lock must not be published after an "
+        "invalidation superseded it — the read-time generation check already "
+        "passed and cannot catch an invalidation that lands afterwards"
+    )
+    assert result["default_model"] == "fresh-rebuild"
+    assert (
+        cfg._available_models_cache is None
+        or cfg._available_models_cache.get("default_model") != "stale-preload"
+    ), "the superseded snapshot must not be resident in the memory cache either"

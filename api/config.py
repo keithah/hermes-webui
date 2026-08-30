@@ -8583,6 +8583,14 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     # so only one thread rebuilds while others wait.
     disk_groups = None
     stale_disk_groups = None
+    # Snapshot the generation BEFORE the read (#7007 round 6): whatever this
+    # read returns describes the catalog as of AT MOST this generation. The
+    # read-time stamp check in `_is_loadable_disk_cache` proves the file was
+    # current when it was opened, but this read happens outside the lock, so
+    # an invalidation can still land between it and the in-lock publish
+    # below. Capturing before (not after) the read is the conservative side:
+    # an invalidation that lands *during* the read also fails the comparison.
+    disk_load_generation = _available_models_cache_generation
     if _available_models_cache is None and not force_refresh:
         disk_groups = _load_models_cache_from_disk()
         if disk_groups is None:
@@ -8681,8 +8689,20 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     return copy.deepcopy(stale_disk_groups)
                 return copy.deepcopy(_static_models_catalog_without_live_probes())
 
-        # Cold path: disk cache hit — use it (fast, no lock contention)
-        if disk_groups is not None and not force_refresh:
+        # Cold path: disk cache hit — use it (fast, no lock contention).
+        # Re-check the generation captured before the pre-lock read (#7007
+        # round 6): the read-time stamp check cannot see an invalidation that
+        # lands AFTER the read returns but before we take the lock. Without
+        # this, that superseded snapshot would be published into the memory
+        # cache with a fresh timestamp and served to every subsequent reader
+        # for the full TTL — the exact "catalog missing a just-authenticated
+        # provider" symptom invalidation exists to prevent. On a mismatch,
+        # drop it and fall through to a real rebuild for the live generation.
+        if (
+            disk_groups is not None
+            and not force_refresh
+            and disk_load_generation == _available_models_cache_generation
+        ):
             _available_models_cache = disk_groups
             _available_models_cache_ts = now
             _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()

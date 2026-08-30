@@ -44,10 +44,27 @@ def test_concurrent_cold_misses_are_coalesced(monkeypatch):
     _install_fake_models(monkeypatch, enumerate_providers)
     _clear_cache(config)
 
+    # Deterministic instead of a sleep(0.05) guess at scheduler timing
+    # (#7007 round 6 audit): wait until all 8 workers have actually ENTERED
+    # the cached lookup. Because the owner is still blocked on `release` at
+    # that point, the cache cannot be populated yet, so every entered
+    # follower must resolve to the in-flight event — which is exactly the
+    # coalescing this test asserts. With a fixed sleep, a slow scheduler
+    # could let followers arrive only after the owner had already returned
+    # and filled the cache, so `calls == 1` would hold vacuously without any
+    # coalescing having happened.
+    entered = threading.Semaphore(0)
+
+    def _enter_and_lookup():
+        entered.release()
+        return config._list_available_providers_cached("default")
+
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(config._list_available_providers_cached, "default") for _ in range(8)]
+        futures = [executor.submit(_enter_and_lookup) for _ in range(8)]
         assert started.wait(timeout=5)
-        time.sleep(0.05)
+        for _ in range(8):
+            assert entered.acquire(timeout=5), "not every worker entered the lookup"
+        assert calls == 1, "the owner must still be the only prober at this point"
         release.set()
         results = [future.result(timeout=5) for future in futures]
 
