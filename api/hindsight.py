@@ -50,7 +50,7 @@ _RATE_LOCK = threading.Lock()
 _RATE_STATE: dict[tuple[str, str], list[float]] = {}
 _RATE_STATE_MAX = 1024
 _STATUS_LOCK = threading.Lock()
-_STATUS_CACHE: dict[tuple[str, str, str, str, str], tuple[float, dict[str, Any]]] = {}
+_STATUS_CACHE: dict[tuple[str, str, str, str, str, bool], tuple[float, dict[str, Any]]] = {}
 _STATUS_CACHE_MAX = 256
 
 
@@ -558,7 +558,18 @@ def handle_status(handler: Any):
     # serving a stale reachable/auth-failure result for up to STATUS_TTL —
     # api_url+bank_id alone can stay identical across a key change.
     key_fingerprint = hashlib.sha256(cfg["_api_key"].encode("utf-8")).hexdigest() if cfg["_api_key"] else ""
-    cache_key = (_active_home().as_posix(), cfg["api_url"], cfg["bank_id"], cfg["provider"], key_fingerprint)
+    #
+    # `enabled` is keyed directly rather than by enumerating its inputs. It
+    # selects which branch below produces `result` (the constant disabled
+    # hint vs a live upstream probe), and it derives from four things:
+    # config readability, provider, memory_enabled, and key presence. The
+    # rest of this tuple covers only two of those. Enumerating the inputs
+    # has already missed one twice — credential identity, then
+    # memory_enabled — and config-unreadable would be the third (it falls
+    # back to the env/default api_url, so the key can stay byte-identical
+    # while enabled flips). Keying the derived value that actually gates
+    # the branch is correct by construction.
+    cache_key = (_active_home().as_posix(), cfg["api_url"], cfg["bank_id"], cfg["provider"], key_fingerprint, bool(cfg["enabled"]))
     now = time.monotonic()
     with _STATUS_LOCK:
         cached = _STATUS_CACHE.get(cache_key)

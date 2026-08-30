@@ -187,3 +187,53 @@ def test_status_does_not_forward_unvalidated_upstream_total(monkeypatch, upstrea
         assert "total_memories" not in payload, payload
     else:
         assert payload["total_memories"] == expected
+
+
+def test_status_cache_key_covers_the_enabled_branch_selector(monkeypatch, tmp_path):
+    """Toggling memory_enabled must change the status response immediately.
+
+    handle_status caches `result` under a key that did not include `enabled`,
+    yet `enabled` selects which branch produces that result: the constant
+    disabled hint, or a live upstream probe. Flipping memory.memory_enabled
+    leaves api_url/bank_id/provider/key identical, so the pre-fix key was
+    byte-identical across the toggle and the panel served the stale branch's
+    answer for up to STATUS_TTL (30s). The user-visible direction is the
+    enable case: you switch memory on and the panel still reports unreachable
+    with a hint telling you to configure what you just configured.
+
+    This drives the real handler, and toggles only the one config flag.
+    """
+    home = tmp_path / "profile"
+    (home / "hindsight").mkdir(parents=True)
+    (home / "hindsight" / "config.json").write_text(
+        json.dumps({"api_url": "https://memory.example", "bank_id": "bank"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(hindsight, "_active_home", lambda: home)
+    monkeypatch.setattr(hindsight, "_load_env_file", lambda _p: {})
+    monkeypatch.setattr(hindsight, "_profile_secret", lambda _n, _h: "key")
+    monkeypatch.setattr(hindsight, "_validate_api_url", lambda u: str(u).rstrip("/"))
+    monkeypatch.setattr(hindsight, "_validate_bank_id", lambda b: str(b))
+    monkeypatch.setattr(hindsight, "_proxy", lambda *_a, **_k: (200, {"total": 3}))
+    monkeypatch.setattr("api.helpers.j", lambda _handler, payload, **_kwargs: payload)
+
+    memory_enabled = {"value": False}
+    monkeypatch.setattr(
+        "api.config.get_config_snapshot",
+        lambda: {"memory": {"provider": "hindsight", "memory_enabled": memory_enabled["value"]}},
+    )
+
+    hindsight._STATUS_CACHE.clear()
+
+    disabled = hindsight.handle_status(_handler())
+    assert disabled["enabled"] is False
+    assert disabled["reachable"] is False
+    assert "total_memories" not in disabled, disabled
+
+    # Only memory_enabled changes. No TTL expiry, no cache clear.
+    memory_enabled["value"] = True
+    enabled = hindsight.handle_status(_handler())
+    assert enabled["enabled"] is True
+    assert enabled["reachable"] is True, enabled
+    assert enabled.get("total_memories") == 3, enabled
+    assert "hint" not in enabled, enabled
