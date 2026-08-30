@@ -9140,6 +9140,12 @@ def get_available_models_for_session_visit() -> dict:
                 _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
                 return cached
         _mark("memory_cache_miss_loading_disk")
+        # Snapshot the generation BEFORE the read (#7007), mirroring
+        # get_available_models(): whatever this read returns describes the
+        # catalog as of AT MOST this generation. Capturing before (not after)
+        # the read is the conservative side -- an invalidation that lands
+        # *during* the read also fails the comparison below.
+        disk_load_generation = _available_models_cache_generation
         disk_cached = _load_models_cache_from_disk()
         if disk_cached is not None:
             with _available_models_cache_lock:
@@ -9148,13 +9154,28 @@ def get_available_models_for_session_visit() -> dict:
                     _mark("disk_then_memory_cache_hit")
                     _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
                     return cached
-                _available_models_cache = copy.deepcopy(disk_cached)
-                _available_models_cache_ts = time.monotonic()
-                _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
-                _sync_models_cache_provenance()
-            _mark("disk_cache_returned")
-            _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
-            return copy.deepcopy(disk_cached)
+                # Re-check the generation captured before the pre-lock read
+                # (#7007): the read-time stamp check in _is_loadable_disk_cache
+                # proves the file was current when opened, but the read happens
+                # OUTSIDE this lock, so an invalidation can land between it and
+                # this publish. The source-fingerprint guard in
+                # _get_fresh_memory_models_cache cannot catch that either --
+                # this publish stamps the *current* fingerprint onto the
+                # superseded payload, so it reads as valid. Without this check
+                # that snapshot is served for the full _AVAILABLE_MODELS_CACHE_TTL
+                # (24h) -- the exact "catalog missing a just-authenticated
+                # provider" symptom invalidation exists to prevent. On a
+                # mismatch, drop it and fall through to a real rebuild.
+                if disk_load_generation == _available_models_cache_generation:
+                    _available_models_cache = copy.deepcopy(disk_cached)
+                    _available_models_cache_ts = time.monotonic()
+                    _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+                    _sync_models_cache_provenance()
+                    _mark("disk_cache_returned")
+                    _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
+                    return copy.deepcopy(disk_cached)
+                _mark("disk_cache_superseded")
+                disk_cached = None
 
     _mark("cache_age_stale_or_missing")
     stale_cached = disk_cached or _load_stale_models_cache_from_disk()
