@@ -818,3 +818,147 @@ process.stdin.on('end', () => {
         f"on a realistic plain-text stream, got incremental={data['incrementalWork']} "
         f"vs full-rescan={data['fullRescanWork']}"
     )
+
+
+def test_production_projector_work_is_linear_on_a_long_open_payload(tmp_path) -> None:
+    """#7040 round 9: measure the COMPLETE production projector, not one
+    internal scanner.
+
+    The previous perf test called ``cache.project()`` directly and counted only
+    ``_opaqueRunSpans`` input, on ordinary spaced prose. That could not see the
+    wrapper's own full-text ``_candidateScanRe`` safe-image sweep, the
+    ``raw.startsWith(rawSnapshot)`` full-prefix comparison, or the
+    ``data:``-guard's slice-to-end-of-string — each of which was independently
+    O(n) per call, so the "incremental" path was still cumulatively O(n^2).
+
+    This drives the real entry point (``_projectTranscriptTextForDisplay`` with
+    a ``liveCache``) on the exact target shape — ONE long, still-growing opaque
+    payload — and counts every O(n) primitive the implementation can reach:
+    ``_opaqueRunSpans`` input, ``String#toLowerCase``, ``String#startsWith``,
+    and ``RegExp#exec`` input. It also measures the no-cache baseline in the
+    same process so the assertion is a ratio, not a hand-tuned constant.
+    """
+    driver = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function extractConst(name) {
+  const match = src.match(new RegExp('const ' + name + '=([^\\n]*);'));
+  if (!match) throw new Error(name + ' not found');
+  globalThis[name] = eval('(' + match[1] + ')');
+}
+function extractFunc(name) {
+  const start = src.search(new RegExp('function\\s+' + name + '\\s*\\('));
+  if (start < 0) throw new Error(name + ' not found');
+  let cursor = src.indexOf('{', start) + 1;
+  let depth = 1;
+  while (depth && cursor < src.length) {
+    if (src[cursor] === '{') depth++;
+    else if (src[cursor] === '}') depth--;
+    cursor++;
+  }
+  return src.slice(start, cursor);
+}
+extractConst('_DATA_IMAGE_RE');
+extractConst('_DATA_IMAGE_SVG_RE');
+extractConst('_DATA_IMAGE_MAX_LEN');
+extractConst('_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT');
+extractConst('_TRANSCRIPT_DISPLAY_OPAQUE_HEAD');
+extractConst('_TRANSCRIPT_DISPLAY_NOTICE');
+extractConst('_TRANSCRIPT_DISPLAY_OPAQUE_DATA_RE');
+eval(extractFunc('_isB64Code'));
+eval(extractFunc('_scanBase64Gap'));
+
+// ── instrument every O(n) primitive the projector can reach ──────────────
+let scanned = 0;
+let counting = false;
+const _origLower = String.prototype.toLowerCase;
+const _origStarts = String.prototype.startsWith;
+const _origExec = RegExp.prototype.exec;
+String.prototype.toLowerCase = function () { if (counting) scanned += this.length; return _origLower.call(this); };
+String.prototype.startsWith = function (s) { if (counting) scanned += this.length; return _origStarts.call(this, s); };
+RegExp.prototype.exec = function (s) { if (counting && typeof s === 'string') scanned += s.length; return _origExec.call(this, s); };
+
+let spansSrc = extractFunc('_opaqueRunSpans').replace(
+  'function _opaqueRunSpans(chunk){',
+  'function _opaqueRunSpans(chunk){ if (counting) scanned += chunk.length;'
+);
+eval(spansSrc);
+eval(extractFunc('_boundOpaqueRuns'));
+eval(extractFunc('_isSafeDataImageUri'));
+eval(extractFunc('_createIncrementalOpaqueRunCache'));
+eval(extractFunc('_projectTranscriptTextForDisplay'));
+
+let input = '';
+process.stdin.on('data', c => { input += c; });
+process.stdin.on('end', () => {
+  const { total, chunk } = JSON.parse(input);
+  // ONE long, still-growing opaque run: the exact case this change targets.
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let payload = '';
+  for (let i = 0; i < total; i++) payload += alphabet[i % alphabet.length];
+  const text = 'here is the tool output ' + payload;
+
+  const run = (useCache) => {
+    const cache = useCache ? _createIncrementalOpaqueRunCache() : null;
+    scanned = 0;
+    counting = true;
+    let last = '';
+    for (let pos = chunk; pos <= text.length; pos += chunk) {
+      const opts = { surface: 'assistant', streaming: true };
+      if (cache) opts.liveCache = cache;
+      last = _projectTranscriptTextForDisplay(text.slice(0, pos), opts);
+    }
+    counting = false;
+    return { scanned, last };
+  };
+
+  const cached = run(true);
+  const baseline = run(false);
+  // Equivalence spot-check: the cached path must agree with a fresh,
+  // non-cached projection of the same final text.
+  const reference = _projectTranscriptTextForDisplay(
+    text.slice(0, Math.floor(text.length / chunk) * chunk),
+    { surface: 'assistant', streaming: true }
+  );
+  process.stdout.write(JSON.stringify({
+    cachedScanned: cached.scanned,
+    baselineScanned: baseline.scanned,
+    textLength: text.length,
+    matchesReference: cached.last === reference,
+  }));
+});
+"""
+    driver_path = tmp_path / "perf_driver.js"
+    driver_path.write_text(driver, encoding="utf-8")
+
+    total, chunk = 120_000, 600
+    result = subprocess.run(
+        [NODE, str(driver_path), str(UI_JS_PATH)],
+        input=json.dumps({"total": total, "chunk": chunk}),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+
+    # Correctness first: a faster wrong answer is not a fix.
+    assert data["matchesReference"], "cached projection diverged from a fresh projection"
+
+    n = data["textLength"]
+    cached_scanned = data["cachedScanned"]
+    baseline_scanned = data["baselineScanned"]
+
+    # The full-rescan baseline is quadratic: ~n^2/(2*chunk).
+    assert baseline_scanned > 10 * n, (
+        "baseline should be super-linear; the measurement harness is not "
+        f"capturing the scans (baseline={baseline_scanned}, n={n})"
+    )
+    # The cached production path must stay within a small multiple of the text
+    # length. A reintroduced full-text sweep anywhere in the wrapper (safe-image
+    # scan, prefix compare, data:-guard slicing to end-of-string) immediately
+    # pushes this into the same order as the baseline.
+    assert cached_scanned < 6 * n, (
+        f"production projector is not linear: scanned {cached_scanned} chars "
+        f"for a {n}-char stream (baseline {baseline_scanned})"
+    )
