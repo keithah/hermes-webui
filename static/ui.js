@@ -13513,6 +13513,29 @@ function _stampToolCallOrdinals(messages){
     }
   }
 }
+// assistant_msg_idx is WINDOW-relative (rawIdx into the currently-loaded
+// S.messages window), NOT a stable coordinate: loading an older page prepends
+// messages and shifts every index, and _ensureAllMessagesLoaded() resets the
+// window wholesale. Keying disclosure identity on it made the DOM
+// data-tool-disclosure-key disagree with the same call's recomputed identity
+// after a prepend -- and worse, let an unrelated same-named ID-less call that
+// landed on the vacated index match the stale key, so Show-more could restore
+// the wrong payload. Convert to the ABSOLUTE session index
+// (_messageSessionIndexBase() + rawIdx), which is invariant because the two
+// co-vary: a prepend that raises rawIdx by N lowers _oldestIdx by the same N.
+// assistant_msg_idx itself deliberately stays window-relative -- the windowing
+// and lookup paths (renderedRawIdxs, the S.toolCalls index) require that -- so
+// this is a second, separate coordinate rather than a redefinition of the
+// existing field.
+function _toolDisclosureOwnerIndex(rawIdx){
+  const n=Number(rawIdx);
+  if(!Number.isFinite(n)) return rawIdx;
+  if(typeof _messageSessionIndexForRawIdx==='function'){
+    const abs=_messageSessionIndexForRawIdx(n);
+    if(abs!==null&&abs!==undefined&&Number.isFinite(Number(abs))) return Number(abs);
+  }
+  return n;
+}
 function _toolDisclosureIdentity(tc, ordinal){
   if(!tc) return '';
   const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
@@ -13528,7 +13551,7 @@ function _toolDisclosureIdentity(tc, ordinal){
   const hasBurst=tc.activityBurstId!==undefined&&tc.activityBurstId!==null&&String(tc.activityBurstId)!==''&&String(tc.activityBurstId)!=='0';
   const hasSeq=tc.activitySegmentSeq!==undefined&&tc.activitySegmentSeq!==null&&String(tc.activitySegmentSeq)!==''&&String(tc.activitySegmentSeq)!=='0';
   let owner='';
-  if(hasAssistantIdx) owner=`a:${tc.assistant_msg_idx}`;
+  if(hasAssistantIdx) owner=`a:${_toolDisclosureOwnerIndex(tc.assistant_msg_idx)}`;
   else if(hasBurst||hasSeq) owner=`b:${hasBurst?tc.activityBurstId:''}:s:${hasSeq?tc.activitySegmentSeq:''}`;
   else owner='a:';
   const name=tc.name||'tool';

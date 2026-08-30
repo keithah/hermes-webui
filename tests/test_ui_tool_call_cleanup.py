@@ -1129,6 +1129,13 @@ def test_idless_call_identity_survives_full_lifecycle_without_preassignment(tmp_
 
     ui_funcs = [
         "_stampToolCallOrdinals",
+        # _toolDisclosureIdentity now converts the window-relative
+        # assistant_msg_idx to an absolute session index; extract the helper it
+        # calls so this harness cannot ReferenceError the moment a fixture
+        # gains an assistant_msg_idx.
+        "_messageSessionIndexBase",
+        "_messageSessionIndexForRawIdx",
+        "_toolDisclosureOwnerIndex",
         "_toolDisclosureIdentity",
         "_anchorSceneRowTimestampSeconds",
         "_anchorSceneToolCallFromRow",
@@ -1349,3 +1356,107 @@ console.log(JSON.stringify({
 
     # And the seam itself must still be the one place that DOES call it.
     assert call_re.search(seam.group(0)), "ingestion seam no longer mints"
+
+
+def test_disclosure_identity_survives_older_page_prepend(tmp_path):
+    """Disclosure identity must not shift when an older page is prepended.
+
+    ``assistant_msg_idx`` is ``rawIdx`` -- a 0-based index into the CURRENTLY
+    LOADED ``S.messages`` window, not a stable coordinate. Loading an older
+    page prepends messages and shifts every index (``_oldestIdx`` is
+    reassigned in ``sessions.js`` after the ``msg_before=`` fetch, and
+    ``_ensureAllMessagesLoaded`` resets it wholesale).
+
+    Keying identity on the raw index meant the ``data-tool-disclosure-key``
+    written into the DOM at render disagreed with the same call's identity
+    recomputed after a prepend, so Show-more recovery silently degraded to the
+    truncated preview -- and, worse, an unrelated same-named ID-less call that
+    landed on the vacated index matched the stale key and could restore the
+    WRONG payload.
+
+    This was previously masked only because a prepend happens to trigger a
+    full re-render and to change ``msgCount`` (invalidating the HTML cache).
+    That is a guard on one side, not stability by construction: identity must
+    be invariant on its own.
+    """
+    ui_src = UI_JS
+
+    def extract(src, name):
+        start = src.index(f"function {name}(")
+        cursor = src.index("{", start) + 1
+        depth = 1
+        while depth and cursor < len(src):
+            ch = src[cursor]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            cursor += 1
+        return src[start:cursor]
+
+    funcs = [
+        "_messageSessionIndexBase",
+        "_messageSessionIndexForRawIdx",
+        "_toolDisclosureOwnerIndex",
+        "_toolDisclosureIdentity",
+    ]
+
+    module_path = tmp_path / "window_identity_mod.js"
+    module_path.write_text(
+        # _oldestIdx is the window origin the real code mutates on paging.
+        "let _oldestIdx = 0;\n"
+        "function setOldest(v){ _oldestIdx = v; }\n"
+        + "\n".join(extract(ui_src, n) for n in funcs)
+        + "\nmodule.exports = { setOldest, _toolDisclosureIdentity };\n",
+        encoding="utf-8",
+    )
+
+    driver = tmp_path / "driver.js"
+    driver.write_text(
+        r"""
+const M = require(process.argv[2]);
+const out = {};
+
+// Tail window loaded first: messages 30..N occupy rawIdx 0..; the owning
+// assistant message sits at rawIdx 3 (absolute session index 33).
+M.setOldest(30);
+const atRender = { name: 'read_file', assistant_msg_idx: 3, _disclosureOrdinal: 0 };
+out.keyAtRender = M._toolDisclosureIdentity(atRender);
+
+// An older page is prepended: the window now starts at 0, so the SAME
+// message has shifted to rawIdx 33.
+M.setOldest(0);
+const sameCallAfterPrepend = { name: 'read_file', assistant_msg_idx: 33, _disclosureOrdinal: 0 };
+out.keyAfterPrepend = M._toolDisclosureIdentity(sameCallAfterPrepend);
+out.sameCallStillMatches = out.keyAtRender === out.keyAfterPrepend;
+
+// A genuinely DIFFERENT message now occupies the vacated raw position 3.
+// It must not be able to answer to the first call's key.
+const unrelatedCallAtOldPosition = { name: 'read_file', assistant_msg_idx: 3, _disclosureOrdinal: 0 };
+out.keyUnrelated = M._toolDisclosureIdentity(unrelatedCallAtOldPosition);
+out.unrelatedAliases = out.keyUnrelated === out.keyAtRender;
+
+console.log(JSON.stringify(out));
+""",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        ["node", str(driver), str(module_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+
+    assert out["sameCallStillMatches"], (
+        "the SAME tool call got a different disclosure identity after an older "
+        "page was prepended "
+        f"({out['keyAtRender']!r} at render vs {out['keyAfterPrepend']!r} "
+        "after) -- Show-more recovery cannot find its canonical payload"
+    )
+    assert not out["unrelatedAliases"], (
+        "an unrelated tool call that landed on the vacated raw index "
+        f"({out['keyUnrelated']!r}) matched the first call's key "
+        f"({out['keyAtRender']!r}) -- Show-more would restore the wrong payload"
+    )
