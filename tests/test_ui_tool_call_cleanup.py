@@ -960,3 +960,128 @@ class TestToolCardDesignTokens:
             assert "max-width:100%" in rule
             assert "box-sizing:border-box" in rule
             assert "min-width:0" in rule
+
+
+def test_two_identical_idless_calls_get_distinct_identities_without_preassignment(tmp_path) -> None:
+    """#7040 round 9: two same-name / equal-args ID-less tool calls in ONE
+    message must end up with distinct disclosure identities.
+
+    The prior reorder test manually assigned both ``_ordinal`` and
+    ``_disclosureOrdinal`` before asserting, i.e. it assumed the very invariant
+    under test. This one assigns NOTHING: it hands raw, unstamped calls to the
+    real normalization entry point (``_stampToolCallOrdinals``) exactly as
+    ``renderMessages()`` does, then asks ``_toolDisclosureIdentity`` for their
+    identities.
+
+    Covers the two concrete collision sources: per-array counter restarts
+    (``tool_calls`` vs ``_partial_tool_calls`` vs ``content`` each began at 0),
+    and the implicit ``o:0`` fallback that let an unstamped call alias the real
+    first occurrence.
+    """
+    driver = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+function extractFunc(name) {
+  const start = src.search(new RegExp('function\\s+' + name + '\\s*\\('));
+  if (start < 0) throw new Error(name + ' not found');
+  let cursor = src.indexOf('{', start) + 1;
+  let depth = 1;
+  while (depth && cursor < src.length) {
+    if (src[cursor] === '{') depth++;
+    else if (src[cursor] === '}') depth--;
+    cursor++;
+  }
+  return src.slice(start, cursor);
+}
+eval(extractFunc('_stampToolCallOrdinals'));
+eval(extractFunc('_toolDisclosureIdentity'));
+
+const out = {};
+
+// (1) Two identical ID-less calls in the SAME tool_calls array.
+{
+  const messages = [{
+    role: 'assistant',
+    tool_calls: [
+      { name: 'read', function: { name: 'read', arguments: '{"path":"a.txt"}' } },
+      { name: 'read', function: { name: 'read', arguments: '{"path":"a.txt"}' } },
+    ],
+  }];
+  _stampToolCallOrdinals(messages);
+  const ids = messages[0].tool_calls.map(tc => _toolDisclosureIdentity(tc));
+  out.sameArray = ids;
+  out.sameArrayDistinct = ids[0] !== ids[1];
+}
+
+// (2) Identical ID-less calls SPREAD ACROSS the three arrays of one message.
+//     Each array used to restart its counter at 0.
+{
+  const messages = [{
+    role: 'assistant',
+    tool_calls: [{ name: 'read' }],
+    _partial_tool_calls: [{ name: 'read' }],
+    content: [{ type: 'tool_use', name: 'read' }],
+  }];
+  _stampToolCallOrdinals(messages);
+  const ids = [
+    _toolDisclosureIdentity(messages[0].tool_calls[0]),
+    _toolDisclosureIdentity(messages[0]._partial_tool_calls[0]),
+    _toolDisclosureIdentity(messages[0].content[0]),
+  ];
+  out.acrossArrays = ids;
+  out.acrossArraysDistinct = new Set(ids).size === ids.length;
+}
+
+// (3) An UNSTAMPED call must not alias the genuinely-minted ordinal 0.
+{
+  const messages = [{ role: 'assistant', tool_calls: [{ name: 'read' }] }];
+  _stampToolCallOrdinals(messages);
+  const stampedZero = _toolDisclosureIdentity(messages[0].tool_calls[0]);
+  const neverStamped = _toolDisclosureIdentity({ name: 'read' });
+  out.stampedZero = stampedZero;
+  out.neverStamped = neverStamped;
+  out.unstampedDistinct = stampedZero !== neverStamped;
+}
+
+// (4) Idempotence: re-running normalization must not renumber anything.
+{
+  const messages = [{
+    role: 'assistant',
+    tool_calls: [{ name: 'read' }, { name: 'read' }],
+  }];
+  _stampToolCallOrdinals(messages);
+  const first = messages[0].tool_calls.map(tc => _toolDisclosureIdentity(tc));
+  _stampToolCallOrdinals(messages);
+  _stampToolCallOrdinals(messages);
+  const again = messages[0].tool_calls.map(tc => _toolDisclosureIdentity(tc));
+  out.idempotent = JSON.stringify(first) === JSON.stringify(again);
+}
+
+process.stdout.write(JSON.stringify(out));
+"""
+    import shutil
+    node = shutil.which("node")
+    if node is None:
+        import pytest as _pytest
+        _pytest.skip("node not on PATH")
+    driver_path = tmp_path / "identity_driver.js"
+    driver_path.write_text(driver, encoding="utf-8")
+    result = subprocess.run(
+        [node, str(driver_path), str(REPO / "static" / "ui.js")],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+
+    assert data["sameArrayDistinct"], (
+        f"two identical ID-less calls in one array collided: {data['sameArray']}"
+    )
+    assert data["acrossArraysDistinct"], (
+        "ID-less calls spread across tool_calls/_partial_tool_calls/content "
+        f"collided (per-array counter restart): {data['acrossArrays']}"
+    )
+    assert data["unstampedDistinct"], (
+        "an unstamped call aliased the genuinely-minted ordinal 0: "
+        f"{data['stampedZero']!r} == {data['neverStamped']!r}"
+    )
+    assert data["idempotent"], "re-running normalization renumbered identities"

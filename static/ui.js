@@ -2702,11 +2702,6 @@ const _TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT=60000;
 const _TRANSCRIPT_DISPLAY_OPAQUE_HEAD=2048;
 const _TRANSCRIPT_DISPLAY_NOTICE='[opaque payload abbreviated for display]';
 const _TRANSCRIPT_DISPLAY_OPAQUE_DATA_RE=/data:(?:application|image)\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*;base64,[a-z0-9+/=\r\n]+/ig;
-// Same literal-prefix grammar as _TRANSCRIPT_DISPLAY_OPAQUE_DATA_RE but
-// anchored to match ONLY when there are zero payload chars after "base64,"
-// yet (used by _createIncrementalOpaqueRunCache to detect a still-growing,
-// not-yet-matched data-uri candidate the main regex can't see at all).
-const _PENDING_DATA_URI_TAIL_RE=/data:(?:application|image)\/[a-z0-9.+-]+(?:;[a-z0-9=.+-]+)*;base64,$/ig;
 function _isB64Code(code){ return (code>=65&&code<=90)||(code>=97&&code<=122)||(code>=48&&code<=57)||code===43||code===47||code===61||code===10||code===13; }
 function _opaqueRunSpans(chunk){
   // One ordered, non-overlapping list of runs to bound: data-URI-shaped runs
@@ -2835,77 +2830,169 @@ function _boundOpaqueRuns(chunk, streaming){
 // data:image mid-stream is rare enough that falling back there doesn't
 // undermine the fix for the dominant plain-text/tool-output case).
 function _createIncrementalOpaqueRunCache(){
-  let rawSnapshot='';
+  let rawSnapshotLen=0;
+  let tailSample='';           // last _TAIL_SAMPLE chars of the consumed prefix
   let boundedSoFar='';
-  let openSpan=null; // {start, kind}, absolute index into rawSnapshot -- or null
+  let openSpan=null;           // {start, kind}, absolute index -- or null
+  let imageScanFrom=0;         // prefix proven free of any "data:image" literal
+  const _TAIL_SAMPLE=64;
+  // "data:image" is 10 chars; a lookback of 32 comfortably covers a literal
+  // split across a chunk boundary.
+  const _IMG_LOOKBACK=32;
+  // A pending "data:...;base64," literal with zero payload chars yet is
+  // invisible to _TRANSCRIPT_DISPLAY_OPAQUE_DATA_RE (its payload group needs
+  // >=1 char), so the next chunk can make a match appear that starts BEFORE
+  // our re-entry point. Longest realistic such literal is well under 200.
+  const _DATA_URI_LOOKBACK=200;
+  function _snap(raw){
+    rawSnapshotLen=raw.length;
+    tailSample=raw.length<=_TAIL_SAMPLE?raw:raw.slice(raw.length-_TAIL_SAMPLE);
+  }
   function _fullRescan(raw, streaming){
     const out=_boundOpaqueRuns(raw, streaming);
-    if(!streaming){ rawSnapshot=raw; boundedSoFar=out; openSpan=null; return out; }
+    _snap(raw); boundedSoFar=out;
+    if(!streaming){ openSpan=null; return out; }
     const spans=_opaqueRunSpans(raw);
     const last=spans[spans.length-1];
-    rawSnapshot=raw; boundedSoFar=out;
     openSpan=(last&&last.end===raw.length) ? {start:last.start, kind:last.kind} : null;
     return out;
   }
+  // Extend an already-open run WITHOUT rescanning it from its origin. Both
+  // run kinds are charset runs over _isB64Code (the data-uri payload class
+  // /[a-z0-9+/=\r\n]/i is exactly that set), and neither can contain ':' --
+  // so no data-uri literal can hide inside an open run, and nothing before a
+  // run's own start affects where it ends. That makes extension provably
+  // identical to what a full rescan would compute, at O(appended) instead of
+  // O(run length) per call.
+  function _extendOpenRun(raw, span, fromIdx){
+    let j=Math.max(span.start+1, fromIdx);
+    if(j>raw.length) j=raw.length;
+    if(span.kind==='data-uri'){
+      // The regex payload class has no blank-line rule: "\n\n" stays inside.
+      while(j<raw.length && _isB64Code(raw.charCodeAt(j))) j++;
+      return {end:j, resume:j, open:j===raw.length};
+    }
+    // base64 gap run: mirror _scanBase64Gap's blank-line stop + trailing
+    // newline trim exactly. Seed sawNewline from the previous char, which is
+    // guaranteed to be inside the run.
+    let sawNewline=(raw.charCodeAt(j-1)===10||raw.charCodeAt(j-1)===13);
+    while(j<raw.length){
+      const cj=raw.charCodeAt(j);
+      if(!_isB64Code(cj)) break;
+      const isNewline=(cj===10||cj===13);
+      if(isNewline&&sawNewline) break;
+      sawNewline=isNewline;
+      j++;
+    }
+    // _scanBase64Gap trims trailing newlines off the SPAN but then advances
+    // its cursor to the untrimmed j ("i=j"), so those trimmed newlines are
+    // emitted as ordinary gap text and can never start a fresh run. Resuming
+    // at the trimmed end instead would let them seed one, diverging from a
+    // full rescan -- so report both positions.
+    let end=j;
+    while(end>span.start && (raw.charCodeAt(end-1)===10||raw.charCodeAt(end-1)===13)) end--;
+    return {end, resume:j, open:end===raw.length};
+  }
+  function _boundedRunText(raw, start, end){
+    const runLen=end-start;
+    return runLen>_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT
+      ? raw.slice(start, start+_TRANSCRIPT_DISPLAY_OPAQUE_HEAD)+'\n\n'+_TRANSCRIPT_DISPLAY_NOTICE
+      : raw.slice(start, end);
+  }
   return {
-    reset(){ rawSnapshot=''; boundedSoFar=''; openSpan=null; },
+    reset(){ rawSnapshotLen=0; tailSample=''; boundedSoFar=''; openSpan=null; imageScanFrom=0; },
+    // Incremental answer to "does this text contain any safe data-image
+    // candidate?" so the wrapper does not have to run its full-text
+    // _candidateScanRe on every streamed chunk (that scan alone was O(n) per
+    // call => O(n^2) cumulative, independent of this cache). A candidate can
+    // only begin at a "data:image" literal, so a prefix proven free of that
+    // literal can never sprout one; we re-check only the appended bytes plus
+    // a small boundary lookback.
+    mayContainDataImage(raw){
+      raw=String(raw||'');
+      if(raw.length<imageScanFrom || !this.isAppendOnly(raw)){ imageScanFrom=0; }
+      const from=Math.max(0, Math.min(imageScanFrom, raw.length)-_IMG_LOOKBACK);
+      const idx=raw.slice(from).toLowerCase().indexOf('data:image');
+      if(idx!==-1) return true;
+      imageScanFrom=raw.length;
+      return false;
+    },
+    // Cheap append-only check. A full raw.startsWith(rawSnapshot) is O(n) per
+    // call, which is one of the very costs this cache exists to remove. This
+    // cache is owner-scoped (one instance per attachLiveStream closure) and is
+    // only ever fed that one stream's own monotonically accumulating buffer,
+    // so the realistic non-append shape is a REWIND (the smd parser's
+    // tool-call-stripping self-heal), which the length test catches outright.
+    // The tail sample additionally pins the exact bytes at the previous
+    // boundary. Worst case on a miss is cosmetic and self-correcting: the
+    // settled (non-streaming) render re-projects from scratch.
+    isAppendOnly(raw){
+      if(raw.length<rawSnapshotLen) return false;
+      if(!rawSnapshotLen) return true;
+      const k=Math.min(_TAIL_SAMPLE, rawSnapshotLen);
+      return raw.slice(rawSnapshotLen-k, rawSnapshotLen)===tailSample;
+    },
     project(raw, streaming, hasSafeImageSpans){
       raw=String(raw||'');
-      if(hasSafeImageSpans || raw.length<rawSnapshot.length || !raw.startsWith(rawSnapshot)){
-        // Unsafe to reuse this call. Still update the cache from this raw
-        // text (unless a safe-image span is present, in which case the
-        // caller owns rendering this call and our cache would be stale
-        // either way) so a LATER call can resume incrementally once the
-        // one-off condition clears.
-        if(hasSafeImageSpans){ this.reset(); return _boundOpaqueRuns(raw, streaming); }
-        return _fullRescan(raw, streaming);
-      }
-      let reentryFrom = openSpan ? openSpan.start : rawSnapshot.length;
-      // A data-uri match's final payload group is GREEDY over the same
-      // charset base64 payload uses, so it can swallow what LOOKS like a
-      // second, later "data:" literal's own letters as more of the FIRST
-      // match's payload (stopping only at the following ':', which isn't in
-      // the payload charset) -- whether that happens depends on everything
-      // back to the FIRST match's own "data:" start, which can be
-      // arbitrarily far behind any bounded local slice. That non-local
-      // coupling makes the data-uri regex specifically unsafe to
-      // incrementalize with a bounded backward search (tried and reverted
-      // twice; verified failing against a real two-adjacent-data-uri
-      // differential test). Multiple adjacent data:image URIs with zero
-      // separator is a pathological, not realistic, input shape, so when a
-      // literal "data:" appears anywhere near the re-entry point, just fall
-      // back to a full, correct (if O(n) for this one call) rescan instead
-      // of trying to reverse-engineer the regex's own greedy cross-boundary
-      // behavior -- this keeps the common plain-text/tool-output case fast
-      // (the actual target of this fix) while staying provably correct for
-      // the rare data-uri case.
-      if(streaming){
-        const DATA_URI_LOOKBACK_WINDOW=200;
-        const tailStart=Math.max(0, reentryFrom-DATA_URI_LOOKBACK_WINDOW);
-        if(raw.slice(tailStart).toLowerCase().indexOf('data:')!==-1){
+      if(hasSafeImageSpans){ this.reset(); return _boundOpaqueRuns(raw, streaming); }
+      if(!this.isAppendOnly(raw)) return _fullRescan(raw, streaming);
+      if(!streaming) return _fullRescan(raw, streaming);
+      if(raw.length===rawSnapshotLen) return boundedSoFar;
+
+      // ── 0. Pending-data-uri guard, BEFORE any incremental reuse. ─────────
+      // A "data:...;base64," literal with no payload chars yet is invisible to
+      // _TRANSCRIPT_DISPLAY_OPAQUE_DATA_RE, so the next chunk can complete a
+      // match that starts BEHIND our re-entry point -- and can even RECLASSIFY
+      // an already-open base64 run (e.g. an open run "\nd" becomes gap "\n" +
+      // a data-uri span starting at the "d"). Neither the tail scan nor the
+      // open-run extension below can absorb that, so any "data:" at or near
+      // the boundary forces one full, correct rescan. Bounded to the appended
+      // bytes plus a small lookback (the old code sliced+lowercased from the
+      // open run's ORIGIN to end-of-string, which was itself O(n) per call).
+      {
+        const guardFrom=Math.max(0, rawSnapshotLen-_DATA_URI_LOOKBACK);
+        if(raw.slice(guardFrom).toLowerCase().indexOf('data:')!==-1){
           return _fullRescan(raw, streaming);
         }
       }
-      // A lone trailing newline that _scanBase64Gap trimmed down to nothing
-      // (a blank-line stop with nothing left to absorb) isn't a durable
-      // verdict: once more text follows, that same newline can become the
-      // start of a fresh run. Only applies with no open span (an open
-      // span's own .start is already exact for whatever it is).
-      if(!openSpan){
+
+      // ── 1. An already-open run: extend it in place. ──────────────────────
+      const _hadOpenSpan=!!openSpan;
+      if(openSpan){
+        const ext=_extendOpenRun(raw, openSpan, rawSnapshotLen);
+        if(ext.open){
+          // Still open => still withheld => output is unchanged.
+          _snap(raw);
+          return boundedSoFar;
+        }
+        // Closed: decide it once, permanently, then continue after it.
+        boundedSoFar+=_boundedRunText(raw, openSpan.start, ext.end);
+        // Newlines trimmed off the span end are plain gap text (see
+        // _extendOpenRun) -- emit them, then resume where _scanBase64Gap would.
+        if(ext.resume>ext.end) boundedSoFar+=raw.slice(ext.end, ext.resume);
+        openSpan=null;
+        rawSnapshotLen=ext.resume;
+      }
+
+      // ── 2. Scan only the un-consumed tail. ───────────────────────────────
+      let reentryFrom=rawSnapshotLen;
+      if(!_hadOpenSpan){
+        // A lone trailing newline that _scanBase64Gap trimmed to nothing is
+        // not a durable verdict: once more text follows, that newline can
+        // become the start of a fresh run.
         let backN=0;
         while(reentryFrom-backN>0){
-          const c=rawSnapshot.charCodeAt(reentryFrom-backN-1);
+          const c=raw.charCodeAt(reentryFrom-backN-1);
           if(c!==10&&c!==13) break;
           backN++;
         }
-        if(backN){ reentryFrom-=backN; boundedSoFar=boundedSoFar.slice(0, boundedSoFar.length-backN); }
+        if(backN && boundedSoFar.length>=backN){ reentryFrom-=backN; boundedSoFar=boundedSoFar.slice(0, boundedSoFar.length-backN); }
       }
-      const limit=_TRANSCRIPT_DISPLAY_OPAQUE_RUN_LIMIT, head=_TRANSCRIPT_DISPLAY_OPAQUE_HEAD, notice=_TRANSCRIPT_DISPLAY_NOTICE;
       const newSpans=_opaqueRunSpans(raw.slice(reentryFrom))
         .map(s=>({start:s.start+reentryFrom, end:s.end+reentryFrom, kind:s.kind}));
       let cutAt=raw.length;
       let nextOpenSpan=null;
-      if(streaming && newSpans.length){
+      if(newSpans.length){
         const last=newSpans[newSpans.length-1];
         if(last.end===raw.length){
           cutAt=last.start;
@@ -2917,13 +3004,12 @@ function _createIncrementalOpaqueRunCache(){
       for(const span of newSpans){
         if(span.start>=cutAt) break;
         if(span.start>pos) delta+=raw.slice(pos, span.start);
-        const runLen=span.end-span.start;
-        delta+= runLen>limit ? raw.slice(span.start, span.start+head)+'\n\n'+notice : raw.slice(span.start, span.end);
+        delta+=_boundedRunText(raw, span.start, span.end);
         pos=span.end;
       }
       if(pos<cutAt) delta+=raw.slice(pos, cutAt);
       boundedSoFar+=delta;
-      rawSnapshot=raw;
+      _snap(raw);
       openSpan=nextOpenSpan;
       return boundedSoFar;
     },
@@ -2953,6 +3039,17 @@ function _projectTranscriptTextForDisplay(value, options){
   // (see the cache's own fallback rationale for why); every other caller
   // (no liveCache passed) is completely unaffected.
   const liveCache=options&&options.liveCache;
+  // perf(#7040 round 9): the _candidateScanRe sweep below is itself O(text)
+  // and used to run on EVERY streamed chunk before the cache was ever
+  // consulted -- so the projector stayed O(n) per call (O(n^2) cumulative)
+  // even on the "incremental" path. A safe-image candidate can only begin at
+  // a "data:image" literal, so the cache can rule the whole text out by
+  // examining only the appended bytes. Only when that cheap check says a
+  // literal may be present do we pay for the full tokenizing sweep.
+  if(liveCache && typeof liveCache.mayContainDataImage==='function'
+     && !liveCache.mayContainDataImage(text)){
+    return liveCache.project(text, streaming, false);
+  }
   const safeSpans=[];
   // Tokenize the exact accepted data-image grammars in one linear pass. Do not
   // discover a broad candidate and repeatedly shorten/revalidate it: malformed
@@ -9277,6 +9374,16 @@ function _canonicalTextForRow(row){
       }
     }
   }catch(_){}
+  // Canonical text for HTML-string-built cards (compression reference /
+  // preserved task list) lives outside the serialized HTML, keyed by the
+  // stable id stamped on the row. Check it before the bounded attribute.
+  try{
+    const ck=row.getAttribute&&row.getAttribute('data-canonical-key');
+    if(ck){
+      const canon=_compressionCanonicalFor(ck);
+      if(canon) return canon;
+    }
+  }catch(_){}
   // Last resort: the bounded DOM attribute (already projected) – copy at least something
   try{
     if(row.dataset && row.dataset.rawText) return String(row.dataset.rawText);
@@ -12203,7 +12310,24 @@ function _copyEventToClipboard(row,control){
   let text='';
   let label='event';
   if(type==='tool'){
-    const tc=row._tcData||{};
+    // #7040 round 9: Copy is a canonical-data consumer. Expandos are lost when
+    // the session HTML cache restores innerHTML, so _tcData alone would leave
+    // Copy reading the bounded/projected DOM after a restore. Use the SAME
+    // recovery-by-identity chain Show more uses (_toggleToolDiff): live
+    // expando -> transparent row dataset -> disclosure-key lookup.
+    let _canonTc=row._tcData;
+    if(!_canonTc){
+      try{
+        if(typeof _transparentToolCallFromRowDataset==='function') _canonTc=_transparentToolCallFromRowDataset(row);
+      }catch(_){}
+    }
+    if(!_canonTc){
+      try{
+        const dk=row.getAttribute?row.getAttribute('data-tool-disclosure-key'):'';
+        if(dk&&typeof _toolCallByDisclosureKey==='function') _canonTc=_toolCallByDisclosureKey(dk);
+      }catch(_){}
+    }
+    const tc=_canonTc||{};
     const fallbackName=row.getAttribute('data-event-name')||row.getAttribute('data-tool-name')||'tool';
     label=`tool ${tc.name||fallbackName}`;
     const parts=[`tool: ${tc.name||fallbackName}`];
@@ -12234,11 +12358,22 @@ function _copyEventToClipboard(row,control){
     }
     text=parts.join('\n');
   }else if(type==='thinking'){
+    // Prefer canonical-by-identity over the projected DOM body, same rationale
+    // as the tool branch above.
+    let _canonThinking='';
+    try{
+      if(typeof _canonicalTextForRow==='function') _canonThinking=String(_canonicalTextForRow(row)||'');
+    }catch(_){}
     const pre=row.querySelector('.thinking-card-body pre');
-    text=pre?pre.textContent:(row.textContent||'').replace(/^\s*Thinking\s*/i,'');
+    const _domThinking=pre?pre.textContent:(row.textContent||'').replace(/^\s*Thinking\s*/i,'');
+    text=_canonThinking||_domThinking;
     label='thinking';
   }else{
-    text=row.textContent||'';
+    let _canonOther='';
+    try{
+      if(typeof _canonicalTextForRow==='function') _canonOther=String(_canonicalTextForRow(row)||'');
+    }catch(_){}
+    text=_canonOther||row.textContent||'';
   }
   if(!text) return;
   const copied=()=>_showTransparentCopiedFeedback(control,row);
@@ -13317,9 +13452,14 @@ function _stampToolCallOrdinals(messages){
       Array.isArray(m.tool_calls)?m.tool_calls:null,
       Array.isArray(m._partial_tool_calls)?m._partial_tool_calls:null,
     ];
+    // ONE occurrence counter per MESSAGE, shared by every array below.
+    // Per-array counters restarted at 0 for each of tool_calls /
+    // _partial_tool_calls / content, so the same (message, name) could be
+    // minted as ordinal 0 up to three times and produce three colliding
+    // identities for three genuinely different calls.
+    const ordCounts=new Map();
     for(const arr of rawArrays){
       if(!arr) continue;
-      const ordCounts=new Map();
       for(const tc of arr){
         if(!tc||typeof tc!=='object') continue;
         const tid=tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'';
@@ -13333,7 +13473,6 @@ function _stampToolCallOrdinals(messages){
       }
     }
     if(Array.isArray(m.content)){
-      const ordCounts=new Map();
       for(const p of m.content){
         if(!p||typeof p!=='object'||p.type!=='tool_use') continue;
         const tid=p.id||'';
@@ -13367,7 +13506,12 @@ function _toolDisclosureIdentity(tc, ordinal){
   else if(hasBurst||hasSeq) owner=`b:${hasBurst?tc.activityBurstId:''}:s:${hasSeq?tc.activitySegmentSeq:''}`;
   else owner='a:';
   const name=tc.name||'tool';
-  const ordPart=(ord!==''&&ord!==null&&ord!==undefined)?`o:${ord}`:'o:0';
+  // An UNSTAMPED call must never alias a genuinely-minted ordinal 0. Falling
+  // back to 'o:0' meant any call that reached here before normalization
+  // silently shared an identity with the real first occurrence of that name
+  // (and with every other unstamped one). Use a distinct marker instead so a
+  // missing ordinal is visible rather than plausible.
+  const ordPart=(ord!==''&&ord!==null&&ord!==undefined)?`o:${ord}`:'o:?';
   return `derived:${owner}:${name}:${ordPart}`;
 }
 function _filterNewWorklogTools(cards, seenTools){
@@ -15593,11 +15737,48 @@ function _latestCompressionReferenceMessage(messages, summaryText=''){
 function _shouldShowSettledCompressionReference(referenceText){
   return !!String(referenceText||'').trim() && !_isContextCompactionText(referenceText);
 }
+// #7040 round 9: compression cards are built as HTML strings, so their text
+// used to be serialized twice at full length -- into data-raw-text (which the
+// session HTML cache persists) and into the <pre> body. Both are serialized
+// DOM surfaces and must carry only the bounded display value. The canonical
+// text is kept OUT of the serialized HTML in this bounded side-store and
+// recovered by the stable key stamped on the row, so Copy still yields the
+// complete value (see _canonicalTextForRow).
+const _COMPRESSION_CANONICAL_MAX=32;
+const _compressionCanonicalText=new Map();
+let _compressionCanonicalSeq=0;
+function _stampCompressionCanonical(text){
+  const canonical=String(text||'');
+  const key='cmp'+(++_compressionCanonicalSeq);
+  try{
+    _compressionCanonicalText.set(key, canonical);
+    // Bound the store: compression cards are re-rendered on every transcript
+    // repaint, so an unbounded Map would grow without limit.
+    while(_compressionCanonicalText.size>_COMPRESSION_CANONICAL_MAX){
+      const oldest=_compressionCanonicalText.keys().next().value;
+      if(oldest===undefined) break;
+      _compressionCanonicalText.delete(oldest);
+    }
+  }catch(_){}
+  return key;
+}
+function _compressionCanonicalFor(key){
+  try{ const v=_compressionCanonicalText.get(String(key||'')); return v==null?'':String(v); }catch(_){ return ''; }
+}
+function _projectCompressionText(text){
+  const raw=String(text||'');
+  try{
+    if(typeof _projectTranscriptTextForDisplay==='function') return _projectTranscriptTextForDisplay(raw,{surface:'tool'});
+  }catch(_){}
+  return raw;
+}
 function _compressionReferenceCardHtml(text, open=false){
   const copy=_engineAwareCompressionCopy();
   const preview=text.split(/\n+/).filter(Boolean).slice(0,2).join(' ');
+  const _canonKey=_stampCompressionCanonical(text);
+  const _bounded=_projectCompressionText(text);
   return `
-    <div class="tool-card-row compression-card-row" data-compression-card="1" data-raw-text="${esc(text)}">
+    <div class="tool-card-row compression-card-row" data-compression-card="1" data-canonical-key="${esc(_canonKey)}" data-raw-text="${esc(_bounded)}">
       <div class="tool-card tool-card-compress-reference${open?' open':''}">
         <div class="tool-card-header" onclick="this.closest('.tool-card').classList.toggle('open')">
           <span class="tool-card-icon">${li('star',13)}</span>
@@ -15608,7 +15789,7 @@ function _compressionReferenceCardHtml(text, open=false){
         </div>
         <div class="tool-card-detail">
           <div class="tool-card-result">
-          <pre>${esc(text)}</pre>
+          <pre>${esc(_bounded)}</pre>
         </div>
         </div>
       </div>
@@ -15617,12 +15798,14 @@ function _compressionReferenceCardHtml(text, open=false){
 }
 function _preservedCompressionTaskListCardHtml(m, open=false){
   const text=msgContent(m)||String(m.content||'');
+  const _canonKey=_stampCompressionCanonical(text);
+  const _bounded=_projectCompressionText(text);
   return `
-    <div class="tool-card-row compression-card-row" data-compression-card="1" data-raw-text="${esc(text)}">
+    <div class="tool-card-row compression-card-row" data-compression-card="1" data-canonical-key="${esc(_canonKey)}" data-raw-text="${esc(_bounded)}">
       ${_compressionStatusCardHtml({
         statusLabel: t('preserved_task_list_label'),
         previewText: _preservedCompressionTaskListPreview(text),
-        detail: text,
+        detail: _bounded,
         icon: li('list-todo',13),
         open,
         variantClass: 'tool-card-compress-reference',

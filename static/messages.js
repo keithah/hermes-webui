@@ -4061,7 +4061,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _finalizeAnchorProseIncrementalNode(st);
       }
       try{ st.node._canonicalRawText=_rawValue; }catch(_){}
-      try{ st.node.dataset.rawText=String(value).slice(0,60000); }catch(_){ st.node.dataset.rawText=String(value).slice(0,60000); }
+      // Bounded display value for the serialized DOM/cache surface. Use the
+      // shared projector (not a blunt .slice) so this matches every other
+      // data-raw-text writer: a raw cut can land mid-opaque-run and omits the
+      // "abbreviated" notice. Canonical stays on the _canonicalRawText expando
+      // set immediately above. (The old catch branch re-ran the identical
+      // expression, so it could never actually recover from a throw.)
+      try{
+        const _b=(typeof _projectTranscriptTextForDisplay==='function')
+          ? _projectTranscriptTextForDisplay(String(value||''),{surface:'assistant'})
+          : String(value||'').slice(0,60000);
+        st.node.dataset.rawText=_b;
+      }catch(_){ try{ st.node.dataset.rawText=String(value||'').slice(0,60000); }catch(__){} }
       return st.node;
     }catch(_){
       if(st){
@@ -5676,18 +5687,43 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const parsed=_cachedParsed&&_cachedParsedText===assistantText&&_cachedParsedReasoning===liveReasoningText ? _cachedParsed : _parseStreamState();
       _cachedParsed=null;
       _renderLiveThinking(parsed);
-      const displayText = segmentStart===0
+      const _rawDisplayText = segmentStart===0
         ? parsed.displayText                          // first segment: uses think-tag stripping
         : _stripXmlToolCalls(assistantText.slice(segmentStart));
+      // #7040 round 9: EVERY live prose write must go through the one
+      // owner-scoped incremental projection state -- the fade path, the
+      // default/no-fade (and reduced-motion) smd path, the renderMd fallback,
+      // and Anchor prose. Writing raw text in any single one of them lets a
+      // growing opaque payload enter the live DOM in full and then retract to
+      // the settled abbreviation, which is the exact prefix-instability this
+      // PR exists to remove. _renderStreamingFadeMarkdown projects internally
+      // (it needs the raw text to record canonical state), so it still takes
+      // the raw value; every other sink takes the projected value.
+      const displayText = _projectLiveDisplayText(_rawDisplayText);
       let anchorProcessText=displayText;
       if(assistantBody){
         if(_shouldUseLiveProseFade()){
-          const caughtUp=_renderStreamingFadeMarkdown(displayText);
+          const caughtUp=_renderStreamingFadeMarkdown(_rawDisplayText);
           anchorProcessText=_streamFadeDomText||'';
           if(!caughtUp&&!_streamFinalized){
             setTimeout(()=>_scheduleRender(), 33);
           }
         } else {
+          // The fade and forced-flush paths both record canonical text so
+          // Copy/TTS/export can recover the unprojected value via
+          // _canonicalTextForRow. The no-fade/reduced-motion path did not, so
+          // a mid-stream Copy in that mode fell through to bounded DOM text.
+          try{
+            assistantBody._canonicalRawText=_rawDisplayText;
+            if(assistantRow) assistantRow._canonicalRawText=_rawDisplayText;
+            if(typeof window!=='undefined'){
+              window._lastLiveAssistantText=_rawDisplayText;
+              try{
+                if(!window._lastLiveAssistantTextBySession) window._lastLiveAssistantTextBySession=new Map();
+                if(typeof activeSid==='string'&&activeSid) window._lastLiveAssistantTextBySession.set(activeSid, _rawDisplayText);
+              }catch(_){}
+            }
+          }catch(_){}
           assistantBody.classList.remove('stream-fade-active');
           _resetStreamFadeState();
           if(!_smdParser&&window.smd){
@@ -5702,10 +5738,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             // Fallback: smd not loaded yet, reconnect session, or smd unavailable — use renderMd
             // for every live segment. Without this, the first segment inserts raw
             // parsed.displayText and users see unformatted markdown until done.
-            const fallbackText = segmentStart===0
-              ? parsed.displayText
-              : _stripXmlToolCalls(assistantText.slice(segmentStart));
-            assistantBody.innerHTML = renderMd ? renderMd(fallbackText) : esc(fallbackText);
+            // Uses the SAME projected value as the smd path (it used to
+            // re-derive the raw text here and write it unprojected).
+            assistantBody.innerHTML = renderMd ? renderMd(displayText) : esc(displayText);
           }
         }
         if(typeof _syncLiveWorklogReasonsForAnchor==='function') _syncLiveWorklogReasonsForAnchor(assistantRow, displayText);
