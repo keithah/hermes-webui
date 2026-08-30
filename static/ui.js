@@ -15896,7 +15896,12 @@ function _compressionStatusCardHtml({
   const hasBody = !!statusDetail;
   const openClass = open ? ' open' : '';
   const statusIcon = icon;
-  const bodyHtml = hasBody ? `<div class="tool-card-detail"><div class="tool-card-result"><pre>${esc(statusDetail)}</pre></div></div>` : '';
+  // Every serialized compression-card surface stays display-bounded. The
+  // preserved-task-list caller already passes projected text; project here too
+  // so the remaining callers (and any future one) cannot serialize an
+  // unbounded payload. Projection is idempotent on already-bounded text.
+  const _boundedStatusDetail=_projectCompressionText(statusDetail);
+  const bodyHtml = hasBody ? `<div class="tool-card-detail"><div class="tool-card-result"><pre>${esc(_boundedStatusDetail)}</pre></div></div>` : '';
   const toggleHtml = hasBody ? `<span class="tool-card-toggle">${li('chevron-right',12)}</span>` : '';
   return `
     <div class="tool-card ${variantClass}${openClass}">
