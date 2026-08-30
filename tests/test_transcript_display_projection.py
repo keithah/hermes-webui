@@ -403,7 +403,14 @@ eval(extractFunc('_isSafeDataImageUri'));try{eval(extractFunc('_isB64Code'));eva
 let input='';process.stdin.on('data',c=>input+=c);process.stdin.on('end',()=>{
   const tcA={name:'terminal',assistant_msg_idx:3,snippet:'AAA',done:true};
   const tcB={name:'terminal',assistant_msg_idx:3,snippet:'BBB',done:true};
-  tcA._ordinal=0;tcA._disclosureOrdinal=0;tcB._ordinal=1;tcB._disclosureOrdinal=1;
+  // Do NOT hand-assign _ordinal/_disclosureOrdinal here: that would assume the
+  // very normalization invariant this test depends on. Let the real entry
+  // point mint them, exactly as renderMessages() does. (messages[3] so the
+  // minted owner matches assistant_msg_idx:3.)
+  S.messages=[{},{},{},{role:'assistant',tool_calls:[tcA,tcB]}];
+  _stampToolCallOrdinals(S.messages);
+  if(tcA._disclosureOrdinal===undefined||tcB._disclosureOrdinal===undefined) throw new Error('normalization did not mint ordinals');
+  if(tcA._disclosureOrdinal===tcB._disclosureOrdinal) throw new Error('normalization minted colliding ordinals');
   const rowA=buildToolCard(tcA);const rowB=buildToolCard(tcB);
   const keyA=rowA.getAttribute('data-tool-disclosure-key');const keyB=rowB.getAttribute('data-tool-disclosure-key');
   S.toolCalls=[tcA,tcB];S.messages=[];
