@@ -392,3 +392,59 @@ def test_stale_disk_preload_is_not_published_after_a_concurrent_invalidation(tmp
         cfg._available_models_cache is None
         or cfg._available_models_cache.get("default_model") != "stale-preload"
     ), "the superseded snapshot must not be resident in the memory cache either"
+
+
+def test_disk_cache_still_survives_a_process_restart(tmp_path, monkeypatch):
+    """#7007 round 6 audit: the generation stamp must not break restart survival.
+
+    `_available_models_cache_generation` is an in-memory counter initialised to
+    0 at import, so it restarts from 0 in every new process. Round 6 stamped it
+    into the PERSISTENT cache file and rejected any mismatch on load. Because
+    every real server bumps that counter on its first credential edit / settings
+    save / onboarding step / OAuth link, the file it leaves behind is stamped
+    with a non-zero generation -- and the next process, starting again at 0,
+    rejected it unconditionally.
+
+    That silently defeated the function's documented purpose ("Save cache to
+    disk so it survives server restarts") and the whole #1633 version/schema
+    machinery that exists to decide when a cache SHOULD be invalidated across
+    restarts, forcing a full live provider rebuild (the slow Copilot token
+    exchange / OpenRouter probes) on every single cold start.
+
+    Scoping the generation check to the run that wrote the file keeps both
+    contracts: superseded-within-this-run is still rejected, and a file from a
+    previous run is judged by schema/version/source-fingerprint as #1633
+    intended.
+    """
+    import api.config as cfg
+
+    cache_path = tmp_path / "models_cache.json"
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
+    monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-test")
+
+    # A long-running server whose counter has advanced past 0.
+    monkeypatch.setattr(cfg, "_available_models_cache_generation", 7, raising=False)
+    cfg._save_models_cache_to_disk(_catalog("warm"))
+    assert cache_path.exists()
+
+    # Same run, generation superseded -> still rejected (round-6 intent).
+    monkeypatch.setattr(cfg, "_available_models_cache_generation", 8, raising=False)
+    assert cfg._load_models_cache_from_disk() is None, (
+        "a snapshot superseded within THIS run must still be rejected"
+    )
+
+    # Restart: new process run id, counter back to its initial 0.
+    monkeypatch.setattr(cfg, "_PROCESS_RUN_ID", "a-different-process-run", raising=False)
+    monkeypatch.setattr(cfg, "_available_models_cache_generation", 0, raising=False)
+    assert cfg._load_models_cache_from_disk() is not None, (
+        "the on-disk cache must survive a restart -- that is the entire reason "
+        "it is written; the in-memory generation counter is meaningless across "
+        "processes and must not veto it"
+    )
+
+    # ...but a restart that genuinely invalidates per #1633 still rejects.
+    monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-newer-release")
+    assert cfg._load_models_cache_from_disk() is None, (
+        "the #1633 version/schema contract must remain the cross-restart authority"
+    )

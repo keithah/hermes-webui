@@ -5075,6 +5075,14 @@ _available_models_cache_lock = threading.RLock()
 # detect it and discard its stale publish.
 _available_models_cache_generation: int = 0
 
+# Identifies THIS process run. `_available_models_cache_generation` is an
+# in-memory counter that restarts at 0 in every new process, so an equality
+# check on it is only meaningful for a file this same process wrote (#7007
+# round 6 audit). Stamping it alongside the generation lets the on-disk cache
+# keep the #1633 cross-restart contract (schema/version/source-fingerprint)
+# while still rejecting a snapshot superseded within the current run.
+_PROCESS_RUN_ID: str = uuid.uuid4().hex
+
 # Provider auth-status enumeration cache. ``list_available_providers()``
 # (core) probes EVERY known provider's credential source serially — AWS IMDS
 # dial, gh CLI subprocess, token exchange, per-endpoint /models — and the
@@ -6493,13 +6501,24 @@ def _is_loadable_disk_cache(cache: object) -> bool:
     # early-init save before this stamp could be resolved) is treated as a
     # mismatch, same convention as the `_webui_version` stamp above — worst
     # case one extra rebuild, never a resurrected stale catalog.
-    if cache.get("_generation") != _available_models_cache_generation:
-        logger.debug(
-            "models cache rejected: generation=%r vs runtime=%r",
-            cache.get("_generation"),
-            _available_models_cache_generation,
-        )
-        return False
+    # Only meaningful for a file THIS process wrote: the generation is an
+    # in-memory counter that resets to 0 on every start, so comparing it to a
+    # file written by an earlier run would reject every cache a restart was
+    # supposed to inherit -- defeating this function's whole purpose ("Save
+    # cache to disk so it survives server restarts") and forcing a full live
+    # provider rebuild on every cold start, since any server that has done a
+    # single credential edit / settings save / OAuth link has already bumped
+    # the counter above 0. Across processes the #1633 schema/version/
+    # source-fingerprint checks above are the correct authority; within one
+    # process the generation still rejects a superseded snapshot.
+    if cache.get("_run_id") == _PROCESS_RUN_ID:
+        if cache.get("_generation") != _available_models_cache_generation:
+            logger.debug(
+                "models cache rejected: generation=%r vs runtime=%r",
+                cache.get("_generation"),
+                _available_models_cache_generation,
+            )
+            return False
     return True
 
 
@@ -6652,6 +6671,7 @@ def _save_models_cache_to_disk(cache: dict, *, generation: int | None = None) ->
         payload = {
             "_schema_version": _MODELS_CACHE_SCHEMA_VERSION,
             "_source_fingerprint": _models_cache_source_fingerprint(),
+            "_run_id": _PROCESS_RUN_ID,
             "_generation": (
                 generation if generation is not None
                 else _available_models_cache_generation
