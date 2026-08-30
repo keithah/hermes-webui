@@ -713,3 +713,68 @@ def test_boot_model_dropdown_clears_cached_ready_on_401():
     consumed_idx = body.index("if(_bootActiveProfileUnauthRedirectBudget.isConsumed()) return true;")
 
     assert status_idx < clear_idx < consumed_idx
+
+
+def test_session_visit_discards_disk_snapshot_superseded_between_read_and_publish(
+    tmp_path, monkeypatch
+):
+    """A disk snapshot invalidated after the pre-lock read must not be published.
+
+    #7007: ``get_available_models_for_session_visit()`` reads the disk cache
+    OUTSIDE ``_available_models_cache_lock``, then publishes it INSIDE the lock
+    with a fresh timestamp *and* a fresh source fingerprint.  An
+    ``invalidate_models_cache()`` landing in that window (the user
+    authenticates a provider) otherwise leaves the pre-auth catalog served for
+    the full ``_AVAILABLE_MODELS_CACHE_TTL`` (24h).  The fingerprint guard in
+    ``_get_fresh_memory_models_cache()`` cannot reject it either, because the
+    publish stamps the *current* fingerprint onto the superseded payload.
+    ``get_available_models()`` already carries this fence; this is its sibling.
+    """
+    import api.config as cfg
+
+    _reset_models_memory_cache(monkeypatch)
+    superseded = _catalog("pre-auth-model")
+    rebuilt = _catalog("post-auth-model")
+
+    cache_path = tmp_path / "models_cache.profile.json"
+    cache_path.write_text("{}", encoding="utf-8")
+    now = time.time()
+    os.utime(cache_path, (now, now))
+
+    monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: None)
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
+    monkeypatch.setattr(cfg, "_available_models_cache_generation", 5, raising=False)
+
+    # The read returns a snapshot that was current *as of the read*, but an
+    # invalidation lands before this thread can take the lock.  Bumping the
+    # generation from inside the loader is the deterministic equivalent of that
+    # interleaving -- no sleeps and no thread scheduling, so the ordering under
+    # test is guaranteed rather than hoped for.
+    def _read_then_invalidated():
+        cfg._available_models_cache_generation += 1
+        return superseded
+
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", _read_then_invalidated)
+
+    rebuild_calls: list[dict] = []
+
+    def _live_rebuild(**kwargs):
+        rebuild_calls.append(kwargs)
+        return rebuilt
+
+    monkeypatch.setattr(cfg, "get_available_models", _live_rebuild)
+
+    result = cfg.get_available_models_for_session_visit()
+
+    assert result["default_model"] == "post-auth-model", (
+        "superseded pre-auth catalog was served instead of rebuilding"
+    )
+    assert rebuild_calls and rebuild_calls[0].get("force_refresh") is True, (
+        "a superseded disk snapshot must fall through to a real rebuild"
+    )
+    published = cfg._available_models_cache
+    assert published is None or published.get("default_model") != "pre-auth-model", (
+        "superseded snapshot was published into the memory cache"
+    )
