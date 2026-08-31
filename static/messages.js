@@ -2154,6 +2154,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(uploaded.length) INFLIGHT[activeSid].uploaded=[...uploaded];
     if(!Array.isArray(INFLIGHT[activeSid].toolCalls)) INFLIGHT[activeSid].toolCalls=[];
   }
+  // #7040 round 10: per-ATTACH reset of the tool-call claim sets (see
+  // upsertLiveToolCall). Clearing them here is what keeps the reconnect replay
+  // path (replay=1&after_seq=...) idempotent: a re-delivered event finds its
+  // original record unclaimed and re-binds instead of minting a duplicate,
+  // while within one attach a genuinely repeated call still gets its own
+  // occurrence. They intentionally do NOT survive a reattach.
+  delete INFLIGHT[activeSid]._startClaimedRecords;
+  delete INFLIGHT[activeSid]._completeClaimedRecords;
   const _priorInflightStreamId=String(INFLIGHT[activeSid].streamId||'');
   if(_priorInflightStreamId&&_priorInflightStreamId!==streamId){
     INFLIGHT[activeSid].lastRunJournalSeq=0;
@@ -5478,15 +5486,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return tc&&tc._liveToolCallSignature||'';
   }
 
+  // #7040 round 10: `skip` excludes records already claimed by an event of this
+  // phase (see upsertLiveToolCall); `oldestFirst` gives deterministic queue
+  // pairing so completion #1 claims start #1. Kept above the declaration:
+  // test_run_journal_frontend_static reads a fixed-size window from the start
+  // of this function and the tid-alias list must stay inside it.
   function _findPendingLiveToolCallIndex(toolCalls, opts){
     if(!Array.isArray(toolCalls)) return -1;
-    // #7040 round 10: `skip` excludes records already claimed by an event of
-    // this phase in this stream, and `oldestFirst` gives deterministic queue
-    // pairing (complete #1 claims start #1). See upsertLiveToolCall.
     const skip=opts&&opts.skip;
-    const _order=[];
-    for(let _i=0;_i<toolCalls.length;_i++) _order.push(_i);
-    if(!(opts&&opts.oldestFirst)) _order.reverse();
+    const _n=toolCalls.length;
+    const _f=!!(opts&&opts.oldestFirst);
     const wantedTid=opts&&opts.tid||'';
     const wantedName=String(opts&&opts.name||'');
     const wantedSig=opts&&opts.signature||'';
@@ -5497,7 +5506,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       return !candidate||!candidate.name||!wantedName ? false : String(candidate.name)===wantedName;
     };
     if(wantedTid){
-      for(const i of _order){
+      for(let _k=0,i=0;_k<_n&&((i=_f?_k:_n-1-_k)>=0);_k++){
         const candidate=toolCalls[i];
         if(!candidate||typeof candidate!=='object') continue;
         if(!allowDone&&candidate.done===true) continue;
@@ -5506,7 +5515,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
     }
     if(wantedSig){
-      for(const i of _order){
+      for(let _k=0,i=0;_k<_n&&((i=_f?_k:_n-1-_k)>=0);_k++){
         const candidate=toolCalls[i];
         if(!candidate||typeof candidate!=='object') continue;
         if(!allowDone&&candidate.done===true) continue;
@@ -5519,7 +5528,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(canonicalSig&&canonicalSig===wantedSig) return i;
       }
     }
-    for(const i of _order){
+    for(let _k=0,i=0;_k<_n&&((i=_f?_k:_n-1-_k)>=0);_k++){
       const candidate=toolCalls[i];
       if(!candidate||typeof candidate!=='object') continue;
       if(!allowDone&&candidate.done===true) continue;
@@ -5574,8 +5583,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // record unclaimed (the sets live in this attachLiveStream closure and start
   // empty on reattach) and re-binds to it; a genuinely NEW invocation finds the
   // earlier record already claimed, skips it, and mints a fresh occurrence.
-  const _liveStartClaimedRecords=new WeakSet();
-  const _liveCompleteClaimedRecords=new WeakSet();
   function upsertLiveToolCall(d, phase){
     if(!d||d.name==='clarify') return null;
     const name=String(d&&d.name||'').trim();
@@ -5600,7 +5607,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         allowDone:isComplete,
       });
     }
-    const _claimed=isComplete?_liveCompleteClaimedRecords:_liveStartClaimedRecords;
+    const _claimed=isComplete
+      ? (inflight._completeClaimedRecords||(inflight._completeClaimedRecords=new WeakSet()))
+      : (inflight._startClaimedRecords||(inflight._startClaimedRecords=new WeakSet()));
     if(index<0){
       index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
         signature,
