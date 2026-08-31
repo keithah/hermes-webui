@@ -233,6 +233,7 @@ process.stdin.on('end', () => {
   process.stdout.write(JSON.stringify({
     htmlLength: row.innerHTML.length,
     hasFullPayloadAttribute: row.innerHTML.includes('data-full='),
+    fullPayload: (row.innerHTML.match(/data-full="([^"]*)"/) || [])[1] || '',
   }));
 });
 """
@@ -379,10 +380,25 @@ def test_live_thinking_render_is_bounded(driver_path: str) -> None:
     assert "opaque payload abbreviated for display" in result["display"]
 
 
-def test_tool_card_does_not_embed_full_snippet_in_dom(tool_driver_path: str) -> None:
+def test_tool_card_serializes_bounded_projected_expansion(tool_driver_path: str) -> None:
+    raw = "data:application/octet-stream;base64," + ("D" * 200_000)
     result = _tool_render(
         tool_driver_path,
-        {"name": "terminal", "done": True, "snippet": "D" * 200_000},
+        {"name": "terminal", "done": True, "snippet": raw},
+    )
+
+    assert result["hasFullPayloadAttribute"] is True
+    full_payload = str(result["fullPayload"])
+    assert len(full_payload) < 70_000
+    assert "opaque payload abbreviated for display" in full_payload
+    assert "D" * 200_000 not in full_payload
+
+
+def test_tool_card_does_not_duplicate_unbounded_ordinary_output(tool_driver_path: str) -> None:
+    prose = "ordinary output " * 20_000
+    result = _tool_render(
+        tool_driver_path,
+        {"name": "terminal", "done": True, "snippet": prose},
     )
 
     # The full 200,000-char snippet must never be serialized into the DOM
