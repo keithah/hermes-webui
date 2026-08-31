@@ -6407,6 +6407,59 @@ def _models_cache_source_fingerprint() -> dict:
     }
 
 
+def _models_cache_epoch_path() -> Path:
+    """Companion path holding the durable invalidation epoch for this profile.
+
+    Derived from `_get_models_cache_path()` so it is profile-keyed the same
+    way the cache itself is, and so tests that repoint the cache path get a
+    matching epoch file automatically. Deliberately a SEPARATE file:
+    `_delete_models_cache_on_disk()` must be able to drop the catalog without
+    dropping the authority record that says which epoch is current.
+    """
+    return Path(str(_get_models_cache_path()) + ".epoch")
+
+
+def _read_durable_invalidation_epoch() -> int:
+    """Return the current durable invalidation epoch (0 when absent).
+
+    Absent/unreadable is 0 rather than an error: on a first run there is no
+    record yet, and a cache written in that state stamps 0 too, so the normal
+    "nothing has been invalidated yet" case still survives a restart.
+    """
+    try:
+        with open(_models_cache_epoch_path(), encoding="utf-8") as f:
+            return int((f.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def _bump_durable_invalidation_epoch() -> int:
+    """Atomically advance the durable invalidation epoch; return the new value.
+
+    #7007 round 6: `_available_models_cache_generation` is an in-memory counter
+    that resets to 0 in every new process, so it cannot express "this build was
+    already superseded" to the NEXT process. Persisting the epoch does — and
+    unlike the source fingerprint (stamped at write time, so a stale writer
+    records a current-looking value) this is captured when the build STARTS, so
+    a build that was superseded before it renamed carries the old epoch and is
+    rejected on load no matter which process reads it.
+
+    Best-effort: if the write fails the epoch simply does not advance, leaving
+    `_delete_models_cache_on_disk()` (called by both invalidators immediately
+    after) as the primary defense — i.e. no worse than before this fix.
+    """
+    nxt = _read_durable_invalidation_epoch() + 1
+    try:
+        path = _models_cache_epoch_path()
+        tmp = str(path) + f".{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(str(nxt))
+        os.rename(tmp, str(path))
+    except OSError:
+        pass
+    return nxt
+
+
 def _delete_models_cache_on_disk() -> None:
     try:
         os.unlink(str(_get_models_cache_path()))
@@ -6511,6 +6564,27 @@ def _is_loadable_disk_cache(cache: object) -> bool:
     # the counter above 0. Across processes the #1633 schema/version/
     # source-fingerprint checks above are the correct authority; within one
     # process the generation still rejects a superseded snapshot.
+    # #7007 round 6: the durable epoch is the RESTART-STABLE half of stale-build
+    # authority. The `_run_id`/`_generation` pair below can only speak about a
+    # file this same process wrote, so on its own it let a stale snapshot become
+    # loadable across a restart: a build superseded by an invalidation could
+    # rename its file and then crash before its own delete-on-retirement ran,
+    # and the next process — new run id, matching schema/version, and a
+    # write-time source fingerprint that looks current — would accept it.
+    # Comparing the epoch captured at BUILD START against the epoch on disk
+    # rejects exactly that file while still letting a legitimately-current
+    # cache survive a restart (its epoch is unchanged, so it still matches).
+    # A missing field (pre-fix cache) counts as a mismatch, same fail-closed
+    # convention as the stamps above: worst case one extra rebuild.
+    cached_epoch = cache.get("_invalidation_epoch")
+    runtime_epoch = _read_durable_invalidation_epoch()
+    if cached_epoch != runtime_epoch:
+        logger.debug(
+            "models cache rejected: invalidation_epoch=%r vs runtime=%r",
+            cached_epoch,
+            runtime_epoch,
+        )
+        return False
     if cache.get("_run_id") == _PROCESS_RUN_ID:
         if cache.get("_generation") != _available_models_cache_generation:
             logger.debug(
@@ -6626,7 +6700,12 @@ def _load_stale_models_cache_from_disk() -> dict | None:
         return None
 
 
-def _save_models_cache_to_disk(cache: dict, *, generation: int | None = None) -> None:
+def _save_models_cache_to_disk(
+    cache: dict,
+    *,
+    generation: int | None = None,
+    invalidation_epoch: int | None = None,
+) -> None:
     """Save cache to disk so it survives server restarts.
 
     Stamps the payload with `_webui_version` and `_schema_version` (#1633) so
@@ -6675,6 +6754,15 @@ def _save_models_cache_to_disk(cache: dict, *, generation: int | None = None) ->
             "_generation": (
                 generation if generation is not None
                 else _available_models_cache_generation
+            ),
+            # Captured when the caller's build STARTED (see the module-level
+            # helpers) so a superseded build records the pre-invalidation
+            # epoch and is rejected on load. Defaults to the live epoch for
+            # the many direct call sites (mostly tests) that have no build
+            # context, matching the `generation` convention above.
+            "_invalidation_epoch": (
+                invalidation_epoch if invalidation_epoch is not None
+                else _read_durable_invalidation_epoch()
             ),
             "active_provider": cache["active_provider"],
             "default_model": cache["default_model"],
@@ -6752,6 +6840,10 @@ def invalidate_models_cache():
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
         _available_models_cache_generation += 1
+        # Advance the durable (on-disk) epoch under the SAME lock, so a
+        # build claiming ownership can capture a value that is atomic
+        # with respect to this invalidation (#7007 round 6).
+        _bump_durable_invalidation_epoch()
         _sync_models_cache_provenance()
         _cache_build_in_progress = False
         # Retire whoever was building — even though the generation bump above
@@ -6845,6 +6937,10 @@ def invalidate_provider_models_cache(provider_id: str):
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
         _available_models_cache_generation += 1
+        # Advance the durable (on-disk) epoch under the SAME lock, so a
+        # build claiming ownership can capture a value that is atomic
+        # with respect to this invalidation (#7007 round 6).
+        _bump_durable_invalidation_epoch()
         _sync_models_cache_provenance()
         _cache_build_in_progress = False
         _active_build_owner = None  # retire any in-flight build (#7007 round 5)
@@ -8762,6 +8858,10 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # the live owner will publish when it finishes.
         with _cache_build_cv:
             _build_owner = _try_claim_build_owner()
+            # Capture the durable epoch under the same lock that guards the
+            # claim, so it pairs atomically with this build's generation
+            # (#7007 round 6). Stamped on every disk write this build makes.
+            _build_epoch = _read_durable_invalidation_epoch()
         if _build_owner is None:
             if stale_disk_groups is not None:
                 return copy.deepcopy(stale_disk_groups)
@@ -8829,7 +8929,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 # itself was already retired by whatever invalidated/took
                 # over — this stale build owns nothing to release.
                 return copy.deepcopy(result)
-            _save_models_cache_to_disk(result, generation=_build_owner[0])
+            _save_models_cache_to_disk(
+                result, generation=_build_owner[0], invalidation_epoch=_build_epoch
+            )
             with _cache_build_cv:
                 if _is_current_build_owner(_build_owner):
                     _cache_build_in_progress = False
@@ -8908,7 +9010,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             # deleted the file it was replacing. If ownership was lost
             # while the write was in flight, delete what we just wrote
             # instead of letting it resurrect stale data.
-            _save_models_cache_to_disk(result, generation=_build_owner[0])
+            _save_models_cache_to_disk(
+                result, generation=_build_owner[0], invalidation_epoch=_build_epoch
+            )
             with _cache_build_cv:
                 if not _is_current_build_owner(_build_owner):
                     _delete_models_cache_on_disk()

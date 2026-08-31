@@ -423,18 +423,16 @@ def test_disk_cache_still_survives_a_process_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
     monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-test")
 
-    # A long-running server whose counter has advanced past 0.
+    # A long-running server whose counter has advanced past 0, writing a
+    # cache that NOTHING has since invalidated -- the only kind of file a
+    # restart is entitled to inherit.
     monkeypatch.setattr(cfg, "_available_models_cache_generation", 7, raising=False)
     cfg._save_models_cache_to_disk(_catalog("warm"))
     assert cache_path.exists()
 
-    # Same run, generation superseded -> still rejected (round-6 intent).
-    monkeypatch.setattr(cfg, "_available_models_cache_generation", 8, raising=False)
-    assert cfg._load_models_cache_from_disk() is None, (
-        "a snapshot superseded within THIS run must still be rejected"
-    )
-
-    # Restart: new process run id, counter back to its initial 0.
+    # Restart: new process run id, counter back to its initial 0. The durable
+    # invalidation epoch is unchanged (no invalidation happened), so the file
+    # is still current and must load.
     monkeypatch.setattr(cfg, "_PROCESS_RUN_ID", "a-different-process-run", raising=False)
     monkeypatch.setattr(cfg, "_available_models_cache_generation", 0, raising=False)
     assert cfg._load_models_cache_from_disk() is not None, (
@@ -447,4 +445,85 @@ def test_disk_cache_still_survives_a_process_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-newer-release")
     assert cfg._load_models_cache_from_disk() is None, (
         "the #1633 version/schema contract must remain the cross-restart authority"
+    )
+
+
+def test_supersession_within_a_run_is_rejected_without_a_restart(tmp_path, monkeypatch):
+    """The same-run half of the round-6 contract, on its own file.
+
+    Deliberately separate from the restart test: proving a file stale and then
+    expecting that SAME file to become valid after only a process-id change is
+    the unsafe premise the round-6 re-gate flagged. Here the file is never
+    revived -- it is stale, and it stays stale.
+    """
+    import api.config as cfg
+
+    cache_path = tmp_path / "models_cache.json"
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
+    monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-test")
+
+    monkeypatch.setattr(cfg, "_available_models_cache_generation", 7, raising=False)
+    cfg._save_models_cache_to_disk(_catalog("warm"))
+
+    monkeypatch.setattr(cfg, "_available_models_cache_generation", 8, raising=False)
+    assert cfg._load_models_cache_from_disk() is None, (
+        "a snapshot superseded within THIS run must still be rejected"
+    )
+
+
+def test_stale_build_that_renamed_before_a_crash_is_rejected_after_restart(
+    tmp_path, monkeypatch
+):
+    """#7007 round 6: the crash window between rename and delete-on-retirement.
+
+    Sequence under test, exactly as the re-gate specified:
+      build starts at epoch E0 -> invalidation advances the durable authority
+      -> the stale writer's rename lands anyway -> the process stops before its
+      delete-on-retirement runs -> the NEXT process must reject that file.
+
+    Before the durable epoch, the next process saw a new `_run_id` and skipped
+    stale-build authority altogether; schema, WebUI version and the write-time
+    source fingerprint all matched, so the superseded catalog was accepted.
+
+    Deterministic: no threads and no sleeps -- the crash is modelled by simply
+    not running the delete, which is precisely what a crash in that window does.
+    """
+    import api.config as cfg
+
+    cache_path = tmp_path / "models_cache.json"
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
+    monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-test")
+    monkeypatch.setattr(cfg, "_available_models_cache_generation", 3, raising=False)
+
+    # The build starts: it captures the authority live at that moment.
+    build_generation = cfg._available_models_cache_generation
+    build_epoch = cfg._read_durable_invalidation_epoch()
+
+    # An invalidation supersedes it (credential edit, OAuth link, ...). This
+    # advances the durable epoch and deletes any file already on disk.
+    cfg.invalidate_models_cache()
+    assert cfg._read_durable_invalidation_epoch() > build_epoch, (
+        "invalidation must advance the durable epoch, or the crash window "
+        "below cannot be detected by the next process"
+    )
+
+    # The superseded build finishes anyway and its rename lands...
+    cfg._save_models_cache_to_disk(
+        _catalog("stale-from-superseded-build"),
+        generation=build_generation,
+        invalidation_epoch=build_epoch,
+    )
+    assert cache_path.exists(), "precondition: the stale rename landed on disk"
+
+    # ...and the process dies before its delete-on-retirement can run, so the
+    # file survives. Restart: fresh run id, in-memory counter back to 0.
+    monkeypatch.setattr(cfg, "_PROCESS_RUN_ID", "a-different-process-run", raising=False)
+    monkeypatch.setattr(cfg, "_available_models_cache_generation", 0, raising=False)
+
+    assert cfg._load_models_cache_from_disk() is None, (
+        "a file written by a build that was ALREADY superseded before it "
+        "renamed must stay rejected across a restart -- a new process id must "
+        "not launder stale-build authority"
     )
