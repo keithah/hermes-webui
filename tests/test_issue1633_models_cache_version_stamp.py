@@ -216,6 +216,7 @@ def test_load_skips_version_check_when_runtime_unknown(isolated_cache, monkeypat
         "_schema_version": config._MODELS_CACHE_SCHEMA_VERSION,
         "_source_fingerprint": config._models_cache_source_fingerprint(),
         "_generation": config._available_models_cache_generation,
+        "_invalidation_epoch": config._read_durable_invalidation_epoch(),
         # no _webui_version
         **_shape_cache(),
     }
@@ -250,6 +251,7 @@ def test_is_loadable_disk_cache_checks_versions(with_runtime_version):
     bad1 = {
         "_schema_version": config._MODELS_CACHE_SCHEMA_VERSION,
         "_generation": config._available_models_cache_generation,
+        "_invalidation_epoch": config._read_durable_invalidation_epoch(),
         **_shape_cache(),
     }
     assert config._is_loadable_disk_cache(bad1) is False
@@ -259,6 +261,7 @@ def test_is_loadable_disk_cache_checks_versions(with_runtime_version):
         "_schema_version": config._MODELS_CACHE_SCHEMA_VERSION,
         "_webui_version": "v0.50.281",
         "_generation": config._available_models_cache_generation,
+        "_invalidation_epoch": config._read_durable_invalidation_epoch(),
         **_shape_cache(),
     }
     assert config._is_loadable_disk_cache(bad2) is False
@@ -268,6 +271,7 @@ def test_is_loadable_disk_cache_checks_versions(with_runtime_version):
         "_schema_version": 0,
         "_webui_version": "v0.50.293",
         "_generation": config._available_models_cache_generation,
+        "_invalidation_epoch": config._read_durable_invalidation_epoch(),
         **_shape_cache(),
     }
     assert config._is_loadable_disk_cache(bad3) is False
@@ -278,6 +282,7 @@ def test_is_loadable_disk_cache_checks_versions(with_runtime_version):
         "_webui_version": "v0.50.293",
         "_source_fingerprint": config._models_cache_source_fingerprint(),
         "_generation": config._available_models_cache_generation,
+        "_invalidation_epoch": config._read_durable_invalidation_epoch(),
         **_shape_cache(),
     }
     assert config._is_loadable_disk_cache(good) is True
@@ -303,6 +308,7 @@ def test_is_loadable_disk_cache_rejects_stale_generation(with_runtime_version):
         # `_save_models_cache_to_disk` always stamps both.
         "_run_id": config._PROCESS_RUN_ID,
         "_generation": config._available_models_cache_generation - 1,
+        "_invalidation_epoch": config._read_durable_invalidation_epoch(),
         **_shape_cache(),
     }
     assert config._is_loadable_disk_cache(stale) is False
