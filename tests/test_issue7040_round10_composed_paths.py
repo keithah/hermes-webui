@@ -29,16 +29,13 @@ function extractLine(re, label) {
   return m[0];
 }
 
-// The per-stream claim sets are closure state in attachLiveStream. Pull their
-// REAL declarations so deleting them from production fails this test loudly
-// rather than silently falling back to a harness-local definition.
-const claimDecls = [
-  extractLine(/const\s+_liveStartClaimedRecords\s*=\s*new WeakSet\(\);/, '_liveStartClaimedRecords'),
-  extractLine(/const\s+_liveCompleteClaimedRecords\s*=\s*new WeakSet\(\);/, '_liveCompleteClaimedRecords'),
-].join('\n');
+// The claim sets hang off the inflight record and are created lazily by
+// upsertLiveToolCall itself, so nothing extra has to be declared here. Assert
+// the production reset point still exists -- without it a reattach would keep
+// stale claims and a replayed event would mint a duplicate.
+extractLine(/delete INFLIGHT\[activeSid\]\._startClaimedRecords;/, 'per-attach claim reset');
 
 const parts = [
-  claimDecls,
   extractFunc('_coerceLiveToolCallSeq'),
   extractFunc('_coerceLiveToolCallSignature'),
   extractFunc('activityBurstFallbackFromCandidate'),
