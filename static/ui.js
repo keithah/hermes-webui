@@ -19533,9 +19533,13 @@ function buildToolCard(tc){
   const hasRawDetail=!!(tc.snippet)||(tc.args&&Object.keys(tc.args).length>0);
   const allowsDetail=typeof _toolCardAllowsDetail==='function'?_toolCardAllowsDetail(toolKind,tc):true;
   const hasDetail=hasRawDetail&&allowsDetail;
+  const rawSnippet=String(tc&&tc.snippet||'');
+  const projectedSnippet=typeof _projectTranscriptTextForDisplay==='function'
+    ? _projectTranscriptTextForDisplay(rawSnippet,{surface:'tool-result'})
+    : rawSnippet;
   let displaySnippet='';
-  if(tc.snippet){
-    const s=tc.snippet;
+  if(projectedSnippet){
+    const s=projectedSnippet;
     if(s.length<=800){displaySnippet=s;}
     else{
       const cutoff=s.slice(0,800);
@@ -19543,9 +19547,14 @@ function buildToolCard(tc){
       displaySnippet=lastBreak>80?s.slice(0,lastBreak+1):cutoff;
     }
   }
-  const hasMore=tc.snippet&&tc.snippet.length>displaySnippet.length;
+  const hasMore=projectedSnippet&&projectedSnippet.length>displaySnippet.length;
   const moreLabel=tc.is_diff?'Show diff':'Show more';
   const lessLabel=tc.is_diff?'Hide diff':'Show less';
+  // Keep restored fallback data bounded; live rows retain canonical _tcData.
+  const _toolCardSerializedDisplayLimit=65536;
+  const fullDataAttr=projectedSnippet!==rawSnippet&&projectedSnippet.length<=_toolCardSerializedDisplayLimit
+    ? ` data-full="${esc(projectedSnippet).replace(/"/g,'&quot;')}"`
+    : '';
   const runIndicator=tc.done===false?'<span class="tool-card-running-dot"></span>':'';
   const isSubagent=tc.name==='subagent_progress';
   const isDelegation=tc.name==='delegate_task';
@@ -19586,7 +19595,7 @@ function buildToolCard(tc){
         }</div>`:''}
         ${displaySnippet?`<div class="tool-card-result">
           <pre>${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?`<code class="diff-block" data-highlighted="1">${_colorDiffLines(displaySnippet)}</code>`:esc(displaySnippet)}</pre>
-          ${hasMore?`<button class="tool-card-more" data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
+          ${hasMore?`<button class="tool-card-more"${fullDataAttr} data-short="${esc(displaySnippet||'').replace(/"/g,'&quot;')}" data-is-diff="${tc.is_diff||_snippetLooksLikeDiff(displaySnippet)?1:0}" data-more-label="${esc(moreLabel)}" data-less-label="${esc(lessLabel)}" onclick="event.stopPropagation();_toggleToolDiff(this)">${esc(moreLabel)}</button>`:''}
         </div>`:''}
       </div>`:''}
     </div>`;
