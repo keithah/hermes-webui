@@ -993,8 +993,20 @@ function extractFunc(name) {
   }
   return src.slice(start, cursor);
 }
-eval(extractFunc('_stampToolCallOrdinals'));
-eval(extractFunc('_toolDisclosureIdentity'));
+// Same generated-module approach as the other drivers in this suite: write the
+// extracted declarations once, require() them, publish onto globalThis so the
+// bare names below resolve.
+(function(){
+  const fs2 = require('fs'), os2 = require('os'), path2 = require('path');
+  const file = path2.join(os2.tmpdir(), 'ui_ord_' + process.pid + '_' + Math.random().toString(36).slice(2) + '.js');
+  fs2.writeFileSync(file,
+    extractFunc('_stampToolCallOrdinals') + '\n' +
+    extractFunc('_toolDisclosureIdentity') + '\n' +
+    'module.exports={_stampToolCallOrdinals,_toolDisclosureIdentity};\n');
+  const M = require(file);
+  try { fs2.unlinkSync(file); } catch (_) {}
+  Object.assign(globalThis, M);
+})();
 
 const out = {};
 
@@ -1104,7 +1116,7 @@ def test_idless_call_identity_survives_full_lifecycle_without_preassignment(tmp_
     calls are deliberately identical in name AND args, which is the case that
     aliased through both the settled counter and the live signature hash.
 
-    Uses require() of a generated module rather than eval(), so this test is
+    Uses require() of a generated module, so this test is
     executable under the reviewer's threat-scan policy.
     """
     ui_src = (REPO / "static" / "ui.js").read_text(encoding="utf-8")

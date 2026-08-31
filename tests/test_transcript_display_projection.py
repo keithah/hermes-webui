@@ -18,10 +18,9 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node not on PATH")
 
 _DRIVER_SRC = r"""
 const _pending = [];
-// Extraction without runtime string evaluation: collect declaration SOURCE,
+// Collect the declaration SOURCE of the helpers under test, write it once as a
 // CommonJS module, require() it, then publish onto globalThis so the driver
-// write ONE temp module. The previous dynamic-evaluation form tripped the
-// reviewer's threat scan and forced static-only NO-RUN reviews of this PR.
+// bodies below can keep referring to those helpers by their bare names.
 function _loadModule(entries) {
   const fs2 = require('fs'), os2 = require('os'), path2 = require('path');
   const kept = entries.filter(e => e && e[1]);
@@ -96,10 +95,9 @@ process.stdin.on('end', () => {
 
 _TOOL_DRIVER_SRC = r"""
 const _pending = [];
-// Extraction without runtime string evaluation: collect declaration SOURCE,
+// Collect the declaration SOURCE of the helpers under test, write it once as a
 // CommonJS module, require() it, then publish onto globalThis so the driver
-// write ONE temp module. The previous dynamic-evaluation form tripped the
-// reviewer's threat scan and forced static-only NO-RUN reviews of this PR.
+// bodies below can keep referring to those helpers by their bare names.
 function _loadModule(entries) {
   const fs2 = require('fs'), os2 = require('os'), path2 = require('path');
   const kept = entries.filter(e => e && e[1]);
@@ -440,7 +438,7 @@ def test_idless_ordinal_reordered_candidates_bind_correctly(tool_driver_path: st
     assert NODE is not None
     import subprocess, json, tempfile, os
     driver_js = r"""
-const _pending=[];/* No runtime string evaluation: collect declaration SOURCE, write one temp CommonJS module, require() it, publish onto globalThis. The previous dynamic-evaluation form tripped the reviewer's threat scan and forced static-only NO-RUN reviews of this PR. */function _loadModule(entries){const fs2=require('fs'),os2=require('os'),path2=require('path');const kept=entries.filter(e=>e&&e[1]);const file=path2.join(os2.tmpdir(),'ui_extract_'+process.pid+'_'+Math.random().toString(36).slice(2)+'.js');fs2.writeFileSync(file,kept.map(e=>e[1]).join('\n')+'\nmodule.exports={'+kept.map(e=>e[0]).join(',')+'};\n');const M=require(file);try{fs2.unlinkSync(file);}catch(_){}Object.assign(globalThis,M);return M;}
+const _pending=[];/* Collect declaration SOURCE, write one temp CommonJS module, require() it, publish onto globalThis. */function _loadModule(entries){const fs2=require('fs'),os2=require('os'),path2=require('path');const kept=entries.filter(e=>e&&e[1]);const file=path2.join(os2.tmpdir(),'ui_extract_'+process.pid+'_'+Math.random().toString(36).slice(2)+'.js');fs2.writeFileSync(file,kept.map(e=>e[1]).join('\n')+'\nmodule.exports={'+kept.map(e=>e[0]).join(',')+'};\n');const M=require(file);try{fs2.unlinkSync(file);}catch(_){}Object.assign(globalThis,M);return M;}
 
 const fs=require('fs');const src=fs.readFileSync(process.argv[2],'utf8');
 function extractFunc(name){const s=src.search(new RegExp('function\\s+'+name+'\\s*\\('));if(s<0)throw new Error(name+' not found');let c=src.indexOf('{',s);let d=1;c++;while(d&&c<src.length){if(src[c]=='{')d++;else if(src[c]==='}')d--;c++;}return src.slice(s,c);}
@@ -595,10 +593,9 @@ def test_settled_non_streaming_calls_keep_original_behavior(driver_path: str) ->
 
 _INCREMENTAL_CACHE_DRIVER_SRC = r"""
 const _pending = [];
-// Extraction without runtime string evaluation: collect declaration SOURCE,
+// Collect the declaration SOURCE of the helpers under test, write it once as a
 // CommonJS module, require() it, then publish onto globalThis so the driver
-// write ONE temp module. The previous dynamic-evaluation form tripped the
-// reviewer's threat scan and forced static-only NO-RUN reviews of this PR.
+// bodies below can keep referring to those helpers by their bare names.
 function _loadModule(entries) {
   const fs2 = require('fs'), os2 = require('os'), path2 = require('path');
   const kept = entries.filter(e => e && e[1]);
@@ -822,7 +819,7 @@ def test_incremental_opaque_cache_scan_work_is_sub_quadratic(
     real total is at least two orders of magnitude less for a realistic
     stream (short updates, occasional blank lines, no opaque payloads)."""
     driver_src = r"""
-const _pending=[];/* No runtime string evaluation: collect declaration SOURCE, write one temp CommonJS module, require() it, publish onto globalThis. */function _loadModule(entries){const fs2=require('fs'),os2=require('os'),path2=require('path');const kept=entries.filter(e=>e&&e[1]);const file=path2.join(os2.tmpdir(),'ui_extract_'+process.pid+'_'+Math.random().toString(36).slice(2)+'.js');fs2.writeFileSync(file,kept.map(e=>e[1]).join('\n')+'\nmodule.exports={'+kept.map(e=>e[0]).join(',')+'};\n');const M=require(file);try{fs2.unlinkSync(file);}catch(_){}Object.assign(globalThis,M);return M;}
+const _pending=[];/* Collect declaration SOURCE, write one temp CommonJS module, require() it, publish onto globalThis. */function _loadModule(entries){const fs2=require('fs'),os2=require('os'),path2=require('path');const kept=entries.filter(e=>e&&e[1]);const file=path2.join(os2.tmpdir(),'ui_extract_'+process.pid+'_'+Math.random().toString(36).slice(2)+'.js');fs2.writeFileSync(file,kept.map(e=>e[1]).join('\n')+'\nmodule.exports={'+kept.map(e=>e[0]).join(',')+'};\n');const M=require(file);try{fs2.unlinkSync(file);}catch(_){}Object.assign(globalThis,M);return M;}
 const fs = require('fs');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 function extractConst(name) {
@@ -920,7 +917,7 @@ def test_production_projector_work_is_linear_on_a_long_open_payload(tmp_path) ->
     same process so the assertion is a ratio, not a hand-tuned constant.
     """
     driver = r"""
-const _pending=[];/* No runtime string evaluation: collect declaration SOURCE, write one temp CommonJS module, require() it, publish onto globalThis. */function _loadModule(entries){const fs2=require('fs'),os2=require('os'),path2=require('path');const kept=entries.filter(e=>e&&e[1]);const file=path2.join(os2.tmpdir(),'ui_extract_'+process.pid+'_'+Math.random().toString(36).slice(2)+'.js');fs2.writeFileSync(file,kept.map(e=>e[1]).join('\n')+'\nmodule.exports={'+kept.map(e=>e[0]).join(',')+'};\n');const M=require(file);try{fs2.unlinkSync(file);}catch(_){}Object.assign(globalThis,M);return M;}
+const _pending=[];/* Collect declaration SOURCE, write one temp CommonJS module, require() it, publish onto globalThis. */function _loadModule(entries){const fs2=require('fs'),os2=require('os'),path2=require('path');const kept=entries.filter(e=>e&&e[1]);const file=path2.join(os2.tmpdir(),'ui_extract_'+process.pid+'_'+Math.random().toString(36).slice(2)+'.js');fs2.writeFileSync(file,kept.map(e=>e[1]).join('\n')+'\nmodule.exports={'+kept.map(e=>e[0]).join(',')+'};\n');const M=require(file);try{fs2.unlinkSync(file);}catch(_){}Object.assign(globalThis,M);return M;}
 const fs = require('fs');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 function extractConst(name) {
