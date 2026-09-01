@@ -5602,44 +5602,39 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     let signature=_toolCallSignature(d,current.burstId,current.segmentSeq);
     let index=-1;
 
-    if(explicitTid){
+    // Durable event identity is the FIRST authority, before any queue search.
+    // A replayed event must re-bind to the exact record it already produced;
+    // if the unfinished search ran first, replaying call 0's completion would
+    // consume the still-pending equal call 1, and the later real completion
+    // for call 1 would then mint a spurious completion-only occurrence.
+    if(incomingEventId){
+      const _ownerField=isComplete?'_completeEventId':'_startEventId';
+      for(let _o=0;_o<inflight.toolCalls.length;_o++){
+        const _c=inflight.toolCalls[_o];
+        if(!_c||typeof _c!=='object') continue;
+        if(String(_c[_ownerField]||'')!==incomingEventId) continue;
+        if(explicitTid&&String(_c.tid||'')!==explicitTid) continue;
+        if(!explicitTid&&name&&_c.name&&String(_c.name)!==name) continue;
+        index=_o; break;
+      }
+    }
+
+    if(index<0&&explicitTid){
       index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
         tid:explicitTid,
         allowDone:isComplete,
       });
-      // For explicit tid, a replayed done event with the same durable event id
-      // should be idempotent even after a reload where the WeakSet is empty.
-      if(index<0 && isComplete && incomingEventId){
-        for(let _r=0;_r<inflight.toolCalls.length;_r++){
-          const _c=inflight.toolCalls[_r];
-          if(_c && String(_c._completeEventId||'')===incomingEventId && String(_c.tid||'')===explicitTid){
-            index=_r; break;
-          }
-        }
-      }
     }
     const _claimed=isComplete
       ? (inflight._completeClaimedRecords||(inflight._completeClaimedRecords=new WeakSet()))
       : (inflight._startClaimedRecords||(inflight._startClaimedRecords=new WeakSet()));
     if(index<0){
       if(!isComplete){
-        // Start: durable event id is the replay authority. Within one attach the
-        // WeakSet path handled this; across a reload the set is empty and the old
-        // allowDone:true + oldestFirst search collapsed a new start onto the first
-        // record. Check for an existing record with the same start event id first
-        // (idempotent replay), otherwise mint a fresh occurrence.
-        if(incomingEventId){
-          for(let _s=0;_s<inflight.toolCalls.length;_s++){
-            const _c=inflight.toolCalls[_s];
-            if(_c && String(_c._startEventId||'')===incomingEventId){ index=_s; break; }
-          }
-        }
-        // No reuse by signature — a new start is a new occurrence.
+        // A new start is always a new occurrence. Replay was already resolved
+        // above by durable event identity; never reuse by signature.
       } else {
-        // Complete without tid: prefer the oldest unfinished queue entry, not
-        // the oldest overall. The prior allowDone:true picked a done record
-        // (e.g. call 0) for a suffix completion that belongs to the later
-        // pending call (call 1) after a reload.
+        // No record owns this event id: this is a genuinely new completion, so
+        // take the OLDEST UNFINISHED matching occurrence (never a done record).
         index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
           signature,
           name,
@@ -5655,15 +5650,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             allowDone:false,
             oldestFirst:true,
           });
-        }
-        if(index<0 && incomingEventId){
-          for(let _r=0;_r<inflight.toolCalls.length;_r++){
-            const _c=inflight.toolCalls[_r];
-            if(_c && String(_c._completeEventId||'')===incomingEventId){
-              const _matchesName=!name||String(_c.name||'')===name;
-              if(_matchesName){ index=_r; break; }
-            }
-          }
         }
       }
     }
@@ -5754,6 +5740,27 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
 
     S.toolCalls=inflight.toolCalls;
+    // Persist the record mutation and the replay cursor as ONE coherent
+    // transition. _rememberRunJournalCursor() advances the cursor through the
+    // THROTTLED path, so a reload in that window used to restore this
+    // synchronously-saved completed record alongside a stale cursor — which is
+    // exactly what makes the server replay an already-applied event. Advancing
+    // the cursor from this same event before the synchronous save closes that
+    // window.
+    if(incomingEventId){
+      const _tail=incomingEventId.includes(':')
+        ? incomingEventId.slice(incomingEventId.lastIndexOf(':')+1)
+        : incomingEventId;
+      const _seq=Number.parseInt(_tail,10);
+      if(Number.isFinite(_seq)&&_seq>Number(inflight.lastRunJournalSeq||0)){
+        inflight.lastRunJournalSeq=_seq;
+        inflight.lastRunJournalEventId=incomingEventId;
+        if(typeof _lastRunJournalSeq==='number'&&_seq>_lastRunJournalSeq){
+          _lastRunJournalSeq=_seq;
+          _lastRunJournalEventId=incomingEventId;
+        }
+      }
+    }
     persistInflightState();
     return tc;
   }
