@@ -310,3 +310,137 @@ def test_anchor_repaints_do_not_reproject_full_text(tmp_path):
         "anchor repaints scanned %d bytes; a full re-scan per repaint is ~%d, "
         "so this is still quadratic" % (out["scanBytes"], quadratic)
     )
+
+REATTACH_DRIVER = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+
+function extractFunc(name) {
+  const start = src.search(new RegExp('function\\s+' + name + '\\s*\\('));
+  if (start < 0) throw new Error(name + ' not found in source');
+  let cursor = src.indexOf('{', start) + 1;
+  let depth = 1;
+  while (depth && cursor < src.length) {
+    if (src[cursor] === '{') depth++;
+    else if (src[cursor] === '}') depth--;
+    cursor++;
+  }
+  return src.slice(start, cursor);
+}
+function extractLine(re, label) {
+  const m = src.match(re);
+  if (!m) throw new Error(label + ' not found in source');
+  return m[0];
+}
+extractLine(/delete INFLIGHT\[activeSid\]\._startClaimedRecords;/, 'per-attach claim reset');
+
+const parts = [
+  extractFunc('_coerceLiveToolCallSeq'),
+  extractFunc('_coerceLiveToolCallSignature'),
+  extractFunc('activityBurstFallbackFromCandidate'),
+  extractFunc('activitySegmentSeqFallbackFromCandidate'),
+  extractFunc('_stableStringify'),
+  extractFunc('_hashString'),
+  extractFunc('_toolCallSignature'),
+  extractFunc('_liveToolTid'),
+  extractFunc('_findPendingLiveToolCallIndex'),
+  extractFunc('upsertLiveToolCall'),
+];
+
+const preamble = `
+const activeSid = 'sess-1';
+const uploaded = [];
+const S = { toolCalls: [], messages: [], session: { session_id: activeSid } };
+const INFLIGHT = {};
+function persistInflightState(){}
+let __anchor = { burstId: 7, segmentSeq: 2 };
+function _currentLiveToolAnchor(){ return __anchor; }
+`;
+
+const mod = preamble + parts.join('\n') + `
+module.exports = { upsertLiveToolCall, INFLIGHT, S, activeSid };
+`;
+const path = process.argv[3];
+fs.writeFileSync(path, mod);
+const M = require(path);
+
+// Simulate persisted INFLIGHT after two equal ID-less starts, first completed.
+const ARGS = { path: '/tmp/x.txt' };
+M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p' }, 'start', 'ev:start0');
+M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p' }, 'start', 'ev:start1');
+// Complete only call 0
+M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p', snippet: 'FIRST' }, 'complete', 'ev:complete0');
+
+let calls = M.INFLIGHT[M.activeSid].toolCalls;
+// Simulate reload: keep toolCalls and nonzero cursor, delete per-attach claim sets
+M.INFLIGHT[M.activeSid].lastRunJournalSeq = 5;
+M.INFLIGHT[M.activeSid].lastRunJournalEventId = 'ev:complete0';
+delete M.INFLIGHT[M.activeSid]._startClaimedRecords;
+delete M.INFLIGHT[M.activeSid]._completeClaimedRecords;
+
+// Suffix replay: only call 1's completion arrives
+const before0Snippet = calls[0].snippet;
+const before0Done = calls[0].done;
+M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p', snippet: 'SECOND' }, 'complete', 'ev:complete1');
+calls = M.INFLIGHT[M.activeSid].toolCalls;
+const out = {
+  count: calls.length,
+  snippets: calls.map(c => c.snippet),
+  dones: calls.map(c => c.done === true),
+  tids: calls.map(c => c.tid),
+  occurrences: calls.map(c => c._occurrence),
+  before0Snippet,
+  before0Done,
+  call0SnippetAfter: calls[0].snippet,
+  call1SnippetAfter: calls[1].snippet,
+};
+// Idempotent replay of same event id should not create duplicate or overwrite.
+M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p', snippet: 'SECOND' }, 'complete', 'ev:complete1');
+const calls2 = M.INFLIGHT[M.activeSid].toolCalls;
+out.countAfterReplay = calls2.length;
+out.snippetsAfterReplay = calls2.map(c => c.snippet);
+out.donesAfterReplay = calls2.map(c => c.done === true);
+
+console.log(JSON.stringify(out));
+"""
+
+def _run_reattach(tmp_path):
+    driver = tmp_path / "reattach_driver.js"
+    driver.write_text(REATTACH_DRIVER)
+    proc = subprocess.run(
+        [NODE, str(driver), str(MESSAGES_JS), str(tmp_path / "reattach_mod.js")],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        raise AssertionError("node driver failed:\n" + proc.stdout + proc.stderr)
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.skipif(not Path(NODE).exists(), reason="node not available")
+def test_reload_reattach_completion_selects_pending_not_done(tmp_path):
+    """#7040 r11: durable ID-less completion across persisted reattach.
+
+    ``attachLiveStream()`` deletes the per-attach WeakSet claim sets. A reload
+    restores persisted ``INFLIGHT.toolCalls`` (call 0 done, call 1 pending) and a
+    nonzero journal cursor. The first suffix completion after reattach must select
+    the pending call, not the older done record with the same name/args. The old
+    allowDone:true + oldestFirst search picked the done record and overwrote its
+    snippet, leaving the pending call unfinished. This test reconstructs that
+    schedule through the producer and asserts the durable event-id path fixes it,
+    plus idempotent replay of the same completion.
+    """
+    out = _run_reattach(tmp_path)
+    assert out["count"] == 2, out
+    # Call 0 must stay unchanged — the bug overwrote it with SECOND.
+    assert out["call0SnippetAfter"] == "FIRST", out
+    assert out["before0Snippet"] == "FIRST", out
+    assert out["call1SnippetAfter"] == "SECOND", out
+    assert out["dones"] == [True, True], out
+    assert out["snippets"] == ["FIRST", "SECOND"], out
+    assert len(set(out["tids"])) == 2, out["tids"]
+    assert out["occurrences"] == [0, 1], out["occurrences"]
+    # Idempotent replay: same event id must not duplicate or mutate.
+    assert out["countAfterReplay"] == 2, out
+    assert out["snippetsAfterReplay"] == ["FIRST", "SECOND"], out
+    assert out["donesAfterReplay"] == [True, True], out
+
