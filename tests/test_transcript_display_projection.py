@@ -473,6 +473,40 @@ def test_show_more_consumes_bounded_fallback_when_canonical_recovery_misses(
     assert len(expanded) < 70_000
 
 
+def test_non_abbreviated_show_more_deliberately_has_no_bounded_fallback(
+    tool_driver_path: str,
+) -> None:
+    """Ordinary output past the preview cut gets Show more but NO data-full.
+
+    data-full is emitted only when projection actually shortened the snippet.
+    Ordinary prose well past the ~800-char preview cut is therefore serialized
+    WITHOUT a bounded fallback, and on canonical-recovery miss Show more shows
+    the short preview. That is deliberate, not a coverage gap: for a
+    non-abbreviated snippet the "bounded" form is the canonical text, so
+    serializing it would put unbounded canonical data in the DOM -- the exact
+    contract rounds 6 and 9 removed data-full to protect. This pins the
+    boundary so the narrower-than-it-reads condition cannot be silently
+    "fixed" into a contract breach.
+    """
+    prose = "ordinary tool output line. " * 400  # ~10.8k chars, no opaque run
+    result = _tool_toggle_canonical_miss(
+        tool_driver_path,
+        {"name": "terminal", "done": True, "snippet": prose},
+    )
+
+    # Projection did not shorten this snippet, so no bounded fallback exists...
+    assert result["hasFullAttribute"] is False
+
+    # ...and Show more therefore renders the short preview, by design.
+    expanded = str(result["expandedText"])
+    short_preview = str(result["shortPreview"])
+    assert expanded == short_preview
+
+    # The canonical text was never serialized into the DOM.
+    assert len(expanded) < 1_200
+    assert prose not in expanded
+
+
 def test_tool_card_does_not_duplicate_unbounded_ordinary_output(tool_driver_path: str) -> None:
     prose = "ordinary output " * 20_000
     result = _tool_render(

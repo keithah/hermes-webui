@@ -19551,6 +19551,21 @@ function buildToolCard(tc){
   const moreLabel=tc.is_diff?'Show diff':'Show more';
   const lessLabel=tc.is_diff?'Hide diff':'Show less';
   // Keep restored fallback data bounded; live rows retain canonical _tcData.
+  // NOTE the two conditions below are deliberately NARROW, and data-full is
+  // therefore absent from most Show-more cards:
+  //   projectedSnippet!==rawSnippet -- emit only when projection actually
+  //     SHORTENED the text (an opaque run was bounded). hasMore is true for any
+  //     snippet past the ~800-char preview cut, so ordinary prose output well
+  //     over that threshold still gets NO data-full. That is intentional: for a
+  //     non-abbreviated snippet the 'bounded' form IS the canonical text, and
+  //     serializing it would put canonical/unbounded data into the DOM -- the
+  //     exact contract breach rounds 6 and 9 removed data-full for. Such rows
+  //     fall back to data-short, and Show more shows the preview.
+  //   length<=_toolCardSerializedDisplayLimit -- never serialize a bounded form
+  //     that is itself huge.
+  // Canonical recovery by immutable identity (_tcData / anchor scene /
+  // disclosure key) remains the primary path; data-full is only the last-resort
+  // fallback for a stale row where all of those miss.
   const _toolCardSerializedDisplayLimit=65536;
   const fullDataAttr=projectedSnippet!==rawSnippet&&projectedSnippet.length<=_toolCardSerializedDisplayLimit
     ? ` data-full="${esc(projectedSnippet).replace(/"/g,'&quot;')}"`
