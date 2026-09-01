@@ -311,6 +311,7 @@ def test_anchor_repaints_do_not_reproject_full_text(tmp_path):
         "so this is still quadratic" % (out["scanBytes"], quadratic)
     )
 
+
 REATTACH_DRIVER = r"""
 const fs = require('fs');
 const src = fs.readFileSync(process.argv[2], 'utf8');
@@ -332,7 +333,8 @@ function extractLine(re, label) {
   if (!m) throw new Error(label + ' not found in source');
   return m[0];
 }
-extractLine(/delete INFLIGHT\[activeSid\]\._startClaimedRecords;/, 'per-attach claim reset');
+// The production per-attach claim reset is what makes this schedule reachable.
+const CLAIM_RESET = extractLine(/delete INFLIGHT\[activeSid\]\._startClaimedRecords;/, 'claim reset');
 
 const parts = [
   extractFunc('_coerceLiveToolCallSeq'),
@@ -347,62 +349,127 @@ const parts = [
   extractFunc('upsertLiveToolCall'),
 ];
 
+// Real persistence: saveInflightState round-trips through JSON exactly like
+// the production localStorage path, so anything not serialized is genuinely
+// lost across the simulated reload.
 const preamble = `
 const activeSid = 'sess-1';
 const uploaded = [];
 const S = { toolCalls: [], messages: [], session: { session_id: activeSid } };
-const INFLIGHT = {};
-function persistInflightState(){}
+let INFLIGHT = {};
+const streamId = 'stream-1';
+const STORE = {};
+let _lastRunJournalSeq = 0;
+let _lastRunJournalEventId = '';
+function saveInflightState(sid, state){ STORE[sid] = JSON.stringify(state); }
+function loadInflightState(sid){ return STORE[sid] ? JSON.parse(STORE[sid]) : null; }
+function persistInflightState(){
+  const inflight = INFLIGHT[activeSid];
+  if (!inflight) return;
+  saveInflightState(activeSid, {
+    streamId,
+    messages: inflight.messages || [],
+    uploaded: inflight.uploaded || [],
+    toolCalls: inflight.toolCalls || [],
+    lastRunJournalSeq: inflight.lastRunJournalSeq || 0,
+    lastRunJournalEventId: inflight.lastRunJournalEventId || '',
+    journalReplayFromStart: !!inflight.journalReplayFromStart,
+  });
+}
 let __anchor = { burstId: 7, segmentSeq: 2 };
 function _currentLiveToolAnchor(){ return __anchor; }
 `;
 
 const mod = preamble + parts.join('\n') + `
-module.exports = { upsertLiveToolCall, INFLIGHT, S, activeSid };
+// Rebuild INFLIGHT the way loadSession() -> attachLiveStream() does: restore
+// the persisted entry, then apply the production per-attach claim reset.
+function simulateReloadAndReattach(staleCursorSeq, staleCursorEventId){
+  const stored = loadInflightState(activeSid);
+  INFLIGHT = {};
+  INFLIGHT[activeSid] = {
+    streamId: String(stored.streamId || ''),
+    messages: stored.messages || [],
+    uploaded: stored.uploaded || [],
+    toolCalls: stored.toolCalls || [],
+    reattach: true,
+    lastRunJournalSeq: Number(stored.lastRunJournalSeq || 0) || 0,
+    lastRunJournalEventId: String(stored.lastRunJournalEventId || ''),
+    journalReplayFromStart: !!stored.journalReplayFromStart,
+  };
+  // Deliberately stale cursor: the reviewer's window where the record was
+  // saved synchronously but the cursor had not advanced yet.
+  if (staleCursorSeq !== undefined) {
+    INFLIGHT[activeSid].lastRunJournalSeq = staleCursorSeq;
+    INFLIGHT[activeSid].lastRunJournalEventId = staleCursorEventId || '';
+  }
+  delete INFLIGHT[activeSid]._startClaimedRecords;
+  delete INFLIGHT[activeSid]._completeClaimedRecords;
+  S.toolCalls = INFLIGHT[activeSid].toolCalls;
+  return INFLIGHT[activeSid];
+}
+module.exports = {
+  upsertLiveToolCall,
+  simulateReloadAndReattach,
+  get INFLIGHT(){ return INFLIGHT; },
+  S, activeSid,
+  get cursor(){ return { seq: _lastRunJournalSeq, id: _lastRunJournalEventId }; },
+};
 `;
 const path = process.argv[3];
 fs.writeFileSync(path, mod);
 const M = require(path);
 
-// Simulate persisted INFLIGHT after two equal ID-less starts, first completed.
 const ARGS = { path: '/tmp/x.txt' };
-M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p' }, 'start', 'ev:start0');
-M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p' }, 'start', 'ev:start1');
-// Complete only call 0
-M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p', snippet: 'FIRST' }, 'complete', 'ev:complete0');
+function ev(extra){ return Object.assign({ name: 'read_file', args: ARGS, preview: 'p' }, extra || {}); }
+function calls(){ return M.INFLIGHT[M.activeSid].toolCalls; }
+function snap(){
+  return {
+    count: calls().length,
+    snippets: calls().map(c => c.snippet),
+    dones: calls().map(c => c.done === true),
+    tids: calls().map(c => c.tid),
+    occurrences: calls().map(c => c._occurrence),
+  };
+}
 
-let calls = M.INFLIGHT[M.activeSid].toolCalls;
-// Simulate reload: keep toolCalls and nonzero cursor, delete per-attach claim sets
-M.INFLIGHT[M.activeSid].lastRunJournalSeq = 5;
-M.INFLIGHT[M.activeSid].lastRunJournalEventId = 'ev:complete0';
-delete M.INFLIGHT[M.activeSid]._startClaimedRecords;
-delete M.INFLIGHT[M.activeSid]._completeClaimedRecords;
+const out = {};
 
-// Suffix replay: only call 1's completion arrives
-const before0Snippet = calls[0].snippet;
-const before0Done = calls[0].done;
-M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p', snippet: 'SECOND' }, 'complete', 'ev:complete1');
-calls = M.INFLIGHT[M.activeSid].toolCalls;
-const out = {
-  count: calls.length,
-  snippets: calls.map(c => c.snippet),
-  dones: calls.map(c => c.done === true),
-  tids: calls.map(c => c.tid),
-  occurrences: calls.map(c => c._occurrence),
-  before0Snippet,
-  before0Done,
-  call0SnippetAfter: calls[0].snippet,
-  call1SnippetAfter: calls[1].snippet,
-};
-// Idempotent replay of same event id should not create duplicate or overwrite.
-M.upsertLiveToolCall({ name: 'read_file', args: ARGS, preview: 'p', snippet: 'SECOND' }, 'complete', 'ev:complete1');
-const calls2 = M.INFLIGHT[M.activeSid].toolCalls;
-out.countAfterReplay = calls2.length;
-out.snippetsAfterReplay = calls2.map(c => c.snippet);
-out.donesAfterReplay = calls2.map(c => c.done === true);
+// Two equal ID-less starts; only call 0 completes, via event E0 (seq 40).
+M.upsertLiveToolCall(ev(), 'start', 'run:sess-1:10');
+M.upsertLiveToolCall(ev(), 'start', 'run:sess-1:20');
+M.upsertLiveToolCall(ev({ snippet: 'FIRST' }), 'complete', 'run:sess-1:40');
+out.beforeReload = snap();
+out.cursorAfterComplete = M.INFLIGHT[M.activeSid].lastRunJournalSeq;
+
+// Reload + reattach with a DELIBERATELY STALE cursor (30 < 40), which is what
+// makes the server replay E0 even though it was already applied.
+M.simulateReloadAndReattach(30, 'run:sess-1:30');
+out.afterReload = snap();
+
+// 1) E0 REPLAYS FIRST while call 1 is still pending.
+M.upsertLiveToolCall(ev({ snippet: 'FIRST' }), 'complete', 'run:sess-1:40');
+out.afterE0Replay = snap();
+
+// 2) Then E1 alone completes call 1.
+M.upsertLiveToolCall(ev({ snippet: 'SECOND' }), 'complete', 'run:sess-1:50');
+out.afterE1 = snap();
+
+// 3) Repeat E1 after all calls are done -> idempotent.
+M.upsertLiveToolCall(ev({ snippet: 'SECOND' }), 'complete', 'run:sess-1:50');
+out.afterE1ReplayAllDone = snap();
+
+// 4) Repeat E1 while ANOTHER equal call is pending -> must not consume it.
+M.upsertLiveToolCall(ev(), 'start', 'run:sess-1:60');
+M.upsertLiveToolCall(ev({ snippet: 'SECOND' }), 'complete', 'run:sess-1:50');
+out.afterE1ReplayWithPending = snap();
+
+// 5) The genuinely new completion for that third call still lands on it.
+M.upsertLiveToolCall(ev({ snippet: 'THIRD' }), 'complete', 'run:sess-1:70');
+out.afterThird = snap();
 
 console.log(JSON.stringify(out));
 """
+
 
 def _run_reattach(tmp_path):
     driver = tmp_path / "reattach_driver.js"
@@ -417,30 +484,58 @@ def _run_reattach(tmp_path):
 
 
 @pytest.mark.skipif(not Path(NODE).exists(), reason="node not available")
-def test_reload_reattach_completion_selects_pending_not_done(tmp_path):
-    """#7040 r11: durable ID-less completion across persisted reattach.
+def test_replayed_completion_does_not_consume_a_later_pending_call(tmp_path):
+    """#7040 r12: an exact replay must never steal a pending occurrence.
 
-    ``attachLiveStream()`` deletes the per-attach WeakSet claim sets. A reload
-    restores persisted ``INFLIGHT.toolCalls`` (call 0 done, call 1 pending) and a
-    nonzero journal cursor. The first suffix completion after reattach must select
-    the pending call, not the older done record with the same name/args. The old
-    allowDone:true + oldestFirst search picked the done record and overwrote its
-    snippet, leaving the pending call unfinished. This test reconstructs that
-    schedule through the producer and asserts the durable event-id path fixes it,
-    plus idempotent replay of the same completion.
+    Round 11 searched unfinished records BEFORE checking whether the incoming
+    event id already owned a completed record. So with call 0 completed by E0
+    and an equal call 1 still pending, replaying E0 after a reload consumed
+    call 1; the later real E1 then had no pending owner and minted a spurious
+    completion-only occurrence.
+
+    This drives the real schedule: persist through a JSON round trip, rebuild
+    INFLIGHT the way loadSession() -> attachLiveStream() does (including the
+    production per-attach claim-set reset), force a deliberately stale replay
+    cursor, then replay E0 FIRST while call 1 is pending.
     """
     out = _run_reattach(tmp_path)
-    assert out["count"] == 2, out
-    # Call 0 must stay unchanged — the bug overwrote it with SECOND.
-    assert out["call0SnippetAfter"] == "FIRST", out
-    assert out["before0Snippet"] == "FIRST", out
-    assert out["call1SnippetAfter"] == "SECOND", out
-    assert out["dones"] == [True, True], out
-    assert out["snippets"] == ["FIRST", "SECOND"], out
-    assert len(set(out["tids"])) == 2, out["tids"]
-    assert out["occurrences"] == [0, 1], out["occurrences"]
-    # Idempotent replay: same event id must not duplicate or mutate.
-    assert out["countAfterReplay"] == 2, out
-    assert out["snippetsAfterReplay"] == ["FIRST", "SECOND"], out
-    assert out["donesAfterReplay"] == [True, True], out
 
+    # Baseline: two calls, only the first done.
+    assert out["beforeReload"]["count"] == 2, out["beforeReload"]
+    assert out["beforeReload"]["dones"] == [True, False], out["beforeReload"]
+    # The cursor advanced from the same event that mutated the record.
+    assert out["cursorAfterComplete"] == 40, out["cursorAfterComplete"]
+
+    # State survives the reload byte-for-byte.
+    assert out["afterReload"]["snippets"] == ["FIRST", ""], out["afterReload"]
+    assert out["afterReload"]["dones"] == [True, False], out["afterReload"]
+
+    # 1) Replaying E0 must be a no-op: call 1 stays pending, nothing is added.
+    a = out["afterE0Replay"]
+    assert a["count"] == 2, "E0 replay minted an occurrence: %r" % (a,)
+    assert a["dones"] == [True, False], "E0 replay consumed the pending call: %r" % (a,)
+    assert a["snippets"] == ["FIRST", ""], a
+
+    # 2) E1 then completes call 1 — and only call 1.
+    b = out["afterE1"]
+    assert b["count"] == 2, b
+    assert b["dones"] == [True, True], b
+    assert b["snippets"] == ["FIRST", "SECOND"], b
+    assert len(set(b["tids"])) == 2, b["tids"]
+    assert b["occurrences"] == [0, 1], b["occurrences"]
+
+    # 3) Replaying E1 with everything done is idempotent.
+    assert out["afterE1ReplayAllDone"] == b, out["afterE1ReplayAllDone"]
+
+    # 4) Replaying E1 while a third equal call is pending must not consume it.
+    c = out["afterE1ReplayWithPending"]
+    assert c["count"] == 3, c
+    assert c["dones"] == [True, True, False], "E1 replay stole the pending call: %r" % (c,)
+    assert c["snippets"] == ["FIRST", "SECOND", ""], c
+
+    # 5) The third call's own completion still lands on it.
+    e = out["afterThird"]
+    assert e["count"] == 3, e
+    assert e["dones"] == [True, True, True], e
+    assert e["snippets"] == ["FIRST", "SECOND", "THIRD"], e
+    assert len(set(e["tids"])) == 3, e["tids"]
