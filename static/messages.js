@@ -2154,14 +2154,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(uploaded.length) INFLIGHT[activeSid].uploaded=[...uploaded];
     if(!Array.isArray(INFLIGHT[activeSid].toolCalls)) INFLIGHT[activeSid].toolCalls=[];
   }
-  // #7040 round 10: per-ATTACH reset of the tool-call claim sets (see
-  // upsertLiveToolCall). Clearing them here is what keeps the reconnect replay
-  // path (replay=1&after_seq=...) idempotent: a re-delivered event finds its
-  // original record unclaimed and re-binds instead of minting a duplicate,
-  // while within one attach a genuinely repeated call still gets its own
-  // occurrence. They intentionally do NOT survive a reattach.
-  delete INFLIGHT[activeSid]._startClaimedRecords;
-  delete INFLIGHT[activeSid]._completeClaimedRecords;
+  // #7040 round 11/12: reconnect-replay idempotence is owned by DURABLE event
+  // identity (_startEventId/_completeEventId, persisted with the tool call and
+  // resolved in upsertLiveToolCall BEFORE any queue search) -- not by per-attach
+  // state. Round 10 kept per-attach claim WeakSets here; round 11 replaced that
+  // approach precisely because they are cleared on reattach, so a replayed event
+  // after a reload met an empty set and could consume a later pending occurrence.
+  // Nothing about tool-call identity needs clearing on attach now: a replayed
+  // event re-binds to the record already owning its event id, a genuinely new
+  // start always mints a fresh occurrence (it is never matched by signature),
+  // and a new completion only ever takes an UNFINISHED occurrence.
   const _priorInflightStreamId=String(INFLIGHT[activeSid].streamId||'');
   if(_priorInflightStreamId&&_priorInflightStreamId!==streamId){
     INFLIGHT[activeSid].lastRunJournalSeq=0;
@@ -5625,9 +5627,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         allowDone:isComplete,
       });
     }
-    const _claimed=isComplete
-      ? (inflight._completeClaimedRecords||(inflight._completeClaimedRecords=new WeakSet()))
-      : (inflight._startClaimedRecords||(inflight._startClaimedRecords=new WeakSet()));
     if(index<0){
       if(!isComplete){
         // A new start is always a new occurrence. Replay was already resolved
@@ -5657,8 +5656,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     let tc=null;
     if(index>=0&&inflight.toolCalls[index]){
       tc=inflight.toolCalls[index];
-      // This phase has now spent its claim on this record.
-      try{ _claimed.add(tc); }catch(_){}
     }
 
     if(!tc){
@@ -5683,7 +5680,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         tc.started_at=Date.now()/1000;
       }
       if(isComplete) tc._createdByComplete=true;
-      try{ _claimed.add(tc); }catch(_){}
       inflight.toolCalls.push(tc);
       if(!signature){
         signature=_toolCallSignature(tc,tc.activityBurstId,tc.activitySegmentSeq);

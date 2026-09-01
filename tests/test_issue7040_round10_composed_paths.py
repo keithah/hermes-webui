@@ -29,12 +29,10 @@ function extractLine(re, label) {
   return m[0];
 }
 
-// The claim sets hang off the inflight record and are created lazily by
-// upsertLiveToolCall itself, so nothing extra has to be declared here. Assert
-// the production reset point still exists -- without it a reattach would keep
-// stale claims and a replayed event would mint a duplicate.
-extractLine(/delete INFLIGHT\[activeSid\]\._startClaimedRecords;/, 'per-attach claim reset');
-
+// Replay idempotence is owned by durable event identity carried ON the tool
+// call (_startEventId/_completeEventId), so there is no per-attach state for
+// this driver to declare or reset. The behavioural assertions below are the
+// oracle; nothing here asserts the mere presence of a mechanism.
 const parts = [
   extractFunc('_coerceLiveToolCallSeq'),
   extractFunc('_coerceLiveToolCallSignature'),
@@ -333,9 +331,9 @@ function extractLine(re, label) {
   if (!m) throw new Error(label + ' not found in source');
   return m[0];
 }
-// The production per-attach claim reset is what makes this schedule reachable.
-const CLAIM_RESET = extractLine(/delete INFLIGHT\[activeSid\]\._startClaimedRecords;/, 'claim reset');
-
+// This schedule is reachable because a reload restores persisted toolCalls and
+// a stale cursor; the durable event ids on those records are what must make the
+// replay idempotent.
 const parts = [
   extractFunc('_coerceLiveToolCallSeq'),
   extractFunc('_coerceLiveToolCallSignature'),
@@ -402,8 +400,6 @@ function simulateReloadAndReattach(staleCursorSeq, staleCursorEventId){
     INFLIGHT[activeSid].lastRunJournalSeq = staleCursorSeq;
     INFLIGHT[activeSid].lastRunJournalEventId = staleCursorEventId || '';
   }
-  delete INFLIGHT[activeSid]._startClaimedRecords;
-  delete INFLIGHT[activeSid]._completeClaimedRecords;
   S.toolCalls = INFLIGHT[activeSid].toolCalls;
   return INFLIGHT[activeSid];
 }
