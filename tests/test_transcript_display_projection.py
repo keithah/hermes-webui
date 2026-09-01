@@ -229,6 +229,50 @@ process.stdin.on('end', () => {
     }));
     return;
   }
+  if (payload.mode === 'toggle-canonical-miss') {
+    // Build the card for real, then reproduce the state Show more actually
+    // hits after an innerHTML restore when EVERY canonical recovery route
+    // misses: the _tcData expando is gone, there is no anchor-scene helper,
+    // and S.toolCalls no longer holds the call. The button is wired from the
+    // attributes buildToolCard really serialized, and the real _toggleToolDiff
+    // is driven -- the fallback expression is never reimplemented here.
+    const row = buildToolCard(payload.tc);
+    try { delete row._tcData; } catch (_) {}
+    S.toolCalls = [];
+    const html = row.innerHTML;
+    const grab = re => (html.match(re) || [])[1];
+    const unesc = v => String(v == null ? '' : v)
+      .replace(/&quot;/g, '"').replace(/&gt;/g, '>')
+      .replace(/&lt;/g, '<').replace(/&amp;/g, '&');
+    const fullRaw = grab(/data-full="([^"]*)"/);
+    const shortRaw = grab(/data-short="([^"]*)"/);
+    const moreLabel = unesc(grab(/data-more-label="([^"]*)"/));
+    const lessLabel = unesc(grab(/data-less-label="([^"]*)"/));
+    const pre = {textContent: ''};
+    const resultBox = {querySelector: sel => (sel === 'pre' ? pre : null)};
+    const btn = {
+      dataset: {
+        // Absent attribute must read as undefined, exactly like a real DOM.
+        full: fullRaw == null ? undefined : unesc(fullRaw),
+        short: unesc(shortRaw),
+        isDiff: grab(/data-is-diff="([^"]*)"/),
+        moreLabel: moreLabel,
+        lessLabel: lessLabel,
+      },
+      // textContent === moreLabel is what makes _toggleToolDiff expand.
+      textContent: moreLabel,
+      closest: sel => (sel === '.tool-card-result'
+        ? resultBox
+        : (sel === '.tool-card-row' ? row : null)),
+    };
+    _toggleToolDiff(btn);
+    process.stdout.write(JSON.stringify({
+      hasFullAttribute: fullRaw != null,
+      shortPreview: unesc(shortRaw),
+      expandedText: pre.textContent,
+    }));
+    return;
+  }
   const row = buildToolCard(payload.tc);
   process.stdout.write(JSON.stringify({
     htmlLength: row.innerHTML.length,
@@ -286,6 +330,20 @@ def _tool_render(tool_driver_path: str, tc: dict) -> dict[str, object]:
     result = subprocess.run(
         [NODE, tool_driver_path, str(UI_JS_PATH)],
         input=json.dumps({"tc": tc}),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    return json.loads(result.stdout)
+
+
+def _tool_toggle_canonical_miss(tool_driver_path: str, tc: dict) -> dict[str, object]:
+    assert NODE is not None
+    result = subprocess.run(
+        [NODE, tool_driver_path, str(UI_JS_PATH)],
+        input=json.dumps({"tc": tc, "mode": "toggle-canonical-miss"}),
         capture_output=True,
         text=True,
         timeout=30,
@@ -380,18 +438,39 @@ def test_live_thinking_render_is_bounded(driver_path: str) -> None:
     assert "opaque payload abbreviated for display" in result["display"]
 
 
-def test_tool_card_serializes_bounded_projected_expansion(tool_driver_path: str) -> None:
-    raw = "data:application/octet-stream;base64," + ("D" * 200_000)
-    result = _tool_render(
+def test_show_more_consumes_bounded_fallback_when_canonical_recovery_misses(
+    tool_driver_path: str,
+) -> None:
+    """Show more must render the bounded serialized fallback, not the short preview.
+
+    buildToolCard serializes a BOUNDED projection into data-full; before this
+    was consumed, _toggleToolDiff still fell back to data-short, so the
+    attribute was present in the DOM but never reached the user -- an
+    attribute-presence assertion passed against a complete no-op. This drives
+    the real _toggleToolDiff with every canonical recovery route missing and
+    asserts on what the expanded <pre> actually receives.
+    """
+    payload = "D" * 200_000
+    raw = "data:application/octet-stream;base64," + payload
+    result = _tool_toggle_canonical_miss(
         tool_driver_path,
         {"name": "terminal", "done": True, "snippet": raw},
     )
 
-    assert result["hasFullPayloadAttribute"] is True
-    full_payload = str(result["fullPayload"])
-    assert len(full_payload) < 70_000
-    assert "opaque payload abbreviated for display" in full_payload
-    assert "D" * 200_000 not in full_payload
+    expanded = str(result["expandedText"])
+    short_preview = str(result["shortPreview"])
+
+    # The producer emitted a bounded fallback at all.
+    assert result["hasFullAttribute"] is True
+
+    # ...and the consumer actually rendered it rather than the short preview.
+    assert expanded != short_preview
+    assert len(expanded) > len(short_preview)
+    assert "opaque payload abbreviated for display" in expanded
+
+    # Bounded, and never the raw unbounded payload.
+    assert payload not in expanded
+    assert len(expanded) < 70_000
 
 
 def test_tool_card_does_not_duplicate_unbounded_ordinary_output(tool_driver_path: str) -> None:

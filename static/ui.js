@@ -19655,14 +19655,20 @@ function _toggleToolDiff(btn){
   const disclosureKey=row&&row.getAttribute?row.getAttribute('data-tool-disclosure-key'):'';
   const recovered=canonicalTool||_toolCallByDisclosureKey(disclosureKey);
   const canonicalSnippet=recovered&&recovered.snippet;
-  // The full canonical snippet is never serialized into the DOM (data-full
-  // used to do this, defeating the bounded-display/cache contract) -- Show
-  // more resolves it by immutable identity (row._tcData expando, anchor
-  // scene, or the disclosure-key lookup above). If none of those can
-  // recover it (e.g. a genuinely stale/orphaned row), fall back to the
-  // bounded short preview rather than a full payload that was never there.
+  // The RAW canonical snippet is never serialized into the DOM -- data-full
+  // once carried the whole payload, defeating the bounded-display/cache
+  // contract. Show more resolves the canonical value by immutable identity
+  // (row._tcData expando, anchor scene, or the disclosure-key lookup above).
+  // When every one of those misses (e.g. a genuinely stale/orphaned row),
+  // buildToolCard has serialized a BOUNDED fallback into data-full: the
+  // already-projected snippet, and only when projection actually shortened
+  // it and the result fits the serialized-size cap. Prefer that over the
+  // truncated short preview; data-short remains the last resort when no
+  // bounded fallback was emitted.
   const raw=expanded
-    ? (canonicalSnippet==null?btn.dataset.short:String(canonicalSnippet))
+    ? (canonicalSnippet==null
+        ? (btn.dataset.full||btn.dataset.short)
+        : String(canonicalSnippet))
     : btn.dataset.short;
   // Even the expanded canonical payload must stay display-bounded — a
   // deferred Transparent Stream detail can hold an oversized opaque run
