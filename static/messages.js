@@ -5583,7 +5583,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // record unclaimed (the sets live in this attachLiveStream closure and start
   // empty on reattach) and re-binds to it; a genuinely NEW invocation finds the
   // earlier record already claimed, skips it, and mints a fresh occurrence.
-  function upsertLiveToolCall(d, phase){
+  function upsertLiveToolCall(d, phase, rawEventId){
     if(!d||d.name==='clarify') return null;
     const name=String(d&&d.name||'').trim();
     if(!name) return null;
@@ -5598,6 +5598,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     const explicitTid=String(d&&d.tid||d&&d.id||d&&d.tool_call_id||d&&d.tool_use_id||d&&d.call_id||'').trim();
     const isComplete=phase==='complete';
+    const incomingEventId=String(rawEventId||(d&&d.event_id)||(d&&d.lastEventId)||(d&&d.last_event_id)||'').trim();
     let signature=_toolCallSignature(d,current.burstId,current.segmentSeq);
     let index=-1;
 
@@ -5606,32 +5607,65 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         tid:explicitTid,
         allowDone:isComplete,
       });
+      // For explicit tid, a replayed done event with the same durable event id
+      // should be idempotent even after a reload where the WeakSet is empty.
+      if(index<0 && isComplete && incomingEventId){
+        for(let _r=0;_r<inflight.toolCalls.length;_r++){
+          const _c=inflight.toolCalls[_r];
+          if(_c && String(_c._completeEventId||'')===incomingEventId && String(_c.tid||'')===explicitTid){
+            index=_r; break;
+          }
+        }
+      }
     }
     const _claimed=isComplete
       ? (inflight._completeClaimedRecords||(inflight._completeClaimedRecords=new WeakSet()))
       : (inflight._startClaimedRecords||(inflight._startClaimedRecords=new WeakSet()));
     if(index<0){
-      index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
-        signature,
-        name,
-        activityBurstId:current.burstId,
-        activitySegmentSeq:current.segmentSeq,
-        // allowDone stays true so a replayed event can re-bind to a record that
-        // has since completed; `skip` is what stops a genuinely new invocation
-        // from collapsing onto it.
-        allowDone:true,
-        oldestFirst:true,
-        skip:_claimed,
-      });
-    }
-    if(index<0 && isComplete && !explicitTid){
-      index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
-        name,
-        activityBurstId:current.burstId,
-        allowDone:true,
-        oldestFirst:true,
-        skip:_claimed,
-      });
+      if(!isComplete){
+        // Start: durable event id is the replay authority. Within one attach the
+        // WeakSet path handled this; across a reload the set is empty and the old
+        // allowDone:true + oldestFirst search collapsed a new start onto the first
+        // record. Check for an existing record with the same start event id first
+        // (idempotent replay), otherwise mint a fresh occurrence.
+        if(incomingEventId){
+          for(let _s=0;_s<inflight.toolCalls.length;_s++){
+            const _c=inflight.toolCalls[_s];
+            if(_c && String(_c._startEventId||'')===incomingEventId){ index=_s; break; }
+          }
+        }
+        // No reuse by signature — a new start is a new occurrence.
+      } else {
+        // Complete without tid: prefer the oldest unfinished queue entry, not
+        // the oldest overall. The prior allowDone:true picked a done record
+        // (e.g. call 0) for a suffix completion that belongs to the later
+        // pending call (call 1) after a reload.
+        index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
+          signature,
+          name,
+          activityBurstId:current.burstId,
+          activitySegmentSeq:current.segmentSeq,
+          allowDone:false,
+          oldestFirst:true,
+        });
+        if(index<0 && !explicitTid){
+          index=_findPendingLiveToolCallIndex(inflight.toolCalls,{
+            name,
+            activityBurstId:current.burstId,
+            allowDone:false,
+            oldestFirst:true,
+          });
+        }
+        if(index<0 && incomingEventId){
+          for(let _r=0;_r<inflight.toolCalls.length;_r++){
+            const _c=inflight.toolCalls[_r];
+            if(_c && String(_c._completeEventId||'')===incomingEventId){
+              const _matchesName=!name||String(_c.name||'')===name;
+              if(_matchesName){ index=_r; break; }
+            }
+          }
+        }
+      }
     }
 
     let tc=null;
@@ -5712,9 +5746,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(d.duration!==undefined) tc.duration=d.duration;
       if(tc.started_at===undefined||tc.started_at===null) tc.started_at=Date.now()/1000;
       if(!tc.tid) tc.tid=explicitTid||_liveToolTid(d,tc.activityBurstId,tc.activitySegmentSeq,tc._occurrence);
+      if(incomingEventId) tc._completeEventId=incomingEventId;
     } else {
       tc.done=false;
       tc.started_at=tc.started_at||Date.now()/1000;
+      if(incomingEventId) tc._startEventId=incomingEventId;
     }
 
     S.toolCalls=inflight.toolCalls;
@@ -6022,7 +6058,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const d=JSON.parse(e.data);
       if(d.name==='clarify') return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
-      const tc=upsertLiveToolCall(d,'start');
+      const tc=upsertLiveToolCall(d,'start', e&&e.lastEventId);
       if(!tc) return;
       const pendingDisplayTextBeforeTool=segmentStart===0
         ? (_parseStreamState().displayText||'')
@@ -6058,7 +6094,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const d=JSON.parse(e.data);
       if(d.name==='clarify') return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
-      const tc=upsertLiveToolCall(d,'complete');
+      const tc=upsertLiveToolCall(d,'complete', e&&e.lastEventId);
       if(!tc) return;
       tc.is_error=!!d.is_error;
       const pendingDisplayTextBeforeComplete=segmentStart===0
