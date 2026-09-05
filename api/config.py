@@ -6659,6 +6659,7 @@ _available_models_cache: dict | None = None
 _available_models_cache_ts: float = 0.0
 _available_models_live_rebuild_ts: float = 0.0
 _available_models_cache_source_fingerprint: dict | None = None
+_available_models_cache_authority: str | None = None
 _AVAILABLE_MODELS_CACHE_TTL: float = 86400.0  # 24 hours
 _SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = 300.0
 _available_models_cache_lock = threading.RLock()
@@ -6667,12 +6668,8 @@ _available_models_cache_lock = threading.RLock()
 # detect it and discard its stale publish.
 _available_models_cache_generation: int = 0
 
-# Identifies THIS process run. `_available_models_cache_generation` is an
-# in-memory counter that restarts at 0 in every new process, so an equality
-# check on it is only meaningful for a file this same process wrote (#7007
-# round 6 audit). Stamping it alongside the generation lets the on-disk cache
-# keep the #1633 cross-restart contract (schema/version/source-fingerprint)
-# while still rejecting a snapshot superseded within the current run.
+# Identifies THIS process run for diagnostics. It is not durable invalidation
+# authority: process identity necessarily changes across a restart.
 _PROCESS_RUN_ID: str = uuid.uuid4().hex
 
 # Provider auth-status enumeration cache. ``list_available_providers()``
@@ -6819,35 +6816,39 @@ _cache_build_in_progress = False  # True while a cold path is actively building
 # under the same generation apart (a timed-out follower used to barge into
 # the cold-rebuild path and start a second worker while the first was still
 # live, since nothing there checked `_cache_build_in_progress` before setting
-# it). `_active_build_owner` is `(generation, token)` for whichever build is
+# it). `_active_build_owner` is `(generation, token, durable_authority)` for
+# whichever build is
 # currently live, or None. Every finalizer (success publish, disk commit,
 # error/timeout cleanup) must own this exact tuple before it may mutate
 # `_cache_build_in_progress` / the caches — a stale build's finalizer running
 # after a newer owner (or an invalidation) has taken over becomes a no-op
 # instead of retiring state it doesn't own.
 _cache_build_owner_token: int = 0
-_active_build_owner: "tuple[int, int] | None" = None
+_active_build_owner: "tuple[int, int, str | None] | None" = None
 
 
-def _try_claim_build_owner() -> "tuple[int, int] | None":
+def _try_claim_build_owner() -> "tuple[int, int, str | None] | None":
     """Attempt to become the sole owner of a fresh catalog rebuild.
 
-    Caller must hold `_cache_build_cv`. Returns the `(generation, token)`
-    this caller now owns, or None if a build is already live for the current
-    generation — the caller must NOT start a second rebuild in that case,
-    just serve a fallback and let the live owner publish when it finishes.
+    Caller must hold `_cache_build_cv`. Returns `(generation, token,
+    durable_authority)`, or None if a build is already live for the current
+    generation.
     """
     global _cache_build_in_progress, _cache_build_owner_token, _active_build_owner
     if _cache_build_in_progress:
         return None
     _cache_build_in_progress = True
     _cache_build_owner_token += 1
-    owner = (_available_models_cache_generation, _cache_build_owner_token)
+    owner = (
+        _available_models_cache_generation,
+        _cache_build_owner_token,
+        _models_cache_authority(),
+    )
     _active_build_owner = owner
     return owner
 
 
-def _release_build_owner_if_current(owner: "tuple[int, int]") -> None:
+def _release_build_owner_if_current(owner: "tuple[int, int, str | None]") -> None:
     """Clear the in-progress flag and wake waiters, but ONLY if `owner` is
     still the live build. A stale/retired owner's call becomes a no-op —
     this is what stops a late failed/timed-out worker from clearing a
@@ -6862,9 +6863,9 @@ def _release_build_owner_if_current(owner: "tuple[int, int]") -> None:
         _cache_build_cv.notify_all()
 
 
-def _is_current_build_owner(owner: "tuple[int, int]") -> bool:
+def _is_current_build_owner(owner: "tuple[int, int, str | None]") -> bool:
     """Caller must hold `_cache_build_cv`."""
-    return _active_build_owner == owner
+    return _active_build_owner == owner and owner[2] == _models_cache_authority()
 
 # Memoized (snapshot_ref, {provider_slug: frozenset(model_ids)}) derived from
 # the published models-catalog snapshot. Used by _endpoint_advertised_model_ids
@@ -8108,6 +8109,53 @@ def _delete_models_cache_on_disk() -> None:
         pass  # already absent
 
 
+def _models_cache_authority_path() -> Path:
+    """Return the durable invalidation-authority sidecar for the disk cache."""
+    cache_path = _get_models_cache_path()
+    return cache_path.with_name(f"{cache_path.name}.authority")
+
+
+def _models_cache_authority() -> str | None:
+    """Read the current durable cache authority, creating an initial token.
+
+    An unavailable sidecar fails closed: a cache without comparable authority
+    is rebuilt rather than accepted after a restart.
+    """
+    path = _models_cache_authority_path()
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None
+    token = uuid.uuid4().hex
+    try:
+        _paths._atomic_write_text(path, f"{token}\n")
+    except OSError:
+        return None
+    return token
+
+
+def _advance_models_cache_authority() -> str | None:
+    """Durably retire every snapshot captured before this invalidation.
+
+    Removing the old sidecar before publishing the replacement is intentional:
+    if the replacement cannot be persisted (or the process crashes mid-change),
+    the next boot creates a different authority and rejects every existing cache
+    rather than accepting a stale snapshot under the old authority.
+    """
+    path = _models_cache_authority_path()
+    try:
+        path.unlink(missing_ok=True)
+        token = uuid.uuid4().hex
+        _paths._atomic_write_text(path, f"{token}\n")
+    except OSError:
+        return None
+    return token
+
+
 def _is_valid_models_cache(cache: object) -> bool:
     """Return True when a cache payload has the full /api/models shape.
 
@@ -8195,16 +8243,10 @@ def _is_loadable_disk_cache(cache: object) -> bool:
     # early-init save before this stamp could be resolved) is treated as a
     # mismatch, same convention as the `_webui_version` stamp above — worst
     # case one extra rebuild, never a resurrected stale catalog.
-    # Only meaningful for a file THIS process wrote: the generation is an
-    # in-memory counter that resets to 0 on every start, so comparing it to a
-    # file written by an earlier run would reject every cache a restart was
-    # supposed to inherit -- defeating this function's whole purpose ("Save
-    # cache to disk so it survives server restarts") and forcing a full live
-    # provider rebuild on every cold start, since any server that has done a
-    # single credential edit / settings save / OAuth link has already bumped
-    # the counter above 0. Across processes the #1633 schema/version/
-    # source-fingerprint checks above are the correct authority; within one
-    # process the generation still rejects a superseded snapshot.
+    # Generation is useful within one process, but resets after restart. The
+    # durable sidecar authority advances with every invalidation and closes the
+    # crash window where a stale writer renames after invalidation then dies
+    # before delete-on-lost-ownership cleanup. Process identity cannot bypass it.
     if cache.get("_run_id") == _PROCESS_RUN_ID:
         if cache.get("_generation") != _available_models_cache_generation:
             logger.debug(
@@ -8213,6 +8255,10 @@ def _is_loadable_disk_cache(cache: object) -> bool:
                 _available_models_cache_generation,
             )
             return False
+    authority = _models_cache_authority()
+    if authority is None or cache.get("_authority") != authority:
+        logger.debug("models cache rejected: durable invalidation authority changed")
+        return False
     return True
 
 
@@ -8320,7 +8366,9 @@ def _load_stale_models_cache_from_disk() -> dict | None:
         return None
 
 
-def _save_models_cache_to_disk(cache: dict, *, generation: int | None = None) -> None:
+def _save_models_cache_to_disk(
+    cache: dict, *, generation: int | None = None, authority: str | None = None
+) -> None:
     """Save cache to disk so it survives server restarts.
 
     Stamps the payload with `_webui_version` and `_schema_version` (#1633) so
@@ -8366,6 +8414,7 @@ def _save_models_cache_to_disk(cache: dict, *, generation: int | None = None) ->
             "_schema_version": _MODELS_CACHE_SCHEMA_VERSION,
             "_source_fingerprint": _models_cache_source_fingerprint(),
             "_run_id": _PROCESS_RUN_ID,
+            "_authority": authority if authority is not None else _models_cache_authority(),
             "_generation": (
                 generation if generation is not None
                 else _available_models_cache_generation
@@ -8375,6 +8424,8 @@ def _save_models_cache_to_disk(cache: dict, *, generation: int | None = None) ->
             "configured_model_badges": cache["configured_model_badges"],
             "groups": cache["groups"],
         }
+        if not isinstance(payload["_authority"], str) or not payload["_authority"]:
+            return
         runtime_version = _current_webui_version()
         if runtime_version is not None:
             payload["_webui_version"] = runtime_version
@@ -8390,22 +8441,25 @@ def _save_models_cache_to_disk(cache: dict, *, generation: int | None = None) ->
 def _get_fresh_memory_models_cache(now: float) -> dict | None:
     """Return a valid fresh in-memory /api/models cache, or clear stale shapes."""
     global _available_models_cache, _available_models_cache_ts
-    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint
+    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _available_models_cache_authority
     if _available_models_cache is None:
         return None
     if (now - _available_models_cache_ts) >= _AVAILABLE_MODELS_CACHE_TTL:
         return None
+    current_authority = _models_cache_authority()
     current_sources = _models_cache_source_fingerprint()
-    if _available_models_cache_source_fingerprint != current_sources:
+    if (
+        _available_models_cache_source_fingerprint != current_sources
+        or _available_models_cache_authority != current_authority
+    ):
         logger.debug(
-            "models memory cache rejected: source_fingerprint=%r vs runtime=%r",
-            _available_models_cache_source_fingerprint,
-            current_sources,
+            "models memory cache rejected: source/authority no longer match runtime"
         )
         _available_models_cache = None
         _available_models_cache_ts = 0.0
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
+        _available_models_cache_authority = None
         _sync_models_cache_provenance()
         return None
     if _is_valid_models_cache(_available_models_cache):
@@ -8414,6 +8468,7 @@ def _get_fresh_memory_models_cache(now: float) -> dict | None:
     _available_models_cache_ts = 0.0
     _available_models_live_rebuild_ts = 0.0
     _available_models_cache_source_fingerprint = None
+    _available_models_cache_authority = None
     _sync_models_cache_provenance()
     return None
 
@@ -8438,13 +8493,15 @@ def invalidate_models_cache():
     results after the outer catalog cache was cleared.
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
-    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
+    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _available_models_cache_authority, _cache_build_cv
     global _available_models_cache_generation, _active_build_owner
     with _available_models_cache_lock:
+        _advance_models_cache_authority()
         _available_models_cache = None
         _available_models_cache_ts = 0.0
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
+        _available_models_cache_authority = None
         _available_models_cache_generation += 1
         _sync_models_cache_provenance()
         _cache_build_in_progress = False
@@ -8531,13 +8588,15 @@ def invalidate_provider_models_cache(provider_id: str):
         provider_id: canonical provider id (e.g. 'openai', 'anthropic', 'custom:my-key')
     """
     global _available_models_cache, _available_models_cache_ts
-    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _CREDENTIAL_POOL_CACHE
+    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _available_models_cache_authority, _CREDENTIAL_POOL_CACHE
     global _available_models_cache_generation, _cache_build_in_progress, _active_build_owner
     with _available_models_cache_lock:
+        _advance_models_cache_authority()
         _available_models_cache = None
         _available_models_cache_ts = 0.0
         _available_models_live_rebuild_ts = 0.0
         _available_models_cache_source_fingerprint = None
+        _available_models_cache_authority = None
         _available_models_cache_generation += 1
         _sync_models_cache_provenance()
         _cache_build_in_progress = False
@@ -8796,7 +8855,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     contract for every existing caller.
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
-    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
+    global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _available_models_cache_authority, _cache_build_cv
     global _active_build_owner
     # Config mtime check — must come before any config reads.
     # (Test #585 verifies _current_mtime appears before active_provider = None)
@@ -10442,6 +10501,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             _available_models_cache = disk_groups
             _available_models_cache_ts = now
             _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+            _available_models_cache_authority = _models_cache_authority()
             _sync_models_cache_provenance()
             return copy.deepcopy(disk_groups)
 
@@ -10538,6 +10598,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     _available_models_cache_ts = published_at
                     _available_models_live_rebuild_ts = published_at
                     _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+                    _available_models_cache_authority = _build_owner[2]
                     _sync_models_cache_provenance()
             if not _is_current_build_owner(_build_owner):
                 # Fall through to fresh-build fallback on next call; return
@@ -10545,7 +10606,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 # itself was already retired by whatever invalidated/took
                 # over — this stale build owns nothing to release.
                 return copy.deepcopy(result)
-            _save_models_cache_to_disk(result, generation=_build_owner[0])
+            _save_models_cache_to_disk(
+                result, generation=_build_owner[0], authority=_build_owner[2]
+            )
             with _cache_build_cv:
                 if _is_current_build_owner(_build_owner):
                     _cache_build_in_progress = False
@@ -10593,6 +10656,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             global _cache_build_in_progress, _available_models_cache
             global _available_models_cache_ts, _available_models_live_rebuild_ts
             global _available_models_cache_source_fingerprint
+            global _available_models_cache_authority
             global _active_build_owner
             # Every check below only ever mutates shared state when
             # `_build_owner` still matches the live owner tuple. A mismatch
@@ -10614,6 +10678,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 _available_models_cache_source_fingerprint = (
                     _models_cache_source_fingerprint()
                 )
+                _available_models_cache_authority = _build_owner[2]
                 _sync_models_cache_provenance()
             # Write OUTSIDE the lock (slow I/O, and several existing tests
             # monkeypatch this exact function to observe/suppress the
@@ -10624,7 +10689,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             # deleted the file it was replacing. If ownership was lost
             # while the write was in flight, delete what we just wrote
             # instead of letting it resurrect stale data.
-            _save_models_cache_to_disk(result, generation=_build_owner[0])
+            _save_models_cache_to_disk(
+                result, generation=_build_owner[0], authority=_build_owner[2]
+            )
             with _cache_build_cv:
                 if not _is_current_build_owner(_build_owner):
                     _delete_models_cache_on_disk()
@@ -10803,6 +10870,7 @@ def warm_models_catalog_provenance_if_cold() -> None:
         _available_models_cache_ts = time.monotonic()
         try:
             _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+            _available_models_cache_authority = _models_cache_authority()
         except Exception:
             _available_models_cache_source_fingerprint = None
         _sync_models_cache_provenance()
@@ -10842,6 +10910,7 @@ def get_available_models_for_session_visit() -> dict:
             _slow_threshold_ms = 0.0
 
     global _available_models_cache, _available_models_cache_ts, _available_models_cache_source_fingerprint
+    global _available_models_cache_authority
     cache_path = _get_models_cache_path()
     cache_age = _models_cache_file_age_seconds(cache_path, time.time())
     _mark(f"disk_age_check:{cache_age}")
@@ -10886,6 +10955,7 @@ def get_available_models_for_session_visit() -> dict:
                     _available_models_cache = copy.deepcopy(disk_cached)
                     _available_models_cache_ts = time.monotonic()
                     _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+                    _available_models_cache_authority = _models_cache_authority()
                     _sync_models_cache_provenance()
                     _mark("disk_cache_returned")
                     _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")

@@ -215,6 +215,7 @@ def test_force_refresh_sync_followers_wait_past_legacy_timeout(tmp_path, monkeyp
             cfg._available_models_cache_ts = published_at
             cfg._available_models_live_rebuild_ts = published_at
             cfg._available_models_cache_source_fingerprint = fingerprint
+            cfg._available_models_cache_authority = cfg._models_cache_authority()
             cfg._cache_build_in_progress = False
             return True
         if timeout == 60.0:
@@ -485,6 +486,7 @@ def test_session_visit_fresh_disk_hit_does_not_overwrite_newer_memory_cache(tmp_
         cfg._available_models_cache = rebuilt_catalog
         cfg._available_models_cache_ts = time.monotonic()
         cfg._available_models_cache_source_fingerprint = fingerprint
+        cfg._available_models_cache_authority = cfg._models_cache_authority()
         return stale_catalog
 
     monkeypatch.setattr(cfg, "_load_models_cache_from_disk", _disk_hit_after_newer_memory_publish)
