@@ -49,4 +49,3 @@ def test_matrix_preference_keys_exist_in_every_locale_block():
     assert locale_count >= 9
     assert i18n.count("settings_label_matrix_sessions:") == locale_count
     assert i18n.count("settings_desc_matrix_sessions:") == locale_count
-

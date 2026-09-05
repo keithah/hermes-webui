@@ -124,4 +124,3 @@
 - [ ] **Step 6: Commit and push**
 
   Commit only the focused diff, push `feat/matrix-session-management` to the user's fork, and update the existing PR body with RED/GREEN evidence, verification commands, screenshots, sibling origins covered, and any unverified gaps.
-

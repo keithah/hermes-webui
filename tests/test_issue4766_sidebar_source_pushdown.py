@@ -502,7 +502,6 @@ def test_session_list_query_string_respects_sidebar_source_and_flags():
     src = SESSIONS_JS.read_text(encoding="utf-8")
     normalize_fn = _extract_function(src, "_normalizeSessionSourceFilters")
     requested_source_fn = _extract_function(src, "_requestedSessionSidebarSources")
-    selection_key_fn = _extract_function(src, "_sessionSourceSelectionKey")
     exclude_hidden_fn = _extract_function(src, "_sessionListExcludeHiddenEnabled")
     archive_filter_fn = _extract_function(src, "_sessionArchivePagingFilterActive")
     query_fn = _extract_function(src, "_sessionListQueryString")

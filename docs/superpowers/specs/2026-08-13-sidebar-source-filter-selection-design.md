@@ -75,4 +75,3 @@ control on the right side of each non-pinned date heading.
   `./scripts/test.sh`.
 - Manually verify desktop, narrow, and touch-equivalent states in the locally
   deployed build, including long origin names and many origins.
-
