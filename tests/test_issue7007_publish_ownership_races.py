@@ -24,10 +24,6 @@ fail against the pre-fix code.
 from __future__ import annotations
 
 import threading
-import time
-from pathlib import Path
-
-from tests.test_provider_enum_cache import _clear_cache, _install_fake_models
 
 
 def _catalog(label: str) -> dict:
@@ -296,7 +292,6 @@ def test_disk_read_before_lock_cannot_resurrect_a_generation_the_writer_lost(tmp
     since moved on (simulating the invalidation that retired that build).
     The read must reject it regardless of whether the delete has run yet.
     """
-    import json as _json
     import api.config as cfg
 
     config_path = tmp_path / "config.yaml"
@@ -394,27 +389,14 @@ def test_stale_disk_preload_is_not_published_after_a_concurrent_invalidation(tmp
     ), "the superseded snapshot must not be resident in the memory cache either"
 
 
-def test_disk_cache_still_survives_a_process_restart(tmp_path, monkeypatch):
-    """#7007 round 6 audit: the generation stamp must not break restart survival.
+def test_stale_disk_snapshot_is_rejected_after_restart_when_authority_advanced(tmp_path, monkeypatch):
+    """A stale rename that survives a crash must not become valid on restart.
 
-    `_available_models_cache_generation` is an in-memory counter initialised to
-    0 at import, so it restarts from 0 in every new process. Round 6 stamped it
-    into the PERSISTENT cache file and rejected any mismatch on load. Because
-    every real server bumps that counter on its first credential edit / settings
-    save / onboarding step / OAuth link, the file it leaves behind is stamped
-    with a non-zero generation -- and the next process, starting again at 0,
-    rejected it unconditionally.
-
-    That silently defeated the function's documented purpose ("Save cache to
-    disk so it survives server restarts") and the whole #1633 version/schema
-    machinery that exists to decide when a cache SHOULD be invalidated across
-    restarts, forcing a full live provider rebuild (the slow Copilot token
-    exchange / OpenRouter probes) on every single cold start.
-
-    Scoping the generation check to the run that wrote the file keeps both
-    contracts: superseded-within-this-run is still rejected, and a file from a
-    previous run is judged by schema/version/source-fingerprint as #1633
-    intended.
+    A build captures durable authority A, invalidation advances it to B, and
+    then the stale writer completes its rename before crashing ahead of its
+    normal delete-on-lost-ownership cleanup.  A new process must compare the
+    persisted snapshot authority to B and reject A; process-local generation
+    and process identity cannot establish that relationship after restart.
     """
     import api.config as cfg
 
@@ -423,28 +405,75 @@ def test_disk_cache_still_survives_a_process_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
     monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-test")
 
-    # A long-running server whose counter has advanced past 0.
     monkeypatch.setattr(cfg, "_available_models_cache_generation", 7, raising=False)
-    cfg._save_models_cache_to_disk(_catalog("warm"))
+    stale_authority = cfg._models_cache_authority()
+    assert stale_authority is not None
+    cfg._save_models_cache_to_disk(_catalog("stale"), authority=stale_authority)
     assert cache_path.exists()
 
-    # Same run, generation superseded -> still rejected (round-6 intent).
-    monkeypatch.setattr(cfg, "_available_models_cache_generation", 8, raising=False)
-    assert cfg._load_models_cache_from_disk() is None, (
-        "a snapshot superseded within THIS run must still be rejected"
+    # Invalidation is durable, not merely an in-memory generation increment.
+    cfg.invalidate_models_cache()
+    cfg._save_models_cache_to_disk(
+        _catalog("stale"), generation=7, authority=stale_authority
     )
+    assert cache_path.exists(), "simulate stale rename after the invalidation delete"
 
-    # Restart: new process run id, counter back to its initial 0.
+    # Simulate a new process after the stale writer crashed before cleanup.
     monkeypatch.setattr(cfg, "_PROCESS_RUN_ID", "a-different-process-run", raising=False)
     monkeypatch.setattr(cfg, "_available_models_cache_generation", 0, raising=False)
-    assert cfg._load_models_cache_from_disk() is not None, (
-        "the on-disk cache must survive a restart -- that is the entire reason "
-        "it is written; the in-memory generation counter is meaningless across "
-        "processes and must not veto it"
+    assert cfg._load_models_cache_from_disk() is None
+
+
+def test_disk_cache_with_current_durable_authority_survives_restart(tmp_path, monkeypatch):
+    """A cache written after invalidation still remains loadable after restart."""
+    import api.config as cfg
+
+    cache_path = tmp_path / "models_cache.json"
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
+    monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-test")
+
+    cfg.invalidate_models_cache()
+    cfg._save_models_cache_to_disk(_catalog("fresh"))
+    monkeypatch.setattr(cfg, "_PROCESS_RUN_ID", "a-different-process-run", raising=False)
+    monkeypatch.setattr(cfg, "_available_models_cache_generation", 0, raising=False)
+    loaded = cfg._load_models_cache_from_disk()
+    assert loaded is not None
+    assert loaded["default_model"] == "fresh"
+
+
+def test_authority_rotation_failure_removes_old_authority(tmp_path, monkeypatch):
+    """An interrupted authority rotation must fail closed after restart."""
+    import api.config as cfg
+
+    cache_path = tmp_path / "models_cache.json"
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
+    assert cfg._models_cache_authority() is not None
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("simulated full disk")
+
+    monkeypatch.setattr(cfg._paths, "_atomic_write_text", fail_write)
+    assert cfg._advance_models_cache_authority() is None
+    assert not cfg._models_cache_authority_path().exists()
+
+
+def test_memory_cache_is_rejected_when_another_process_advances_authority(monkeypatch):
+    """A live instance must not serve a warm cache after peer invalidation."""
+    import time
+    import api.config as cfg
+
+    old_authority = cfg._models_cache_authority()
+    assert old_authority is not None
+    monkeypatch.setattr(cfg, "_available_models_cache", _catalog("stale"), raising=False)
+    monkeypatch.setattr(cfg, "_available_models_cache_ts", time.monotonic(), raising=False)
+    monkeypatch.setattr(
+        cfg, "_available_models_cache_source_fingerprint", {"profile": "demo"}, raising=False
+    )
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: {"profile": "demo"})
+    monkeypatch.setattr(
+        cfg, "_available_models_cache_authority", old_authority, raising=False
     )
 
-    # ...but a restart that genuinely invalidates per #1633 still rejects.
-    monkeypatch.setattr(cfg, "_current_webui_version", lambda: "v-newer-release")
-    assert cfg._load_models_cache_from_disk() is None, (
-        "the #1633 version/schema contract must remain the cross-restart authority"
-    )
+    assert cfg._advance_models_cache_authority() is not None
+    assert cfg._get_fresh_memory_models_cache(time.monotonic()) is None
