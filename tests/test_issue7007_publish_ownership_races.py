@@ -13,7 +13,7 @@ the already-fixed bounded-follower-wait and generation-bump issues:
    under the same generation, since nothing checked `_cache_build_in_progress`
    before barging in and setting it True again.
 
-Fixed via an immutable `(generation, owner_token)` identity
+Fixed via an immutable `(generation, owner_token, durable_authority)` identity
 (`_try_claim_build_owner` / `_is_current_build_owner` /
 `_release_build_owner_if_current`) that every finalizer must own before it
 may mutate shared state. These tests reproduce each race deterministically
@@ -477,3 +477,46 @@ def test_memory_cache_is_rejected_when_another_process_advances_authority(monkey
 
     assert cfg._advance_models_cache_authority() is not None
     assert cfg._get_fresh_memory_models_cache(time.monotonic()) is None
+
+
+def test_external_authority_advance_retires_blocked_stale_build(tmp_path, monkeypatch):
+    """A peer's durable invalidation must release this instance's stale owner.
+
+    The builder captures authority A, a different process advances the shared
+    sidecar to B, then the local worker completes. It must neither publish A nor
+    leave `_cache_build_in_progress` stuck, which would make all later callers
+    fail open without ever starting a fresh B rebuild.
+    """
+    import api.config as cfg
+
+    _reset_models_memory_cache(monkeypatch)
+    _isolate_disk_and_config(monkeypatch, tmp_path)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.01, raising=False)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda *_a, **_k: None)
+
+    release = threading.Event()
+    probing = threading.Event()
+
+    def _invoke(_builder):
+        probing.set()
+        assert release.wait(timeout=10), "test setup failed to release stale build"
+        return _catalog("stale-build")
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _invoke)
+
+    result = cfg.get_available_models(force_refresh=True)
+    assert probing.wait(timeout=5), "build never reached the controlled probe"
+    assert cfg._cache_build_in_progress is True
+    assert result != _catalog("stale-build")
+
+    assert cfg._advance_models_cache_authority() is not None
+    release.set()
+
+    with cfg._cache_build_cv:
+        assert cfg._cache_build_cv.wait_for(
+            lambda: not cfg._cache_build_in_progress, timeout=10
+        ), (
+            "a worker retired by another process's authority change must release "
+            "its local build owner"
+        )
+    assert cfg._available_models_cache is None

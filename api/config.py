@@ -8875,6 +8875,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     # Catalog was invalidated (or a newer owner took over)
                     # while we built — discard stale result, don't touch
                     # shared state, and don't write it to disk below either.
+                    # A local invalidation already retired the owner. An
+                    # external process can instead advance only the durable
+                    # authority, leaving this process's local flag live; in
+                    # that case release this exact stale owner so a B-era
+                    # caller can rebuild instead of remaining stuck behind it.
+                    _release_build_owner_if_current(_build_owner)
                     pass
                 else:
                     published_at = time.monotonic()
@@ -8954,6 +8960,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             # never touches the flag, cache, or disk.
             with _cache_build_cv:
                 if not _is_current_build_owner(_build_owner):
+                    # Cross-process invalidation changes the durable authority
+                    # but cannot clear our process-local ownership flag. Retire
+                    # this stale owner; a local invalidation has already made
+                    # this a harmless no-op by clearing `_active_build_owner`.
+                    _release_build_owner_if_current(_build_owner)
                     return
                 published_at = time.monotonic()
                 _available_models_cache = result
@@ -8979,6 +8990,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             with _cache_build_cv:
                 if not _is_current_build_owner(_build_owner):
                     _delete_models_cache_on_disk()
+                    _release_build_owner_if_current(_build_owner)
                     return
                 _cache_build_in_progress = False
                 _active_build_owner = None

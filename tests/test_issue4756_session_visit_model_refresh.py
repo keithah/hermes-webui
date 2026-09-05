@@ -35,6 +35,7 @@ def _reset_models_memory_cache(monkeypatch):
     monkeypatch.setattr(cfg, "_available_models_cache_ts", 0.0, raising=False)
     monkeypatch.setattr(cfg, "_available_models_live_rebuild_ts", 0.0, raising=False)
     monkeypatch.setattr(cfg, "_available_models_cache_source_fingerprint", None, raising=False)
+    monkeypatch.setattr(cfg, "_available_models_cache_authority", None, raising=False)
     monkeypatch.setattr(cfg, "_cache_build_in_progress", False, raising=False)
 
 
