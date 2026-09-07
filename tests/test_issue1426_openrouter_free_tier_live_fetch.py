@@ -50,7 +50,8 @@ def _get_grouped_models() -> list[dict]:
         config.invalidate_models_cache()
     except Exception:
         pass
-    result = config.get_available_models()
+    with config._available_models_cache_lock:
+        result = config.get_available_models()
     return result.get("groups", [])
 
 
@@ -67,6 +68,12 @@ def _isolate_openrouter_cache(monkeypatch):
         pass
 
     # Force openrouter to be detected by injecting it into config
+    monkeypatch.setattr(config, "_LIVE_REBUILD_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(
+        config,
+        "_models_cache_source_fingerprint",
+        lambda: "test-issue1426-openrouter",
+    )
     monkeypatch.setattr(
         config,
         "cfg",
@@ -75,6 +82,11 @@ def _isolate_openrouter_cache(monkeypatch):
             "providers": {"openrouter": {"api_key": "sk-or-test-key"}},
         },
         raising=False,
+    )
+    monkeypatch.setattr(
+        config,
+        "reload_config_if_stale",
+        lambda: None,
     )
     # Reset module-level cache
     try:
@@ -238,15 +250,20 @@ def test_openrouter_falls_back_to_static_when_live_fails(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
 
-    # Force hermes_cli to fail too
+    # Force hermes_cli to fail too using a coherent fake package. Replacing only
+    # the child module leaves a previously imported parent package able to bypass
+    # this seam in a long-running test process.
     import sys
-    fake_module = type(sys)("hermes_cli.models")
+    import types
+    import hermes_cli
+    fake_module = types.ModuleType("hermes_cli.models")
 
     def _raise(*args, **kwargs):
         raise RuntimeError("simulated import failure")
 
     fake_module.fetch_openrouter_models = _raise
     fake_module.provider_model_ids = lambda *a, **k: []
+    monkeypatch.setattr(hermes_cli, "models", fake_module)
     monkeypatch.setitem(sys.modules, "hermes_cli.models", fake_module)
 
     grouped = _get_grouped_models()
@@ -254,7 +271,13 @@ def test_openrouter_falls_back_to_static_when_live_fails(monkeypatch):
     assert or_group is not None, "openrouter group must still be present in fallback path"
     assert len(or_group["models"]) > 0, "fallback must produce a non-empty model list"
     # The hardcoded free-tier entries MUST be in the fallback
-    fallback_ids = {m["id"] for m in or_group["models"]}
+    # Picker IDs may gain an unambiguous @openrouter: prefix when another
+    # provider has already exposed the same model ID. Compare semantic IDs so
+    # the offline fallback contract does not depend on global dedup ordering.
+    def _canonical_id(model_id):
+        return model_id.split(":", 1)[1] if model_id.startswith("@openrouter:") else model_id
+
+    fallback_ids = {_canonical_id(m["id"]) for m in or_group["models"]}
     # At least one of the contributor's hardcoded free-tier entries must be present
     expected_free_ids = {
         "openrouter/elephant-alpha",

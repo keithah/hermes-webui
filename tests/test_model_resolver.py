@@ -1401,14 +1401,52 @@ def _isolate_models_cache():
 
 
 def _available_models_with_provider(provider):
-    """Helper: temporarily set active_provider in config."""
-    old_cfg = dict(config.cfg)
-    config.cfg['model'] = {'provider': provider}
+    """Build a catalog against an isolated in-memory active-provider config."""
+    old_cfg = config.cfg
+    old_mtime = config._cfg_mtime
+    old_path = config._cfg_path
+    old_cache = config._available_models_cache
+    old_cache_ts = config._available_models_cache_ts
+    old_fingerprint = config._available_models_cache_source_fingerprint
+    old_live_rebuild_ts = config._available_models_live_rebuild_ts
+    old_provenance = config._models_cache_provenance
+    old_advertised_memo = config._advertised_model_ids_memo
+    old_live_budget = config._LIVE_REBUILD_BUDGET_SECONDS
+    old_load_disk_cache = config._load_models_cache_from_disk
+    old_load_stale_disk_cache = config._load_stale_models_cache_from_disk
+
+    fixture_cfg = dict(old_cfg)
+    fixture_cfg['model'] = {'provider': provider}
+    # Exclude detached catalog publishers while this helper owns module-global
+    # configuration. This test asserts live-provider behavior, not cache reuse.
+    config._cfg_lock.acquire()
+    config.cfg = fixture_cfg
+    config._LIVE_REBUILD_BUDGET_SECONDS = 0.0
+    config._load_models_cache_from_disk = lambda: None
+    config._load_stale_models_cache_from_disk = lambda: None
+    config._cfg_path = config._get_config_path()
     try:
-        return config.get_available_models()
+        config._cfg_mtime = config.Path(config._cfg_path).stat().st_mtime
+    except OSError:
+        config._cfg_mtime = 0.0
+    try:
+        with config._available_models_cache_lock:
+            config.invalidate_models_cache()
+            return config.get_available_models()
     finally:
-        config.cfg.clear()
-        config.cfg.update(old_cfg)
+        config.cfg = old_cfg
+        config._cfg_mtime = old_mtime
+        config._cfg_path = old_path
+        config._available_models_cache = old_cache
+        config._available_models_cache_ts = old_cache_ts
+        config._available_models_cache_source_fingerprint = old_fingerprint
+        config._available_models_live_rebuild_ts = old_live_rebuild_ts
+        config._models_cache_provenance = old_provenance
+        config._advertised_model_ids_memo = old_advertised_memo
+        config._LIVE_REBUILD_BUDGET_SECONDS = old_live_budget
+        config._load_models_cache_from_disk = old_load_disk_cache
+        config._load_stale_models_cache_from_disk = old_load_stale_disk_cache
+        config._cfg_lock.release()
 
 
 def test_non_default_provider_models_use_hint_prefix():
@@ -1584,14 +1622,21 @@ def test_default_model_lands_under_active_provider_group(monkeypatch):
     alphabetically (e.g. 'anthropic'), placed gpt-5.4 in the WRONG group.
     """
     import sys, types
+    import hermes_cli
     fake_mod = types.ModuleType('hermes_cli.models')
     fake_mod.list_available_providers = lambda: [
         {'id': 'anthropic',    'authenticated': True},  # sorts before openai-codex
         {'id': 'openai-codex', 'authenticated': True},
+        {'id': 'opencode-zen', 'authenticated': True},
         {'id': 'custom',       'authenticated': True},
     ]
+    # A different provider exposes the same bare ID. This must not suppress
+    # insertion into the active provider's group.
+    fake_mod.provider_model_ids = lambda provider_id: ['gpt-5.4'] if provider_id == 'opencode-zen' else []
     fake_auth = types.ModuleType('hermes_cli.auth')
     fake_auth.get_auth_status = lambda pid: {'key_source': 'env'}
+    monkeypatch.setattr(hermes_cli, 'models', fake_mod)
+    monkeypatch.setattr(hermes_cli, 'auth', fake_auth)
     monkeypatch.setitem(sys.modules, 'hermes_cli.models', fake_mod)
     monkeypatch.setitem(sys.modules, 'hermes_cli.auth', fake_auth)
 

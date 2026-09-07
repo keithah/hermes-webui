@@ -8174,26 +8174,29 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     default_model,
                 )
             else:
-                all_ids_norm = {
+                target_display = (
+                    _PROVIDER_DISPLAY.get(active_provider, active_provider or "").lower()
+                    if active_provider
+                    else ""
+                )
+                target_group = next(
+                    (
+                        g for g in groups
+                        if g.get("provider_id") == active_provider
+                        or (target_display and g.get("provider", "").lower() == target_display)
+                    ),
+                    None,
+                )
+                target_ids_norm = {
                     _norm_model_id(m["id"])
-                    for g in groups
                     for bucket_name in ("models", "extra_models")
-                    for m in g.get(bucket_name, [])
+                    for m in (target_group or {}).get(bucket_name, [])
                 }
-                if _norm_model_id(default_model) not in all_ids_norm:
+                if _norm_model_id(default_model) not in target_ids_norm:
                     label = _get_label_for_model(default_model, groups)
-                    target_display = (
-                        _PROVIDER_DISPLAY.get(active_provider, active_provider or "").lower()
-                        if active_provider
-                        else ""
-                    )
-                    injected = False
-                    for g in groups:
-                        if target_display and g.get("provider", "").lower() == target_display:
-                            g["models"].insert(0, {"id": default_model, "label": label})
-                            injected = True
-                            break
-                    if not injected and groups:
+                    if target_group is not None:
+                        target_group["models"].insert(0, {"id": default_model, "label": label})
+                    else:
                         groups.append(
                             {
                                 "provider": "Default",
