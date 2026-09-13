@@ -11329,6 +11329,18 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = (
     _route_session_list_cache._SIDEBAR_SESSION_RESPONSE_FIELDS
 )
 
+# `match_type` / `match_preview` are deliberately NOT serialized from row data.
+# They are trusted, server-computed search metadata that the search branch
+# passes explicitly to `_sidebar_session_response_item`; a row (which can carry
+# forged values from state.db) must never be able to project them onto a plain
+# list response. The canonical allowlist above is shared with the cache
+# projection, which legitimately carries them, so they are subtracted here at
+# the wire boundary rather than removed from the shared contract (#6985 round 6).
+_SIDEBAR_SESSION_UNTRUSTED_ROW_FIELDS = frozenset({"match_type", "match_preview"})
+_SIDEBAR_SESSION_SERIALIZED_FIELDS = (
+    frozenset(_SIDEBAR_SESSION_RESPONSE_FIELDS) - _SIDEBAR_SESSION_UNTRUSTED_ROW_FIELDS
+)
+
 
 def _sidebar_session_response_item(
     session: dict,
@@ -11360,7 +11372,7 @@ def _sidebar_session_response_item(
     item = {
         key: value
         for key, value in dict(session).items()
-        if key in _SIDEBAR_SESSION_RESPONSE_FIELDS
+        if key in _SIDEBAR_SESSION_SERIALIZED_FIELDS
     }
     _add_profile_lineage_key(item)
     if isinstance(item.get("title"), str):
