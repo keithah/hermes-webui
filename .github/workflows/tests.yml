@@ -15,7 +15,7 @@ on:
 # any non-doc path touched), docs_only=false and the full suite runs.
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     outputs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
     steps:
@@ -96,7 +96,7 @@ jobs:
     # never wedge if it's promoted to required later — same rationale as the test/
     # browser-smoke jobs; a failed `changes` degrades to running the full lint.
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     steps:
       - name: Docs-only short-circuit
         if: needs.changes.outputs.docs_only == 'true'
@@ -175,7 +175,7 @@ jobs:
     # missing/empty docs_only (which is what a failed `changes` yields) as "run full
     # CI" — so a detector failure degrades to running everything, never to a wedge.
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     strategy:
       # Don't cancel the other shards/versions when one fails — we want the full
       # failure picture across the matrix in a single run.
