@@ -23,7 +23,7 @@ on:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     outputs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
     steps:
@@ -89,7 +89,7 @@ jobs:
     # Belt-and-suspenders (see tests.yml): run even if `changes` errored/was skipped
     # so this required context can never wedge; step guards degrade to full smoke.
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
     timeout-minutes: 10
     steps:
       - name: Docs-only short-circuit
